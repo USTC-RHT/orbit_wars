@@ -1,0 +1,9 @@
+# orbit-wars-lab 识别这个 agent 时使用的元信息。
+# 真正的推理入口在 main.py；这里只描述名称、标签和是否启用。
+
+name: "Clean RL PPO"
+description: "Readable PPO rewrite for Orbit Wars: source-level target and ship-amount selection, MLP actor-critic, GAE, shaped reward, CUDA training support."
+author: "local"
+license: "Apache 2.0"
+tags: [mine, reinforcement-learning, ppo, gpu, neural-network]
+disabled: false

@@ -80,7 +80,7 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         )
         self.key = nn.Linear(hidden_size, hidden_size)
-        self.noop_key = nn.Parameter(torch.zeros(hidden_size))
+        # self.noop_key = nn.Parameter(torch.zeros(hidden_size))
         self.amount_actor = nn.Sequential(
             nn.Linear(per_target_dim, hidden_size),
             nn.ReLU(),

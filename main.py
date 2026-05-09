@@ -14,7 +14,15 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from src.config import load_config  # noqa: E402
-from src.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
+from src.features import (  # noqa: E402
+    CANDIDATE_DIM,
+    GLOBAL_DIM,
+    MAP_CHANNELS,
+    MAP_GRID_SIZE,
+    SELF_DIM,
+    encode_turn,
+    target_count,
+)
 from src.model import ActorCritic  # noqa: E402
 from src.normalization import StateNormalizer  # noqa: E402
 from src.opponents import actions_from_policy  # noqa: E402
@@ -60,6 +68,9 @@ def _load():
         candidate_count=target_count(cfg.env),
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
+        use_cnn=cfg.model.use_cnn,
+        map_channels=MAP_CHANNELS,
+        map_grid_size=MAP_GRID_SIZE,
     ).to(device)
     errors: list[str] = []
     for path in _checkpoint_candidates():

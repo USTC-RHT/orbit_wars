@@ -131,6 +131,7 @@ class StateNormalizer:
             self_features=self_features.astype(np.float32, copy=False),
             candidate_features=candidate_features.astype(np.float32, copy=False),
             global_features=global_features.astype(np.float32, copy=False),
+            map_features=batch.map_features,
             candidate_mask=batch.candidate_mask,
             amount_mask=batch.amount_mask,
             contexts=batch.contexts,

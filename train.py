@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
     parser.add_argument("--resume", default=None, help="从指定 .pt checkpoint 文件继续训练")
+    parser.add_argument("--use-CNN", "--use_CNN", "-use_CNN", dest="use_cnn", action="store_true")
     return parser.parse_args()
 
 
@@ -58,6 +59,8 @@ def main() -> None:
         cfg.wandb.entity = args.wandb_entity
     if args.wandb_mode is not None:
         cfg.wandb.mode = args.wandb_mode
+    if args.use_cnn:
+        cfg.model.use_cnn = True
     train(cfg, resume_from=args.resume)
 
 

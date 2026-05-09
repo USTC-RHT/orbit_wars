@@ -21,6 +21,8 @@ INBOUND_HORIZON = 60  # 预测未来 60 回合内舰队与星球的碰撞
 SELF_DIM = 18
 CANDIDATE_DIM = 26
 GLOBAL_DIM = 11
+MAP_GRID_SIZE = 8
+MAP_CHANNELS = 6
 
 
 
@@ -49,6 +51,7 @@ class TurnBatch:
     self_features: 每颗我方星球一行。
     candidate_features: 每行对应 no-op + 全图星球槽位。
     global_features: 全局局势，按来源星球重复。
+    map_features: 以当前来源星球为第 0 通道的小地图特征，形状 [N, 6, 8, 8]。
     candidate_mask: 哪些目标槽位可选。
     amount_mask: 轻量合法性 mask；物理可达性在动作解码阶段只检查已选结果。
     contexts: 把网络动作映射回游戏动作所需的信息。
@@ -57,13 +60,14 @@ class TurnBatch:
     self_features: np.ndarray
     candidate_features: np.ndarray
     global_features: np.ndarray
+    map_features: np.ndarray
     candidate_mask: np.ndarray
     amount_mask: np.ndarray
     contexts: list[DecisionContext]
     state: GameState
 
 
-# 详细特征定义见 RL/FEATURES.md。
+# 详细特征定义见 RL_new/FEATURES.md。
 
 
 def target_count(cfg: EnvConfig) -> int:
@@ -91,6 +95,7 @@ def encode_turn(observation: Any, cfg: EnvConfig) -> TurnBatch:
             self_features=np.zeros((0, SELF_DIM), dtype=np.float32),
             candidate_features=np.zeros((0, n_targets, CANDIDATE_DIM), dtype=np.float32),
             global_features=np.zeros((0, GLOBAL_DIM), dtype=np.float32),
+            map_features=np.zeros((0, MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=np.float32),
             candidate_mask=np.zeros((0, n_targets), dtype=bool),
             amount_mask=np.zeros((0, n_targets, cfg.ship_bucket_count), dtype=bool),
             contexts=[],
@@ -101,6 +106,7 @@ def encode_turn(observation: Any, cfg: EnvConfig) -> TurnBatch:
     inbound = precompute_inbound(state)
     self_rows = []
     candidate_rows = []
+    map_rows = []
     masks = []
     amount_masks = []
     contexts = []
@@ -108,6 +114,7 @@ def encode_turn(observation: Any, cfg: EnvConfig) -> TurnBatch:
         cand_features, mask, amount_mask, ship_buckets, candidate_ids = build_candidate_features(src, state, cfg, inbound)
         self_rows.append(build_self_features(src, state, cfg, inbound))
         candidate_rows.append(cand_features)
+        map_rows.append(build_map_features(src, state, cfg))
         masks.append(mask)
         amount_masks.append(amount_mask)
         contexts.append(
@@ -125,6 +132,7 @@ def encode_turn(observation: Any, cfg: EnvConfig) -> TurnBatch:
         self_features=np.asarray(self_rows, dtype=np.float32),
         candidate_features=np.asarray(candidate_rows, dtype=np.float32),
         global_features=np.repeat(global_features[None, :], len(self_rows), axis=0),
+        map_features=np.asarray(map_rows, dtype=np.float32),
         candidate_mask=np.asarray(masks, dtype=bool),
         amount_mask=np.asarray(amount_masks, dtype=bool),
         contexts=contexts,
@@ -141,7 +149,7 @@ def build_self_features(
     """构建来源星球自身特征。
 
     一颗我方星球对应一行决策。这里描述“我从哪里发兵”以及这颗星球
-    所处的粗略局势。具体每一维见 RL/FEATURES.md。
+    所处的粗略局势。具体每一维见 RL_new/FEATURES.md。
     """
 
     my_planets = [p for p in state.planets if p.owner == state.player]
@@ -306,6 +314,40 @@ def build_global_features(state: GameState, cfg: EnvConfig) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+def build_map_features(src: Planet, state: GameState, cfg: EnvConfig) -> np.ndarray:
+    """构建以当前来源星球为参照的小地图特征。
+
+    通道含义：
+    0 当前星球；1 友方星球（不含当前星球）；2 敌方星球；3 中立星球；
+    4 友方飞行舰队船数；5 敌方飞行舰队船数。
+    """
+
+    grid = np.zeros((MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=np.float32)
+    for planet in state.planets:
+        if planet.id == src.id:
+            _accum_grid(grid, 0, planet.x, planet.y, 1.0, cfg)
+        elif planet.owner == state.player:
+            _accum_grid(grid, 1, planet.x, planet.y, 1.0, cfg)
+        elif planet.owner == -1:
+            _accum_grid(grid, 3, planet.x, planet.y, 1.0, cfg)
+        else:
+            _accum_grid(grid, 2, planet.x, planet.y, 1.0, cfg)
+
+    for fleet in state.fleets:
+        channel = 4 if fleet.owner == state.player else 5
+        value = clip01(float(fleet.ships) / cfg.max_ships)
+        _accum_grid(grid, channel, fleet.x, fleet.y, value, cfg)
+    return grid
+
+
+def _accum_grid(grid: np.ndarray, channel: int, x: float, y: float, value: float, cfg: EnvConfig) -> None:
+    if x < 0.0 or y < 0.0 or x > cfg.board_size or y > cfg.board_size:
+        return
+    ix = min(MAP_GRID_SIZE - 1, max(0, int((x / cfg.board_size) * MAP_GRID_SIZE)))
+    iy = min(MAP_GRID_SIZE - 1, max(0, int((y / cfg.board_size) * MAP_GRID_SIZE)))
+    grid[channel, iy, ix] = min(1.0, grid[channel, iy, ix] + float(value))
 
 
 def build_ship_buckets(src: Planet, cfg: EnvConfig) -> list[int]:

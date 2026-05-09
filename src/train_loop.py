@@ -17,11 +17,20 @@ import torch
 
 from .config import TrainConfig
 from .env_wrapper import OrbitWarsPPOEnv
-from .features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, TurnBatch, encode_turn, target_count
+from .features import (
+    CANDIDATE_DIM,
+    GLOBAL_DIM,
+    MAP_CHANNELS,
+    MAP_GRID_SIZE,
+    SELF_DIM,
+    TurnBatch,
+    encode_turn,
+    target_count,
+)
 from .model import ActorCritic
 from .normalization import StateNormalizer
 from .opponents import SelfPlayOpponent, actions_from_policy, build_opponent, decoded_action_from_indices
-from .ppo import PPOOptimizer, RolloutBatch, sample_amounts, sample_targets
+from .ppo import PPOOptimizer, RolloutBatch, sample_amounts, sample_fire, sample_targets
 from .state import read
 
 
@@ -70,6 +79,9 @@ def build_model(cfg: TrainConfig, device: torch.device) -> ActorCritic:
         candidate_count=target_count(cfg.env),
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
+        use_cnn=cfg.model.use_cnn,
+        map_channels=MAP_CHANNELS,
+        map_grid_size=MAP_GRID_SIZE,
     ).to(device)
 
 
@@ -146,6 +158,11 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                 "learning_rate",
                 "episode_reward_mean",
                 "terminal_reward_mean",
+                "neutral_capture_reward_mean",
+                "enemy_capture_reward_mean",
+                "lose_planet_reward_mean",
+                "wasted_attack_reward_mean",
+                "fire_rate",
                 "episodes",
                 "win_rate",
                 "wins",
@@ -210,6 +227,7 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                 f"reward={stats['episode_reward_mean']:.4f} "
                 f"terminal={stats['terminal_reward_mean']:.4f} "
                 f"ent={metrics['entropy']:.3f} ev={metrics['explained_variance']:.3f} "
+                f"fire={stats['fire_rate']:.3f} "
                 f"episodes={int(stats['episodes'])} winrate={stats['win_rate']:.3f} "
                 f"W/L/D={int(stats['wins'])}/{int(stats['losses'])}/{int(stats['draws'])}"
                 f"{eval_text}",
@@ -231,6 +249,11 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                         lr_now,
                         stats["episode_reward_mean"],
                         stats["terminal_reward_mean"],
+                        stats["neutral_capture_reward_mean"],
+                        stats["enemy_capture_reward_mean"],
+                        stats["lose_planet_reward_mean"],
+                        stats["wasted_attack_reward_mean"],
+                        stats["fire_rate"],
                         int(stats["episodes"]),
                         stats["win_rate"],
                         int(stats["wins"]),
@@ -246,6 +269,11 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
             # 避免面板被大量训练细节淹没。
             wandb_payload: dict[str, float] = {
                 "reward": float(stats["episode_reward_mean"]),
+                "neutral_capture_reward": float(stats["neutral_capture_reward_mean"]),
+                "enemy_capture_reward": float(stats["enemy_capture_reward_mean"]),
+                "lose_planet_reward": float(stats["lose_planet_reward_mean"]),
+                "wasted_attack_reward": float(stats["wasted_attack_reward_mean"]),
+                "fire_rate": float(stats["fire_rate"]),
                 "win_rate": float(stats["win_rate"]),
                 "loss": float(metrics["loss"]),
                 "policy_loss": float(metrics["policy_loss"]),
@@ -340,8 +368,10 @@ def collect_rollout(
     self_rows: list[np.ndarray] = []
     candidate_rows: list[np.ndarray] = []
     global_rows: list[np.ndarray] = []
+    map_rows: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     amount_masks: list[np.ndarray] = []
+    fire_actions: list[bool] = []
     target_actions: list[int] = []
     amount_actions: list[int] = []
     log_probs: list[float] = []
@@ -350,6 +380,10 @@ def collect_rollout(
     episode_rewards = [0.0 for _ in envs]
     finished_rewards: list[float] = []
     finished_terminals: list[float] = []
+    neutral_capture_rewards: list[float] = []
+    enemy_capture_rewards: list[float] = []
+    lose_planet_rewards: list[float] = []
+    wasted_attack_rewards: list[float] = []
     wins = 0
     losses = 0
     draws = 0
@@ -360,6 +394,7 @@ def collect_rollout(
         merged = state_normalizer.normalize_batch(raw_merged)
         normalized_batches = [state_normalizer.normalize_batch(batch) for batch in batches]
         row_values = np.zeros((merged.self_features.shape[0],), dtype=np.float32)
+        sampled_fires = np.zeros((merged.self_features.shape[0],), dtype=bool)
         sampled_targets = np.zeros((merged.self_features.shape[0],), dtype=np.int64)
         sampled_amounts = np.zeros((merged.self_features.shape[0],), dtype=np.int64)
         sampled_log_probs = np.zeros((merged.self_features.shape[0],), dtype=np.float32)
@@ -374,14 +409,23 @@ def collect_rollout(
                     torch.from_numpy(merged.candidate_features).to(device),
                     torch.from_numpy(merged.global_features).to(device),
                     torch.from_numpy(merged.candidate_mask).to(device).bool(),
+                    map_features=torch.from_numpy(merged.map_features).to(device),
                 )
-                # 训练 rollout 必须采样动作，PPO 才有探索；采样到的 target 会保存下来。
-                target_sample = sample_targets(target_outputs, deterministic=False)
+                # 训练 rollout 必须采样动作，PPO 才有探索；先采样 fire，再采样 target。
+                candidate_mask_tensor = torch.from_numpy(merged.candidate_mask).to(device).bool()
+                fire_sample = sample_fire(target_outputs, candidate_mask_tensor, deterministic=False)
+                target_sample = sample_targets(
+                    target_outputs,
+                    fire_sample,
+                    candidate_mask_tensor,
+                    deterministic=False,
+                )
                 amount_outputs = model(
                     torch.from_numpy(merged.self_features).to(device),
                     torch.from_numpy(merged.candidate_features).to(device),
                     torch.from_numpy(merged.global_features).to(device),
                     torch.from_numpy(merged.candidate_mask).to(device).bool(),
+                    map_features=torch.from_numpy(merged.map_features).to(device),
                     selected_targets=target_sample.target,
                 )
                 sample = sample_amounts(
@@ -392,6 +436,7 @@ def collect_rollout(
                     amount_mask=torch.from_numpy(merged.amount_mask).to(device).bool(),
                 )
                 row_values = target_outputs.value.detach().cpu().numpy()
+                sampled_fires = sample.fire.detach().cpu().numpy()
                 sampled_targets = sample.target.detach().cpu().numpy()
                 sampled_amounts = sample.amount.detach().cpu().numpy()
                 sampled_log_probs = sample.log_prob.detach().cpu().numpy()
@@ -409,8 +454,10 @@ def collect_rollout(
                 self_rows.append(batch.self_features[local_idx])
                 candidate_rows.append(batch.candidate_features[local_idx])
                 global_rows.append(batch.global_features[local_idx])
+                map_rows.append(batch.map_features[local_idx])
                 masks.append(batch.candidate_mask[local_idx])
                 amount_masks.append(batch.amount_mask[local_idx])
+                fire_actions.append(bool(sampled_fires[global_idx]))
                 target_actions.append(int(sampled_targets[global_idx]))
                 amount_actions.append(int(sampled_amounts[global_idx]))
                 log_probs.append(float(sampled_log_probs[global_idx]))
@@ -422,7 +469,7 @@ def collect_rollout(
                     context,
                     int(sampled_targets[global_idx]),
                     int(sampled_amounts[global_idx]),
-                )
+                ) if bool(sampled_fires[global_idx]) else None
                 if decoded is not None:
                     move_list.append(decoded.move)
                     action_infos.append(
@@ -439,6 +486,10 @@ def collect_rollout(
 
             result = env.step(move_list, action_infos)
             episode_rewards[env_idx] += result.reward
+            neutral_capture_rewards.append(float(result.info.get("neutral_capture_reward", 0.0)))
+            enemy_capture_rewards.append(float(result.info.get("enemy_capture_reward", 0.0)))
+            lose_planet_rewards.append(float(result.info.get("lose_planet_reward", 0.0)))
+            wasted_attack_rewards.append(float(result.info.get("wasted_attack_reward", 0.0)))
             groups_by_env[env_idx].append(StepGroup(group_indices, result.reward, result.done))
             if result.done:
                 finished_rewards.append(episode_rewards[env_idx])
@@ -473,10 +524,14 @@ def collect_rollout(
             np.asarray(candidate_rows, dtype=np.float32).reshape(-1, n_targets, CANDIDATE_DIM)
         ),
         global_features=torch.from_numpy(np.asarray(global_rows, dtype=np.float32).reshape(-1, GLOBAL_DIM)),
+        map_features=torch.from_numpy(
+            np.asarray(map_rows, dtype=np.float32).reshape(-1, MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE)
+        ),
         candidate_mask=torch.from_numpy(np.asarray(masks, dtype=bool).reshape(-1, n_targets)),
         amount_mask=torch.from_numpy(
             np.asarray(amount_masks, dtype=bool).reshape(-1, n_targets, cfg.env.ship_bucket_count)
         ),
+        fire_actions=torch.tensor(fire_actions, dtype=torch.bool),
         target_actions=torch.tensor(target_actions, dtype=torch.long),
         amount_actions=torch.tensor(amount_actions, dtype=torch.long),
         old_log_probs=torch.tensor(log_probs, dtype=torch.float32),
@@ -487,6 +542,11 @@ def collect_rollout(
     stats = {
         "episode_reward_mean": float(np.mean(finished_rewards)) if finished_rewards else 0.0,
         "terminal_reward_mean": float(np.mean(finished_terminals)) if finished_terminals else 0.0,
+        "neutral_capture_reward_mean": float(np.mean(neutral_capture_rewards)) if neutral_capture_rewards else 0.0,
+        "enemy_capture_reward_mean": float(np.mean(enemy_capture_rewards)) if enemy_capture_rewards else 0.0,
+        "lose_planet_reward_mean": float(np.mean(lose_planet_rewards)) if lose_planet_rewards else 0.0,
+        "wasted_attack_reward_mean": float(np.mean(wasted_attack_rewards)) if wasted_attack_rewards else 0.0,
+        "fire_rate": float(np.mean(fire_actions)) if fire_actions else 0.0,
         "episodes": float(len(finished_rewards)),
         "win_rate": float(wins / max(len(finished_rewards), 1)),
         "wins": float(wins),
@@ -667,6 +727,7 @@ def bootstrap_values(
             torch.from_numpy(merged.candidate_features).to(device),
             torch.from_numpy(merged.global_features).to(device),
             torch.from_numpy(merged.candidate_mask).to(device).bool(),
+            map_features=torch.from_numpy(merged.map_features).to(device),
         )
     values = outputs.value.detach().cpu().numpy()
     per_env = []
@@ -692,6 +753,7 @@ def merge_batches(batches: list[TurnBatch], cfg: TrainConfig | None) -> TurnBatc
         self_features = np.concatenate([batch.self_features for batch in batches], axis=0)
         candidate_features = np.concatenate([batch.candidate_features for batch in batches], axis=0)
         global_features = np.concatenate([batch.global_features for batch in batches], axis=0)
+        map_features = np.concatenate([batch.map_features for batch in batches], axis=0)
         candidate_mask = np.concatenate([batch.candidate_mask for batch in batches], axis=0)
         amount_mask = np.concatenate([batch.amount_mask for batch in batches], axis=0)
     else:
@@ -700,12 +762,14 @@ def merge_batches(batches: list[TurnBatch], cfg: TrainConfig | None) -> TurnBatc
         self_features = np.zeros((0, SELF_DIM), dtype=np.float32)
         candidate_features = np.zeros((0, candidate_count, CANDIDATE_DIM), dtype=np.float32)
         global_features = np.zeros((0, GLOBAL_DIM), dtype=np.float32)
+        map_features = np.zeros((0, MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=np.float32)
         candidate_mask = np.zeros((0, candidate_count), dtype=bool)
         amount_mask = np.zeros((0, candidate_count, ship_bucket_count), dtype=bool)
     return TurnBatch(
         self_features=self_features,
         candidate_features=candidate_features,
         global_features=global_features,
+        map_features=map_features,
         candidate_mask=candidate_mask,
         amount_mask=amount_mask,
         contexts=[ctx for batch in batches for ctx in batch.contexts],

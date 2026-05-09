@@ -1,7 +1,8 @@
 """测特征工程速度。
 
 用法（在 kaggle/ 根目录执行）：
-    python RL/bench_inbound.py
+    python RL_new/bench_inbound.py            # 测新版
+    python RL_new/bench_inbound.py --baseline # 测旧版 RL/
 """
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ ROOT = Path(__file__).resolve().parent.parent  # /home/dministrator/kaggle
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--n", type=int, default=200)
     args = parser.parse_args()
 
-    target_dir = ROOT / "RL"
+    target_dir = ROOT / ("RL" if args.baseline else "RL_new")
     sys.path.insert(0, str(target_dir))
 
     from src.config import EnvConfig, TrainConfig  # noqa: E402
@@ -30,7 +32,8 @@ def main() -> None:
     from src import features as feat  # noqa: E402
     from src.state import parse_observation  # noqa: E402
 
-    print(f"=== RL | dir={target_dir.name} ===")
+    label = "RL (baseline)" if args.baseline else "RL_new"
+    print(f"=== {label} | dir={target_dir.name} ===")
 
     cfg = TrainConfig()
     cfg.opponent = "random"

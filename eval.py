@@ -17,7 +17,15 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from src.config import load_config  # noqa: E402
-from src.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
+from src.features import (  # noqa: E402
+    CANDIDATE_DIM,
+    GLOBAL_DIM,
+    MAP_CHANNELS,
+    MAP_GRID_SIZE,
+    SELF_DIM,
+    encode_turn,
+    target_count,
+)
 from src.model import ActorCritic  # noqa: E402
 from src.normalization import StateNormalizer  # noqa: E402
 from src.opponents import NearestOpponent, RandomOpponent, actions_from_policy  # noqa: E402
@@ -46,6 +54,9 @@ def main() -> None:
         candidate_count=target_count(cfg.env),
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
+        use_cnn=cfg.model.use_cnn,
+        map_channels=MAP_CHANNELS,
+        map_grid_size=MAP_GRID_SIZE,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("model", ckpt))

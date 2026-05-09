@@ -6,6 +6,7 @@ step 同时执行 learner 和 opponent 动作，并计算终局奖励加 shaped 
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,8 @@ class ScoreSnapshot:
     ships_on_planets: float
     ships_in_fleets: float
     production: float
+    enemy_planets: int
+    enemy_production: float
 
 
 class OrbitWarsPPOEnv:
@@ -88,6 +91,8 @@ class OrbitWarsPPOEnv:
 
         if self.env is None or self.last_obs is None or self.last_opp_obs is None:
             raise RuntimeError("Call reset before step.")
+        prev_obs = self.last_obs
+        prev_state = parse_observation(prev_obs)
         opponent_action = self.opponent.act(self.last_opp_obs)
         joint = [action, opponent_action] if self.learner_player == 0 else [opponent_action, action]
         states = self.env.step(joint)
@@ -97,15 +102,28 @@ class OrbitWarsPPOEnv:
         self.last_opp_obs = extract_observation(opp_state)
         done = extract_status(player_state) != "ACTIVE"
 
-        current_score = score_snapshot(parse_observation(self.last_obs))
+        current_state = parse_observation(self.last_obs)
+        current_score = score_snapshot(current_state)
         shaped = shaped_reward(self.last_score, current_score, self.cfg.reward)
+        neutral_capture = neutral_capture_reward(prev_state, current_state, self.cfg.reward)
+        enemy_capture = enemy_capture_reward(prev_state, current_state, self.cfg.reward)
+        lose_planet = lose_planet_reward(prev_state, current_state, self.cfg.reward)
+        wasted_attack = wasted_attack_reward(prev_state, current_state, self.cfg.reward)
         time_penalty = -float(self.cfg.reward.time_penalty)
         launch_penalty = -float(self.cfg.reward.launch_penalty) * float(len(action))
-        eta_bonus = reachable_eta_bonus(action_infos or [], self.cfg.reward)
         self.last_score = current_score
         raw_terminal = terminal_reward(player_state) if done else 0.0
         terminal = raw_terminal * self.cfg.reward.terminal_weight if done else 0.0
-        reward = shaped + eta_bonus + time_penalty + launch_penalty + terminal
+        reward = (
+            shaped
+            + neutral_capture
+            + enemy_capture
+            + lose_planet
+            + wasted_attack
+            + time_penalty
+            + launch_penalty
+            + terminal
+        )
 
         return StepResult(
             batch=encode_turn(self.last_obs, self.cfg.env),
@@ -115,7 +133,10 @@ class OrbitWarsPPOEnv:
                 "terminal_reward": float(terminal),
                 "raw_terminal_reward": float(raw_terminal),
                 "shaped_reward": float(shaped),
-                "eta_bonus": float(eta_bonus),
+                "neutral_capture_reward": float(neutral_capture),
+                "enemy_capture_reward": float(enemy_capture),
+                "lose_planet_reward": float(lose_planet),
+                "wasted_attack_reward": float(wasted_attack),
                 "time_penalty": float(time_penalty),
                 "launch_penalty": float(launch_penalty),
                 "launch_count": len(action),
@@ -124,23 +145,139 @@ class OrbitWarsPPOEnv:
         )
 
 
-def reachable_eta_bonus(action_infos: list[dict[str, Any]], cfg: RewardConfig) -> float:
-    """Small one-shot bonus for physics-validated non-friendly launches.
+def neutral_capture_reward(prev: GameState, cur: GameState, cfg: RewardConfig) -> float:
+    """Reward early captures of nearby neutral planets.
 
-    `action_infos` is produced only after aim_with_prediction succeeds, so failed
-    or unreachable selected actions never receive this bonus.
+    A capture is detected by owner transition: neutral in previous observation,
+    learner-owned in current observation. ETA is a cheap prior from the closest
+    previous owned planet to the captured neutral target.
     """
 
-    if cfg.eta_bonus_weight <= 0.0:
+    if cfg.neutral_capture_weight <= 0.0:
         return 0.0
+    early_steps = max(float(cfg.neutral_capture_early_steps), 1.0)
+    early_factor = max(0.0, 1.0 - float(prev.step) / early_steps)
+    if early_factor <= 0.0:
+        return 0.0
+
+    prev_by_id = {planet.id: planet for planet in prev.planets}
+    my_prev_planets = [planet for planet in prev.planets if planet.owner == prev.player]
+    if not my_prev_planets:
+        return 0.0
+
     bonus = 0.0
-    for info in action_infos:
-        if int(info.get("target_owner", -999)) == int(info.get("player", -998)):
+    eta_scale = max(float(cfg.neutral_capture_eta_scale), 1e-6)
+    for cur_planet in cur.planets:
+        prev_planet = prev_by_id.get(cur_planet.id)
+        if prev_planet is None:
             continue
-        eta = max(float(info.get("eta", 0.0)), 1.0)
-        production = max(float(info.get("target_production", 0.0)), 0.0)
-        bonus += cfg.eta_bonus_weight * production / eta
+        if prev_planet.owner != -1 or cur_planet.owner != cur.player:
+            continue
+        eta = nearest_capture_eta(my_prev_planets, prev_planet)
+        bonus += cfg.neutral_capture_weight * math.exp(-eta / eta_scale) * early_factor
     return bonus
+
+
+def enemy_capture_reward(prev: GameState, cur: GameState, cfg: RewardConfig) -> float:
+    """Bonus for converting enemy-owned planets to learner-owned planets."""
+
+    if cfg.enemy_capture_weight <= 0.0:
+        return 0.0
+    prev_by_id = {planet.id: planet for planet in prev.planets}
+    bonus = 0.0
+    for cur_planet in cur.planets:
+        prev_planet = prev_by_id.get(cur_planet.id)
+        if prev_planet is None:
+            continue
+        if prev_planet.owner in {-1, prev.player}:
+            continue
+        if cur_planet.owner == cur.player:
+            bonus += cfg.enemy_capture_weight * (1.0 + float(prev_planet.production))
+    return bonus
+
+
+def lose_planet_reward(prev: GameState, cur: GameState, cfg: RewardConfig) -> float:
+    """Penalty for losing learner-owned planets."""
+
+    if cfg.lose_planet_penalty <= 0.0:
+        return 0.0
+    cur_by_id = {planet.id: planet for planet in cur.planets}
+    penalty = 0.0
+    for prev_planet in prev.planets:
+        if prev_planet.owner != prev.player:
+            continue
+        cur_planet = cur_by_id.get(prev_planet.id)
+        if cur_planet is None or cur_planet.owner != cur.player:
+            penalty -= cfg.lose_planet_penalty * (1.0 + float(prev_planet.production))
+    return penalty
+
+
+def wasted_attack_reward(prev: GameState, cur: GameState, cfg: RewardConfig) -> float:
+    """Penalty for learner fleets that arrive at non-friendly planets without capture.
+
+    This is intentionally conservative: only disappeared learner fleets with an
+    estimated collision target are counted. Fleets that vanish out of bounds or
+    cannot be matched to a planet are ignored to avoid noisy punishment.
+    """
+
+    if cfg.wasted_attack_penalty <= 0.0 or not prev.fleets:
+        return 0.0
+    cur_fleet_ids = {fleet.id for fleet in cur.fleets}
+    penalty = 0.0
+    for fleet in prev.fleets:
+        if fleet.owner != prev.player or fleet.id in cur_fleet_ids:
+            continue
+        target = estimate_fleet_hit_planet(fleet, cur.planets)
+        if target is None or target.owner == cur.player:
+            continue
+        penalty -= cfg.wasted_attack_penalty * float(fleet.ships)
+    return penalty
+
+
+def estimate_fleet_hit_planet(fleet: Any, planets: list[Any]) -> Any | None:
+    speed = fleet_speed(int(fleet.ships))
+    x0 = float(fleet.x)
+    y0 = float(fleet.y)
+    x1 = x0 + math.cos(float(fleet.angle)) * speed
+    y1 = y0 + math.sin(float(fleet.angle)) * speed
+    best = None
+    best_dist = float("inf")
+    for planet in planets:
+        dist = point_segment_distance(float(planet.x), float(planet.y), x0, y0, x1, y1)
+        if dist <= float(planet.radius) + 1e-6 and dist < best_dist:
+            best = planet
+            best_dist = dist
+    return best
+
+
+def point_segment_distance(px: float, py: float, x0: float, y0: float, x1: float, y1: float) -> float:
+    dx = x1 - x0
+    dy = y1 - y0
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return math.hypot(px - x0, py - y0)
+    t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / denom))
+    cx = x0 + t * dx
+    cy = y0 + t * dy
+    return math.hypot(px - cx, py - cy)
+
+
+def nearest_capture_eta(sources: list[Any], target: Any) -> float:
+    ships_needed = max(1, int(target.ships) + 1)
+    speed = fleet_speed(ships_needed)
+    nearest_dist = min(distance(src, target) for src in sources)
+    return nearest_dist / max(speed, 1e-6)
+
+
+def fleet_speed(ships: int) -> float:
+    if ships <= 1:
+        return 1.0
+    log_ratio = min(max(math.log(max(1, ships)) / math.log(1000.0), 0.0), 1.0)
+    return min(1.0 + 5.0 * (log_ratio ** 1.5), 6.0)
+
+
+def distance(a: Any, b: Any) -> float:
+    return math.hypot(float(a.x) - float(b.x), float(a.y) - float(b.y))
 
 
 def extract_observation(state: Any) -> Any:
@@ -178,12 +315,15 @@ def score_snapshot(state: GameState) -> ScoreSnapshot:
     """提取我方当前局势摘要，用于 shaped reward。"""
 
     mine = [p for p in state.planets if p.owner == state.player]
+    enemy = [p for p in state.planets if p.owner not in {-1, state.player}]
     my_fleets = [f for f in state.fleets if f.owner == state.player]
     return ScoreSnapshot(
         planets=len(mine),
         ships_on_planets=float(sum(p.ships for p in mine)),
         ships_in_fleets=float(sum(f.ships for f in my_fleets)),
         production=float(sum(p.production for p in mine)),
+        enemy_planets=len(enemy),
+        enemy_production=float(sum(p.production for p in enemy)),
     )
 
 
@@ -197,7 +337,6 @@ def shaped_reward(prev: ScoreSnapshot | None, cur: ScoreSnapshot, cfg: RewardCon
         return 0.0
     reward = 0.0
     reward += (cur.ships_on_planets - prev.ships_on_planets) * cfg.ships_weight
-    reward += (cur.ships_in_fleets - prev.ships_in_fleets) * cfg.fleet_weight
     reward += (cur.production - prev.production) * cfg.production_weight
     reward += (cur.planets - prev.planets) * cfg.planet_weight
     if cfg.step_clip <= 0.0:

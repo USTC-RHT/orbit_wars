@@ -1,11 +1,13 @@
-# RL Feature Definitions
+# RL_new Feature Definitions
 
-`src/features.py` exposes three fixed input sizes:
+`src/features.py` exposes these fixed input sizes:
 
 ```python
 SELF_DIM = 18
-CANDIDATE_DIM = 25
+CANDIDATE_DIM = 26
 GLOBAL_DIM = 11
+MAP_CHANNELS = 6
+MAP_GRID_SIZE = 8
 ```
 
 ## self_features
@@ -65,6 +67,7 @@ One row per owned source planet.
 # 22 enemy_inbound_eta_min: 敌方最早到达 ETA / horizon，无则为 1。
 # 23 enemy_inbound_eta_mean: 敌方到达 ETA 平均 / horizon，无则为 1。
 # 24 proto_score: Proto-V15 公式得分 / 100，给网络一个手工设计的目标价值参考信号。
+# 25 eta_max_fleet: 当前来源星球用最大档位舰队飞到目标的 ETA / horizon。
 ```
 
 `proto_score` uses:
@@ -91,6 +94,20 @@ Repeated for each source planet in the same turn.
 # 8  enemy_ships_in_fleets: 敌方飞行中舰队总船数归一化。
 # 9  my_total_production: 我方总产量归一化。
 # 10 enemy_total_production: 敌方总产量归一化。
+```
+
+## map_features
+
+只有配置 `model.use_cnn: true` 或训练入口加 `--use-CNN` / `--use_CNN` / `-use_CNN`
+时，模型才会使用这路输入。每颗来源星球一张小地图，形状为 `[6, 8, 8]`。
+
+```python
+# 0 当前星球位置计数：当前正在决策的 source 所在格 +1。
+# 1 友方星球位置计数：不包含当前 source，其它我方星球所在格 +1。
+# 2 敌方星球位置计数：敌方星球所在格 +1。
+# 3 中立星球位置计数：中立星球所在格 +1。
+# 4 友方飞行舰队船数：飞行中的我方舰队按 ships / max_ships 累加到所在格，裁剪到 1。
+# 5 敌方飞行舰队船数：飞行中的敌方舰队按 ships / max_ships 累加到所在格，裁剪到 1。
 ```
 
 ## inbound collision features

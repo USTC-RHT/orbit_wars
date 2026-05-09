@@ -17,7 +17,7 @@ from .features import DecisionContext, TurnBatch, encode_turn
 from .model import ActorCritic
 from .normalization import StateNormalizer
 from .physics import aim_with_prediction
-from .ppo import sample_amounts, sample_targets
+from .ppo import sample_amounts, sample_fire, sample_targets
 from .state import GameState, Planet, parse_observation
 
 
@@ -82,7 +82,7 @@ class SelfPlayOpponent:
     """
 
     def __init__(self, cfg: TrainConfig, device: torch.device) -> None:
-        from .features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, target_count
+        from .features import CANDIDATE_DIM, GLOBAL_DIM, MAP_CHANNELS, MAP_GRID_SIZE, SELF_DIM, target_count
 
         self.cfg = cfg
         self.device = device
@@ -94,6 +94,9 @@ class SelfPlayOpponent:
             candidate_count=target_count(cfg.env),
             ship_bucket_count=cfg.env.ship_bucket_count,
             hidden_size=cfg.model.hidden_size,
+            use_cnn=cfg.model.use_cnn,
+            map_channels=MAP_CHANNELS,
+            map_grid_size=MAP_GRID_SIZE,
         ).to(device)
         self.policy.eval()
 
@@ -155,13 +158,22 @@ def actions_from_policy(
             torch.from_numpy(batch.candidate_features).to(device),
             torch.from_numpy(batch.global_features).to(device),
             torch.from_numpy(batch.candidate_mask).to(device).bool(),
+            map_features=torch.from_numpy(batch.map_features).to(device),
         )
-        target_sample = sample_targets(target_outputs, deterministic=deterministic)
+        candidate_mask_tensor = torch.from_numpy(batch.candidate_mask).to(device).bool()
+        fire_sample = sample_fire(target_outputs, candidate_mask_tensor, deterministic=deterministic)
+        target_sample = sample_targets(
+            target_outputs,
+            fire_sample,
+            candidate_mask_tensor,
+            deterministic=deterministic,
+        )
         amount_outputs = model(
             torch.from_numpy(batch.self_features).to(device),
             torch.from_numpy(batch.candidate_features).to(device),
             torch.from_numpy(batch.global_features).to(device),
             torch.from_numpy(batch.candidate_mask).to(device).bool(),
+            map_features=torch.from_numpy(batch.map_features).to(device),
             selected_targets=target_sample.target,
         )
         sampled = sample_amounts(
@@ -172,8 +184,11 @@ def actions_from_policy(
         )
     targets = sampled.target.detach().cpu().numpy()
     amounts = sampled.amount.detach().cpu().numpy()
+    fires = sampled.fire.detach().cpu().numpy()
     moves: list[list[float | int]] = []
     for row_idx, context in enumerate(batch.contexts):
+        if not bool(fires[row_idx]):
+            continue
         action_idx = int(targets[row_idx])
         amount_idx = int(amounts[row_idx])
         if action_idx == 0 or action_idx >= len(context.candidate_ids):

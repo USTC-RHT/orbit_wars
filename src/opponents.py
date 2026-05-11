@@ -6,8 +6,13 @@
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import math
+import random
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import torch
@@ -121,15 +126,127 @@ class SelfPlayOpponent:
         )
 
 
+class ExternalScriptOpponent:
+    """Wrap an Orbit Wars lab external agent as a training opponent."""
+
+    def __init__(self, agent_dir: Path) -> None:
+        self.agent_dir = agent_dir.resolve()
+        self.main_py = self.agent_dir / "main.py"
+        if not self.main_py.exists():
+            raise FileNotFoundError(f"External opponent entry not found: {self.main_py}")
+        self.modules: dict[int, Any] = {}
+        self.call_with_config: dict[int, bool] = {}
+        self.load_counter = 0
+
+    def reset_env(self, env_index: int, seed: int) -> None:
+        """Reload per env so module-level state in external agents does not leak across episodes."""
+
+        self.modules[env_index], self.call_with_config[env_index] = self._load_module(env_index, seed)
+
+    def act_for_env(self, env_index: int, observation: Any) -> list[list[float | int]]:
+        if env_index not in self.modules:
+            self.reset_env(env_index, seed=0)
+        return self._call_agent(env_index, observation)
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        env_index = -1
+        if env_index not in self.modules:
+            self.reset_env(env_index, seed=0)
+        return self._call_agent(env_index, observation)
+
+    def _load_module(self, env_index: int, seed: int) -> tuple[Any, bool]:
+        self.load_counter += 1
+        module_name = f"_orbit_external_{self.agent_dir.name.replace('-', '_')}_{id(self)}_{env_index}_{self.load_counter}"
+        spec = importlib.util.spec_from_file_location(module_name, self.main_py)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load external opponent: {self.main_py}")
+        module = importlib.util.module_from_spec(spec)
+        old_path = list(sys.path)
+        try:
+            sys.path.insert(0, str(self.agent_dir))
+            spec.loader.exec_module(module)
+        finally:
+            sys.path = old_path
+        agent = getattr(module, "agent", None)
+        if agent is None or not callable(agent):
+            raise AttributeError(f"External opponent has no callable agent(obs): {self.main_py}")
+        random.seed(int(seed))
+        try:
+            signature = inspect.signature(agent)
+            call_with_config = len(signature.parameters) >= 2
+        except (TypeError, ValueError):
+            call_with_config = False
+        return module, call_with_config
+
+    def _call_agent(self, env_index: int, observation: Any) -> list[list[float | int]]:
+        module = self.modules[env_index]
+        agent = module.agent
+        if self.call_with_config.get(env_index, False):
+            moves = agent(observation, {"__raw_path__": str(self.main_py)})
+        else:
+            moves = agent(observation)
+        return list(moves or [])
+
+
+class MixedOpponent:
+    """Episode-level opponent pool.
+
+    每个并行 env 在 reset 时按权重抽一个对手，并在整局内保持不变。
+    """
+
+    def __init__(self, cfg: TrainConfig, device: torch.device) -> None:
+        names = list(cfg.opponent_pool or ["nearest"])
+        weights = list(cfg.opponent_pool_weights or [1.0])
+        if len(weights) != len(names):
+            raise ValueError("opponent_pool_weights length must match opponent_pool length.")
+        if not names:
+            raise ValueError("opponent_pool must not be empty.")
+        if sum(max(0.0, float(w)) for w in weights) <= 0.0:
+            raise ValueError("opponent_pool_weights must contain at least one positive weight.")
+        self.names = names
+        self.weights = [max(0.0, float(w)) for w in weights]
+        self.opponents = {name: build_opponent(name, cfg, device) for name in sorted(set(names))}
+        self.active_by_env: dict[int, str] = {}
+
+    def reset_env(self, env_index: int, seed: int) -> None:
+        rng = random.Random((int(seed) + 1) * 1_000_003 + int(env_index))
+        name = rng.choices(self.names, weights=self.weights, k=1)[0]
+        self.active_by_env[env_index] = name
+        reset = getattr(self.opponents[name], "reset_env", None)
+        if reset is not None:
+            reset(env_index, seed)
+
+    def act_for_env(self, env_index: int, observation: Any) -> list[list[float | int]]:
+        name = self.active_by_env.get(env_index, self.names[0])
+        opponent = self.opponents[name]
+        act_for_env = getattr(opponent, "act_for_env", None)
+        return act_for_env(env_index, observation) if act_for_env is not None else opponent.act(observation)
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        return self.opponents[self.names[0]].act(observation)
+
+    def sync_from(self, model: ActorCritic, state_normalizer: StateNormalizer | None = None) -> None:
+        for opponent in self.opponents.values():
+            sync = getattr(opponent, "sync_from", None)
+            if sync is not None:
+                sync(model, state_normalizer)
+
+
 def build_opponent(name: str, cfg: TrainConfig, device: torch.device) -> Opponent:
     """按配置创建训练对手。"""
 
-    if name == "random":
+    normalized = name.strip().lower()
+    if normalized == "random":
         return RandomOpponent()
-    if name == "nearest":
+    if normalized == "nearest":
         return NearestOpponent()
-    if name == "self":
+    if normalized == "self":
         return SelfPlayOpponent(cfg, device)
+    if normalized == "mixed":
+        return MixedOpponent(cfg, device)
+    if normalized in {"sigmaborov-reinforce", "sigmaborov_reinforce"}:
+        repo_root = Path(__file__).resolve().parents[2]
+        return ExternalScriptOpponent(repo_root / "orbit-wars-lab" / "agents" / "external" / "sigmaborov-reinforce")
     raise ValueError(f"Unknown opponent: {name}")
 
 

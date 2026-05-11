@@ -29,7 +29,7 @@ from .features import (
 )
 from .model import ActorCritic
 from .normalization import StateNormalizer
-from .opponents import SelfPlayOpponent, actions_from_policy, build_opponent, decoded_action_from_indices
+from .opponents import actions_from_policy, build_opponent, decoded_action_from_indices
 from .ppo import PPOOptimizer, RolloutBatch, sample_amounts, sample_fire, sample_targets
 from .state import read
 
@@ -129,8 +129,9 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
         start_update = int(ckpt["update"]) + 1
         print(f"Resumed from {resume_from}, starting at update={start_update}", flush=True)
 
-    if isinstance(opponent, SelfPlayOpponent):
-        opponent.sync_from(model, state_normalizer)
+    sync_opponent = getattr(opponent, "sync_from", None)
+    if sync_opponent is not None:
+        sync_opponent(model, state_normalizer)
 
     next_seed = cfg.seed
     batches = []
@@ -202,8 +203,9 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
         )
         metrics = ppo.train(rollout)
 
-        if isinstance(opponent, SelfPlayOpponent) and update % cfg.self_play_update_interval == 0:
-            opponent.sync_from(model, state_normalizer)
+        sync_opponent = getattr(opponent, "sync_from", None)
+        if sync_opponent is not None and update % cfg.self_play_update_interval == 0:
+            sync_opponent(model, state_normalizer)
 
         eval_stats = maybe_eval_deterministic(
             model,

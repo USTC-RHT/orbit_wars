@@ -132,6 +132,8 @@ class TrainConfig:
     checkpoint_every: int = 10
     log_every: int = 1
     opponent: str = "nearest"
+    opponent_pool: list[str] = field(default_factory=lambda: ["nearest"])
+    opponent_pool_weights: list[float] = field(default_factory=lambda: [1.0])
     self_play_update_interval: int = 25
     # self-play 对手本质上是在“推理”旧策略，默认用 argmax 保持行为稳定。
     self_play_deterministic: bool = True

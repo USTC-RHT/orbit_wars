@@ -3,7 +3,7 @@
 # 命令行参数可以临时覆盖 updates/num-envs/rollout-steps/device/run-name/opponent。
 
 seed: 42
-run_name: "0509_target_filter"
+run_name: "0511_target_filter"
 device: auto
 save_dir: outputs
 checkpoint_every: 100
@@ -45,15 +45,15 @@ reward:
   # 发射惩罚：关闭无差别惩罚，改用 wasted_attack_penalty 只罚送兵失败。
   launch_penalty: 0.0
   # 早期占领中立星球奖励：鼓励先吃近处中立，按 exp(-ETA/scale) 和开局衰减。
-  neutral_capture_weight: 0.05
+  neutral_capture_weight: 0.2
   neutral_capture_eta_scale: 12.0
   neutral_capture_early_steps: 150
   # 打掉敌方星球奖励：敌星是双向收益，按星球生产力放大。
-  enemy_capture_weight: 0.10
+  enemy_capture_weight: 0.05
   # 丢失我方星球惩罚：独立于 step_clip，避免防守信号被裁剪到太小。
-  lose_planet_penalty: 0.10
+  lose_planet_penalty: 0.05
   # 送兵失败惩罚：我方舰队消失且估计撞到非友方星球但目标仍不是我方时，按船数扣分。
-  wasted_attack_penalty: 0.0003
+  wasted_attack_penalty: 0.0002
   # 单步 shaped reward 裁剪：保护 dense reward 不会单步爆掉，盖过 terminal。
   step_clip: 0.05
 

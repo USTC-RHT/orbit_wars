@@ -3,12 +3,14 @@
 # 命令行参数可以临时覆盖 updates/num-envs/rollout-steps/device/run-name/opponent。
 
 seed: 42
-run_name: "0509_target_filter_no_combat"
+run_name: "0511_target_filter_no_combat"
 device: auto
 save_dir: outputs
 checkpoint_every: 100
 log_every: 1
-opponent: nearest
+opponent: mixed
+opponent_pool: [nearest, self, sigmaborov-reinforce]
+opponent_pool_weights: [0.5, 0.2, 0.3]
 self_play_update_interval: 25
 self_play_deterministic: true
 alternate_player_sides: true

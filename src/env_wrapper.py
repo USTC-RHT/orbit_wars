@@ -75,6 +75,9 @@ class OrbitWarsPPOEnv:
             self.learner_player = (self.env_index + self.episode_index) % 2
         else:
             self.learner_player = 0
+        reset_env = getattr(self.opponent, "reset_env", None)
+        if reset_env is not None:
+            reset_env(self.env_index, seed)
         self.env = make("orbit_wars", configuration={"seed": int(seed), "randomSeed": int(seed)}, debug=False)
         self.env.reset(num_agents=2)
         states = self.env.step([[], []])
@@ -93,7 +96,12 @@ class OrbitWarsPPOEnv:
             raise RuntimeError("Call reset before step.")
         prev_obs = self.last_obs
         prev_state = parse_observation(prev_obs)
-        opponent_action = self.opponent.act(self.last_opp_obs)
+        act_for_env = getattr(self.opponent, "act_for_env", None)
+        opponent_action = (
+            act_for_env(self.env_index, self.last_opp_obs)
+            if act_for_env is not None
+            else self.opponent.act(self.last_opp_obs)
+        )
         joint = [action, opponent_action] if self.learner_player == 0 else [opponent_action, action]
         states = self.env.step(joint)
         player_state = states[self.learner_player]

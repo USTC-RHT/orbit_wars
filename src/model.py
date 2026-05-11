@@ -18,11 +18,13 @@ import torch.nn.functional as F
 class PolicyOutput:
     """网络前向输出。
 
-    target_logits: 每颗来源星球对 no-op + 全图目标槽位的打分。
+    fire_logits: 每颗来源星球是否发射的 Bernoulli logit。
+    target_logits: 每颗来源星球对全图目标槽位的打分；slot 0 仍保留为 no-op 占位。
     amount_logits: 已选目标对应的派兵档位打分，形状为 [batch, ship_bucket_count]。
     value: critic 对该来源星球决策状态的价值估计。
     """
 
+    fire_logits: torch.Tensor
     target_logits: torch.Tensor
     amount_logits: torch.Tensor
     value: torch.Tensor
@@ -51,7 +53,8 @@ class ActorCritic(nn.Module):
     """按来源星球决策的 Actor-Critic 网络。
 
     一行输入代表一颗我方来源星球。Actor 分成两个头：
-    - target head: 用 src query 与全图 target keys 点积，选择目标/no-op。
+    - fire head: 先判断当前来源星球这一帧是否发射。
+    - target head: fire=True 时，用 src query 与全图 target keys 点积选择目标。
     - amount head: 目标采样后，只针对被选中的目标槽位选择派兵数量档位。
 
     Critic 输出这行决策状态的价值 V(s)。
@@ -65,19 +68,46 @@ class ActorCritic(nn.Module):
         candidate_count: int,
         ship_bucket_count: int,
         hidden_size: int = 128,
+        use_cnn: bool = False,
+        map_channels: int = 6,
+        map_grid_size: int = 8,
     ) -> None:
         super().__init__()
         self.candidate_count = candidate_count
         self.ship_bucket_count = ship_bucket_count
+        self.use_cnn = use_cnn
+        self.map_channels = map_channels
+        self.map_grid_size = map_grid_size
         self.self_encoder = mlp(self_dim, hidden_size)
         self.candidate_encoder = mlp(candidate_dim, hidden_size)
         self.global_encoder = mlp(global_dim, hidden_size)
-        context_dim = hidden_size * 3
-        per_target_dim = hidden_size * 4
+        cnn_out_dim = 16
+        if self.use_cnn:
+            self.map_encoder = nn.Sequential(
+                nn.Conv2d(map_channels, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(16, cnn_out_dim),
+                nn.ReLU(),
+            )
+        else:
+            self.map_encoder = None
+        context_dim = hidden_size * 3 + (cnn_out_dim if self.use_cnn else 0)
+        per_target_dim = context_dim + hidden_size
         self.query = nn.Sequential(
             nn.Linear(context_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
+        )
+        self.fire_actor = nn.Sequential(
+            nn.Linear(context_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
         )
         self.key = nn.Linear(hidden_size, hidden_size)
         self.noop_key = nn.Parameter(torch.zeros(hidden_size))
@@ -116,9 +146,7 @@ class ActorCritic(nn.Module):
 
     def _amount_logits(
         self,
-        self_h: torch.Tensor,
-        global_h: torch.Tensor,
-        map_h: torch.Tensor,
+        context_h: torch.Tensor,
         cand_h: torch.Tensor,
         selected_targets: torch.Tensor,
     ) -> torch.Tensor:
@@ -126,15 +154,15 @@ class ActorCritic(nn.Module):
 
         row = torch.arange(selected_targets.shape[0], device=selected_targets.device)
         selected_target_h = cand_h[row, selected_targets]
-        return self.amount_actor(torch.cat([self_h, global_h, map_h, selected_target_h], dim=-1))
+        return self.amount_actor(torch.cat([context_h, selected_target_h], dim=-1))
 
-    def _critic_value(self, self_h: torch.Tensor, global_h: torch.Tensor, map_h: torch.Tensor) -> torch.Tensor:
-        return self.critic(torch.cat([self_h, global_h, map_h], dim=-1)).squeeze(-1)
+    def _critic_value(self, context_h: torch.Tensor) -> torch.Tensor:
+        return self.critic(context_h).squeeze(-1)
 
-    def _query(self, self_h: torch.Tensor, global_h: torch.Tensor, map_h: torch.Tensor) -> torch.Tensor:
+    def _query(self, context_h: torch.Tensor) -> torch.Tensor:
         """来源星球 query：它带着自身、全局统计、全图 pooled 上下文去匹配目标。"""
 
-        q = self.query(torch.cat([self_h, global_h, map_h], dim=-1))
+        q = self.query(context_h)
         return F.normalize(q, dim=-1)
 
     def _score_targets(self, query: torch.Tensor, keys: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
@@ -149,6 +177,7 @@ class ActorCritic(nn.Module):
         candidate_features: torch.Tensor,
         global_features: torch.Tensor,
         candidate_mask: torch.Tensor,
+        map_features: torch.Tensor | None = None,
         selected_targets: torch.Tensor | None = None,
     ) -> PolicyOutput:
         """前向传播。
@@ -162,14 +191,28 @@ class ActorCritic(nn.Module):
         cand_h = self.candidate_encoder(candidate_features)
         global_h = self.global_encoder(global_features)
         map_h = self._masked_pool(cand_h, candidate_features)
+        context_parts = [self_h, global_h, map_h]
+        if self.use_cnn:
+            if map_features is None:
+                map_features = torch.zeros(
+                    self_h.shape[0],
+                    self.map_channels,
+                    self.map_grid_size,
+                    self.map_grid_size,
+                    dtype=self_h.dtype,
+                    device=self_h.device,
+                )
+            context_parts.append(self.map_encoder(map_features))
+        context_h = torch.cat(context_parts, dim=-1)
 
         # [设计] Dot-product target selector：当前来源星球形成 query，
         # 全图目标编码形成 keys，query 与每个 key 的匹配分数就是 target logits。
         target_logits = self._score_targets(
-            self._query(self_h, global_h, map_h),
+            self._query(context_h),
             self._target_keys(cand_h),
             candidate_mask,
         )
+        fire_logits = self.fire_actor(context_h).squeeze(-1)
 
         if selected_targets is None:
             amount_logits = torch.zeros(
@@ -180,6 +223,11 @@ class ActorCritic(nn.Module):
             )
         else:
             # 自回归第二步：目标已经确定，再根据 selected target_h 决定派多少船。
-            amount_logits = self._amount_logits(self_h, global_h, map_h, cand_h, selected_targets)
-        value = self._critic_value(self_h, global_h, map_h)
-        return PolicyOutput(target_logits=target_logits, amount_logits=amount_logits, value=value)
+            amount_logits = self._amount_logits(context_h, cand_h, selected_targets)
+        value = self._critic_value(context_h)
+        return PolicyOutput(
+            fire_logits=fire_logits,
+            target_logits=target_logits,
+            amount_logits=amount_logits,
+            value=value,
+        )

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Bernoulli, Categorical
 
 from .model import PolicyOutput
 
@@ -19,11 +19,13 @@ from .model import PolicyOutput
 class ActionSample:
     """策略网络采样出来的一次动作。
 
-    一个动作分成两部分：
-    target 表示打哪个候选目标，0 表示不发兵；
+    一个动作分成三部分：
+    fire 表示这颗来源星球是否发射；
+    target 表示打哪个候选目标；
     amount 表示选择哪个派兵比例档位。
     """
 
+    fire: torch.Tensor
     target: torch.Tensor
     amount: torch.Tensor
     log_prob: torch.Tensor
@@ -31,9 +33,19 @@ class ActionSample:
 
 
 @dataclass(slots=True)
-class TargetSample:
-    """自回归第一步：只采样目标。"""
+class FireSample:
+    """第一步：采样是否发射。"""
 
+    fire: torch.Tensor
+    log_prob: torch.Tensor
+    entropy: torch.Tensor
+
+
+@dataclass(slots=True)
+class TargetSample:
+    """第二步：fire=True 时采样目标。"""
+
+    fire: torch.Tensor
     target: torch.Tensor
     log_prob: torch.Tensor
     entropy: torch.Tensor
@@ -51,8 +63,10 @@ class RolloutBatch:
     self_features: torch.Tensor
     candidate_features: torch.Tensor
     global_features: torch.Tensor
+    map_features: torch.Tensor
     candidate_mask: torch.Tensor
     amount_mask: torch.Tensor
+    fire_actions: torch.Tensor
     target_actions: torch.Tensor
     amount_actions: torch.Tensor
     old_log_probs: torch.Tensor
@@ -83,6 +97,19 @@ def safe_logits(logits: torch.Tensor) -> torch.Tensor:
     return fixed
 
 
+def fire_target_mask(candidate_mask: torch.Tensor) -> torch.Tensor:
+    """fire=True 时 target head 可选目标。
+
+    slot 0 仍然作为 no-op 占位保留在特征里，但 fire=True 后不允许再选择
+    no-op；是否不行动由 fire_head 单独决定。
+    """
+
+    mask = candidate_mask.bool().clone()
+    if mask.shape[-1] > 0:
+        mask[..., 0] = False
+    return mask
+
+
 def masked_amount_logits(
     amount_logits: torch.Tensor,
     amount_mask: torch.Tensor | None,
@@ -109,16 +136,50 @@ def masked_amount_logits(
     return amount_logits.masked_fill(~fixed_mask, torch.finfo(amount_logits.dtype).min)
 
 
-def sample_targets(outputs: PolicyOutput, deterministic: bool) -> TargetSample:
-    """自回归第一步：从 target logits 采样目标/no-op。"""
+def sample_fire(outputs: PolicyOutput, candidate_mask: torch.Tensor, deterministic: bool) -> FireSample:
+    """自回归第一步：采样 fire/no-fire。
 
-    target_logits = safe_logits(outputs.target_logits)
+    如果当前行没有任何可发目标，则强制 fire=False。
+    """
+
+    has_target = fire_target_mask(candidate_mask).any(dim=-1)
+    fire_logits = torch.where(
+        has_target,
+        outputs.fire_logits,
+        torch.full_like(outputs.fire_logits, -1.0e8),
+    )
+    fire_dist = Bernoulli(logits=fire_logits)
+    fire_float = (torch.sigmoid(fire_logits) > 0.5).float() if deterministic else fire_dist.sample()
+    fire = fire_float.bool()
+    return FireSample(
+        fire=fire,
+        log_prob=fire_dist.log_prob(fire_float),
+        entropy=torch.where(has_target, fire_dist.entropy(), torch.zeros_like(fire_logits)),
+    )
+
+
+def sample_targets(
+    outputs: PolicyOutput,
+    fire_sample: FireSample,
+    candidate_mask: torch.Tensor,
+    deterministic: bool,
+) -> TargetSample:
+    """自回归第二步：fire=True 时从 target logits 采样目标。"""
+
+    target_logits = outputs.target_logits.masked_fill(~fire_target_mask(candidate_mask), torch.finfo(outputs.target_logits.dtype).min)
+    no_fire = ~fire_sample.fire
+    if no_fire.any():
+        target_logits = target_logits.clone()
+        target_logits[no_fire] = torch.finfo(target_logits.dtype).min
+        target_logits[no_fire, 0] = 0.0
+    target_logits = safe_logits(target_logits)
     target_dist = Categorical(logits=target_logits)
     target = target_logits.argmax(dim=-1) if deterministic else target_dist.sample()
     return TargetSample(
+        fire=fire_sample.fire,
         target=target,
-        log_prob=target_dist.log_prob(target),
-        entropy=target_dist.entropy(),
+        log_prob=fire_sample.log_prob + fire_sample.fire.float() * target_dist.log_prob(target),
+        entropy=fire_sample.entropy + fire_sample.fire.float() * target_dist.entropy(),
     )
 
 
@@ -134,23 +195,23 @@ def sample_amounts(
     Categorical 组成，所以总 log_prob 和总 entropy 都是两部分相加。
     """
 
+    fire = target_sample.fire
     target = target_sample.target
     amount_logits = masked_amount_logits(outputs.amount_logits, amount_mask, target)
     amount_dist = Categorical(logits=amount_logits)
     amount = amount_logits.argmax(dim=-1) if deterministic else amount_dist.sample()
-    # [设计] target 和 amount 视作独立（factored）分布，联合 log_prob 直接相加。
-    # 两者实际有关联（选了目标才有意义发兵），但独立假设大幅简化网络和 loss，经验上够用。
-    # [游戏特殊] no-op（target==0）时 amount 对游戏无意义，屏蔽其梯度贡献避免引入噪声。
-    not_noop = (target != 0).float()
-    log_prob = target_sample.log_prob + not_noop * amount_dist.log_prob(amount)
-    entropy = target_sample.entropy + not_noop * amount_dist.entropy()
-    return ActionSample(target=target, amount=amount, log_prob=log_prob, entropy=entropy)
+    fire_float = fire.float()
+    log_prob = target_sample.log_prob + fire_float * amount_dist.log_prob(amount)
+    entropy = target_sample.entropy + fire_float * amount_dist.entropy()
+    return ActionSample(fire=fire, target=target, amount=amount, log_prob=log_prob, entropy=entropy)
 
 
 def log_prob_entropy(
     outputs: PolicyOutput,
+    fire_actions: torch.Tensor,
     target_actions: torch.Tensor,
     amount_actions: torch.Tensor,
+    candidate_mask: torch.Tensor,
     amount_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """重新计算旧动作在当前新策略下的 log_prob 和 entropy。
@@ -159,13 +220,23 @@ def log_prob_entropy(
     用二者的比值限制策略更新幅度。
     """
 
-    target_dist = Categorical(logits=safe_logits(outputs.target_logits))
+    fire_float = fire_actions.float()
+    fire_dist = Bernoulli(logits=outputs.fire_logits)
+    target_logits = outputs.target_logits.masked_fill(~fire_target_mask(candidate_mask), torch.finfo(outputs.target_logits.dtype).min)
+    no_fire = ~fire_actions.bool()
+    if no_fire.any():
+        target_logits = target_logits.clone()
+        target_logits[no_fire] = torch.finfo(target_logits.dtype).min
+        target_logits[no_fire, 0] = 0.0
+    target_dist = Categorical(logits=safe_logits(target_logits))
     amount_logits = masked_amount_logits(outputs.amount_logits, amount_mask, target_actions)
     amount_dist = Categorical(logits=amount_logits)
-    # 与 sample_actions 保持一致：no-op 时不计入 amount 的 log_prob / entropy。
-    not_noop = (target_actions != 0).float()
-    log_prob = target_dist.log_prob(target_actions) + not_noop * amount_dist.log_prob(amount_actions)
-    entropy = target_dist.entropy() + not_noop * amount_dist.entropy()
+    log_prob = (
+        fire_dist.log_prob(fire_float)
+        + fire_float * target_dist.log_prob(target_actions)
+        + fire_float * amount_dist.log_prob(amount_actions)
+    )
+    entropy = fire_dist.entropy() + fire_float * target_dist.entropy() + fire_float * amount_dist.entropy()
     return log_prob, entropy
 
 
@@ -249,12 +320,15 @@ class PPOOptimizer:
                     tensors.candidate_features[idx],
                     tensors.global_features[idx],
                     tensors.candidate_mask[idx],
+                    map_features=tensors.map_features[idx],
                     selected_targets=tensors.target_actions[idx],
                 )
                 log_prob, entropy = log_prob_entropy(
                     outputs,
+                    tensors.fire_actions[idx],
                     tensors.target_actions[idx],
                     tensors.amount_actions[idx],
+                    tensors.candidate_mask[idx],
                     tensors.amount_mask[idx],
                 )
                 values = outputs.value.flatten()
@@ -328,8 +402,10 @@ class PPOOptimizer:
             self_features=batch.self_features.to(self.device),
             candidate_features=batch.candidate_features.to(self.device),
             global_features=batch.global_features.to(self.device),
+            map_features=batch.map_features.to(self.device),
             candidate_mask=batch.candidate_mask.to(self.device).bool(),
             amount_mask=batch.amount_mask.to(self.device).bool(),
+            fire_actions=batch.fire_actions.to(self.device).bool(),
             target_actions=batch.target_actions.to(self.device),
             amount_actions=batch.amount_actions.to(self.device),
             old_log_probs=batch.old_log_probs.to(self.device),

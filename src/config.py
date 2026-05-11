@@ -41,16 +41,21 @@ class RewardConfig:
     ships_weight: float = 0.0015
     production_weight: float = 0.025
     planet_weight: float = 0.035
-    fleet_weight: float = 0.0008
     time_penalty: float = 0.0
     launch_penalty: float = 0.0
-    eta_bonus_weight: float = 0.0
+    neutral_capture_weight: float = 0.0
+    neutral_capture_eta_scale: float = 12.0
+    neutral_capture_early_steps: int = 150
+    enemy_capture_weight: float = 0.0
+    lose_planet_penalty: float = 0.0
+    wasted_attack_penalty: float = 0.0
     step_clip: float = 0.20
 
 
 @dataclass(slots=True)
 class ModelConfig:
     hidden_size: int = 128
+    use_cnn: bool = False
 
 
 @dataclass(slots=True)

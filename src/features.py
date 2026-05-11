@@ -219,6 +219,8 @@ def build_candidate_features(
     spd_max = min(1.0 + 5.0 * (log_r_max ** 1.5), 6.0)
     comet_ids = set(state.comet_planet_ids)
     planets = sorted(state.planets, key=lambda p: p.id)[: cfg.max_planets]
+    attack_candidates: list[tuple[float, int]] = []
+    defense_candidates: list[tuple[float, int]] = []
     for idx, tgt in enumerate(planets, start=1):
         dx = tgt.x - src.x
         dy = tgt.y - src.y
@@ -280,7 +282,25 @@ def build_candidate_features(
                 viable = [ships > tgt.ships for ships in ship_buckets]
                 amount_mask[idx] = np.asarray(viable, dtype=bool)
                 mask[idx] = any(viable)
+        if mask[idx]:
+            if owner_is_enemy or owner_is_neutral:
+                attack_candidates.append((_proto_score(src, tgt), idx))
+            elif owner_is_friend:
+                defense_pressure = _defense_pressure(tgt, inbound)
+                if defense_pressure > 0.0:
+                    defense_candidates.append((defense_pressure, idx))
         candidate_ids[idx] = tgt.id
+
+    if cfg.target_filter_enabled:
+        mask = _apply_target_filter(
+            mask,
+            attack_candidates,
+            defense_candidates,
+            attack_top_k=cfg.attack_top_k,
+            defense_top_k=cfg.defense_top_k,
+        )
+        amount_mask[~mask] = False
+        amount_mask[0, :] = True
 
     return features, mask, amount_mask, ship_buckets, candidate_ids
 
@@ -407,6 +427,41 @@ def _proto_score(src: Planet, tgt: Planet) -> float:
         enemy_bonus = 0
     total_ships = min_ships + enemy_produced
     return (100.0 - dist) + 15.0 * tgt.production + 10.0 * enemy_bonus - 0.7 * total_ships - 2.0 * eta
+
+
+def _defense_pressure(
+    tgt: Planet,
+    inbound: dict[int, tuple[float, float, float, float, float, float]] | None,
+) -> float:
+    """Estimate how badly a friendly planet needs reinforcements."""
+
+    my_inbound, enemy_inbound, _my_eta_min, _my_eta_mean, enemy_eta_min, _enemy_eta_mean = (
+        inbound or {}
+    ).get(tgt.id, (0.0, 0.0, 1.0, 1.0, 1.0, 1.0))
+    if enemy_inbound <= 0.0:
+        return 0.0
+    enemy_eta = enemy_eta_min * INBOUND_HORIZON
+    projected_defense = float(tgt.ships) + float(my_inbound) + enemy_eta * float(tgt.production)
+    return float(enemy_inbound) - projected_defense
+
+
+def _apply_target_filter(
+    base_mask: np.ndarray,
+    attack_candidates: list[tuple[float, int]],
+    defense_candidates: list[tuple[float, int]],
+    *,
+    attack_top_k: int,
+    defense_top_k: int,
+) -> np.ndarray:
+    """Keep no-op, top-K Proto attack targets, and top defense-pressure friends."""
+
+    filtered = np.zeros_like(base_mask, dtype=bool)
+    filtered[0] = bool(base_mask[0])
+    for _score, idx in sorted(attack_candidates, key=lambda row: row[0], reverse=True)[: max(0, attack_top_k)]:
+        filtered[idx] = bool(base_mask[idx])
+    for _pressure, idx in sorted(defense_candidates, key=lambda row: row[0], reverse=True)[: max(0, defense_top_k)]:
+        filtered[idx] = bool(base_mask[idx])
+    return filtered
 
 
 def is_rotating(planet: Planet) -> bool:

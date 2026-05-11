@@ -27,6 +27,9 @@ class EnvConfig:
     max_planets: int = 45
     max_ships: float = 500.0
     max_production: float = 5.0
+    target_filter_enabled: bool = False
+    attack_top_k: int = 6
+    defense_top_k: int = 3
 
 
 @dataclass(slots=True)

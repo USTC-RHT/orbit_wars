@@ -2,9 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .Python
-artifacts/*/ckpt_*.pt
-artifacts/*/ckpt_last.pt
-artifacts/*/metrics.csv
+outputs/
 *.log
 .ipynb_checkpoints/
 .vscode/

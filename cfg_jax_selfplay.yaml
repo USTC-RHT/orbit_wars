@@ -1,0 +1,86 @@
+# JAX 对手池训练配置：nearest / selfplay / selfplay-lag 各 1/3（Phase 1）
+# Phase 2（稳定战胜 nearest 后）：selfplay / selfplay-lag 各 1/2 + sigma eval 跟踪
+#
+# 设计原则：
+#   - 关闭所有 dense shaping，只用终局胜负奖励（胜 +1，负/平 -1）。
+#   - opponent: "pool" — 每 rollout 随机从对手池抽取对手类型。
+#   - lagged 对手为 pool_lag_interval 步前的自己，防止策略过快收敛。
+#   - 连续 promote_consecutive_evals 次 nearest win_rate >= promote_nearest_win_rate
+#     自动升阶至 Phase 2。
+#
+# 启动示例（从 rl-agent/ 目录）：
+#   python -m jax_agent.train_jax --config cfg_jax_selfplay.yaml
+
+seed: 42
+run_name: "jax_pool_0513"
+save_dir: outputs
+checkpoint_every: 100
+opponent: "pool"
+
+env:
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: true
+  attack_top_k: 6
+  defense_top_k: 3
+
+reward:
+  # 只开终局奖励；胜 +1，负 −1，平局按得分决定。
+  terminal_weight: 1.0
+  ships_weight: 0.0
+  production_weight: 0.0
+  planet_weight: 0.0
+  time_penalty: 0.0
+  launch_penalty: 0.0
+  neutral_capture_weight: 0.0
+  neutral_capture_eta_scale: 12.0
+  neutral_capture_early_steps: 150
+  enemy_capture_weight: 0.0
+  lose_planet_penalty: 0.0
+  wasted_attack_penalty: 0.0
+  step_clip: 0.0
+
+model:
+  hidden_size: 128
+  use_cnn: false
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+ppo:
+  num_envs: 64
+  rollout_steps: 128
+  total_updates: 5000
+  epochs: 4
+  minibatch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.25
+  vf_coef: 0.5
+  ent_coef: 0.05
+  lr: 3.0e-4
+  max_grad_norm: 0.5
+  norm_adv: true
+
+# 每隔多少 update 把 learner 权重同步给冻结对手（selfplay 对手）
+self_play_update_interval: 50
+# 对手池配置
+pool_lag_interval: 50           # 每隔多少 update 更新 lagged 对手权重（对抗 50 步前的自己）
+promote_nearest_win_rate: 1.0   # nearest win_rate 达到此阈值触发升阶（全胜才升）
+promote_consecutive_evals: 3    # 连续多少次评估超过阈值才升阶至 Phase 2
+
+eval:
+  enabled: true
+  every: 200         # 每 200 次 update 评估一次
+  games: 10          # 每次评估局数
+  seed: 200000
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"

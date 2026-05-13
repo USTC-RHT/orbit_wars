@@ -386,7 +386,7 @@ def build_ship_buckets(src: Planet, cfg: EnvConfig) -> list[int]:
     s = int(src.ships)
     # 比例档位覆盖常见战术语义：试探/半攻/主攻/All-in。
     # 比起均匀线性档位，更容易踩中“刚好攻占 nearest 守军”的关键数量。
-    MIN_LAUNCH = 5  # 绝对下限：星球兵力不足 MIN_LAUNCH 时禁止发兵（全部档位为 0）。
+    MIN_LAUNCH = 10  # 绝对下限：星球兵力不足 MIN_LAUNCH 时禁止发兵（全部档位为 0）。
     if s < MIN_LAUNCH:
         return [0 for _ in range(cfg.ship_bucket_count)]
     ratios = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]

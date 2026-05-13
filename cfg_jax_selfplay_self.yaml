@@ -1,0 +1,74 @@
+# JAX 纯自博弈训练配置（对应原 jax_selfplay_0513 run，使用修复后的代码）
+# 修复：draw 奖励 0 → -1，ent_coef 0.02 → 0.05
+# 对手：始终为当前策略网络镜像（online self-play）
+#
+# 启动示例（从 rl-agent/ 目录）：
+#   python -m jax_agent.train_jax --config cfg_jax_selfplay_self.yaml
+
+seed: 42
+run_name: "jax_selfplay_0513b"
+save_dir: outputs
+checkpoint_every: 100
+opponent: "self"
+
+env:
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: true
+  attack_top_k: 6
+  defense_top_k: 3
+
+reward:
+  terminal_weight: 1.0
+  ships_weight: 0.0
+  production_weight: 0.0
+  planet_weight: 0.0
+  time_penalty: 0.0
+  launch_penalty: 0.0
+  neutral_capture_weight: 0.0
+  neutral_capture_eta_scale: 12.0
+  neutral_capture_early_steps: 150
+  enemy_capture_weight: 0.0
+  lose_planet_penalty: 0.0
+  wasted_attack_penalty: 0.0
+  step_clip: 0.0
+
+model:
+  hidden_size: 128
+  use_cnn: false
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+ppo:
+  num_envs: 64
+  rollout_steps: 128
+  total_updates: 5000
+  epochs: 4
+  minibatch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.25
+  vf_coef: 0.5
+  ent_coef: 0.05
+  lr: 3.0e-4
+  max_grad_norm: 0.5
+  norm_adv: true
+
+self_play_update_interval: 50
+
+eval:
+  enabled: true
+  every: 200
+  games: 10
+  seed: 200000
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"

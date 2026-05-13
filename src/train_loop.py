@@ -143,6 +143,8 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     wandb_run = init_wandb(cfg, run_dir, device)
     metrics_path = run_dir / "metrics.csv"
+    eval_opponents = eval_opponent_specs(cfg)
+    eval_extra_fields = eval_metric_fields(eval_opponents)
     with metrics_path.open("w", newline="") as f:
         csv.writer(f).writerow(
             [
@@ -174,6 +176,7 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                 "det_eval_losses",
                 "det_eval_draws",
             ]
+            + eval_extra_fields
         )
 
     print(
@@ -223,6 +226,7 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                     f"det_W/L/D={int(eval_stats['det_eval_wins'])}/"
                     f"{int(eval_stats['det_eval_losses'])}/"
                     f"{int(eval_stats['det_eval_draws'])}"
+                    f"{format_opponent_eval_text(eval_stats, eval_opponents)}"
                 )
             print(
                 f"update={update} loss={metrics['loss']:.4f} "
@@ -266,6 +270,10 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
                         "" if eval_stats is None else int(eval_stats["det_eval_losses"]),
                         "" if eval_stats is None else int(eval_stats["det_eval_draws"]),
                     ]
+                    + [
+                        "" if eval_stats is None else eval_stats.get(field, "")
+                        for field in eval_extra_fields
+                    ]
                 )
             # wandb 只保留 reward / win_rate / loss 相关的核心指标，
             # 避免面板被大量训练细节淹没。
@@ -283,6 +291,11 @@ def train(cfg: TrainConfig, resume_from: str | Path | None = None) -> None:
             }
             if eval_stats is not None:
                 wandb_payload["det_eval_win_rate"] = float(eval_stats["det_eval_win_rate"])
+                for name, _weight in eval_opponents:
+                    prefix = eval_metric_prefix(name)
+                    key = f"{prefix}_win_rate"
+                    if key in eval_stats:
+                        wandb_payload[key] = float(eval_stats[key])
             log_wandb(
                 wandb_run,
                 update,
@@ -558,6 +571,73 @@ def collect_rollout(
     return rollout, batches, next_seed, stats
 
 
+def eval_opponent_specs(cfg: TrainConfig) -> list[tuple[str, float]]:
+    """Return eval opponents and sampling weights, preserving configured pool order."""
+
+    if cfg.opponent == "mixed":
+        names = list(cfg.opponent_pool or [])
+        weights = list(cfg.opponent_pool_weights or [])
+        if len(weights) != len(names):
+            weights = [1.0 for _ in names]
+        merged: dict[str, float] = {}
+        for name, weight in zip(names, weights):
+            weight = max(0.0, float(weight))
+            if weight <= 0.0:
+                continue
+            merged[name] = merged.get(name, 0.0) + weight
+        return list(merged.items()) or [("nearest", 1.0)]
+    return [(cfg.opponent, 1.0)]
+
+
+def allocate_eval_games(total_games: int, specs: list[tuple[str, float]]) -> list[tuple[str, int]]:
+    """Allocate a fixed total number of eval games according to opponent weights."""
+
+    total_games = max(0, int(total_games))
+    if total_games == 0 or not specs:
+        return []
+    total_weight = sum(max(0.0, weight) for _name, weight in specs)
+    if total_weight <= 0.0:
+        specs = [(name, 1.0) for name, _weight in specs]
+        total_weight = float(len(specs))
+
+    exact = [(name, total_games * max(0.0, weight) / total_weight) for name, weight in specs]
+    floors = [(name, int(np.floor(value)), value - np.floor(value)) for name, value in exact]
+    remaining = total_games - sum(count for _name, count, _frac in floors)
+    order = sorted(range(len(floors)), key=lambda i: floors[i][2], reverse=True)
+    counts = [count for _name, count, _frac in floors]
+    for idx in order[:remaining]:
+        counts[idx] += 1
+    return [(floors[idx][0], counts[idx]) for idx in range(len(floors)) if counts[idx] > 0]
+
+
+def eval_metric_prefix(opponent_name: str) -> str:
+    safe = "".join(ch if ch.isalnum() else "_" for ch in opponent_name.lower()).strip("_")
+    return f"det_eval_{safe or 'opponent'}"
+
+
+def eval_metric_fields(specs: list[tuple[str, float]]) -> list[str]:
+    fields: list[str] = []
+    for name, _weight in specs:
+        prefix = eval_metric_prefix(name)
+        fields.extend([f"{prefix}_win_rate", f"{prefix}_wins", f"{prefix}_losses", f"{prefix}_draws"])
+    return fields
+
+
+def format_opponent_eval_text(eval_stats: dict[str, float], specs: list[tuple[str, float]]) -> str:
+    chunks = []
+    for name, _weight in specs:
+        prefix = eval_metric_prefix(name)
+        if f"{prefix}_win_rate" not in eval_stats:
+            continue
+        chunks.append(
+            f" {name}={eval_stats[f'{prefix}_win_rate']:.3f} "
+            f"W/L/D={int(eval_stats[f'{prefix}_wins'])}/"
+            f"{int(eval_stats[f'{prefix}_losses'])}/"
+            f"{int(eval_stats[f'{prefix}_draws'])}"
+        )
+    return "".join(chunks)
+
+
 def maybe_eval_deterministic(
     model: ActorCritic,
     cfg: TrainConfig,
@@ -573,14 +653,46 @@ def maybe_eval_deterministic(
         return None
     # 固定 base_seed：跨 update 复用同一组评估 seed，
     # 这样胜率曲线只反映策略变化，不受 seed 抽样噪声影响。
-    return eval_deterministic_policy(
-        model,
-        cfg,
-        device,
-        state_normalizer,
-        games=cfg.eval.games,
-        base_seed=cfg.eval.seed,
+    specs = eval_opponent_specs(cfg)
+    allocations = allocate_eval_games(cfg.eval.games, specs)
+    wins = 0.0
+    losses = 0.0
+    draws = 0.0
+    stats: dict[str, float] = {}
+    seed_offset = 0
+    for opponent_name, games in allocations:
+        opponent_stats = eval_deterministic_policy(
+            model,
+            cfg,
+            device,
+            state_normalizer,
+            games=games,
+            base_seed=cfg.eval.seed + seed_offset,
+            opponent_name=opponent_name,
+        )
+        seed_offset += games
+        wins += opponent_stats["det_eval_wins"]
+        losses += opponent_stats["det_eval_losses"]
+        draws += opponent_stats["det_eval_draws"]
+        prefix = eval_metric_prefix(opponent_name)
+        stats.update(
+            {
+                f"{prefix}_win_rate": opponent_stats["det_eval_win_rate"],
+                f"{prefix}_wins": opponent_stats["det_eval_wins"],
+                f"{prefix}_losses": opponent_stats["det_eval_losses"],
+                f"{prefix}_draws": opponent_stats["det_eval_draws"],
+            }
+        )
+    total = max(wins + losses + draws, 1.0)
+    stats.update(
+        {
+            "det_eval_win_rate": float(wins / total),
+            "det_eval_wins": float(wins),
+            "det_eval_losses": float(losses),
+            "det_eval_draws": float(draws),
+        }
     )
+    return stats
 
 
 def eval_deterministic_policy(
@@ -591,6 +703,7 @@ def eval_deterministic_policy(
     *,
     games: int,
     base_seed: int,
+    opponent_name: str | None = None,
 ) -> dict[str, float]:
     """用当前模型 argmax 策略完整打若干局。
 
@@ -613,6 +726,7 @@ def eval_deterministic_policy(
                 state_normalizer,
                 seed=base_seed + game_idx,
                 learner_player=learner_player,
+                opponent_name=opponent_name,
             )
             if reward > 0.0:
                 wins += 1
@@ -641,12 +755,16 @@ def play_eval_game(
     *,
     seed: int,
     learner_player: int,
+    opponent_name: str | None = None,
 ) -> float:
     """跑一局 deterministic eval，返回 learner 的 Kaggle 终局 reward。"""
 
     from kaggle_environments import make
 
-    opponent = build_opponent(cfg.opponent, cfg, device)
+    opponent = build_opponent(opponent_name or cfg.opponent, cfg, device)
+    sync = getattr(opponent, "sync_from", None)
+    if sync is not None:
+        sync(model, state_normalizer)
     env = make("orbit_wars", configuration={"seed": int(seed), "randomSeed": int(seed)}, debug=False)
     env.reset(num_agents=2)
     states = env.step([[], []])

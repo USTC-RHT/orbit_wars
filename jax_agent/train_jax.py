@@ -356,7 +356,14 @@ def main() -> None:
         hidden_size=cfg.model.hidden_size,
         use_cnn=cfg.model.use_cnn,
     )
-    train_state = make_train_state(rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm)
+    train_state = make_train_state(
+        rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
+        total_steps=(
+            cfg.ppo.total_updates
+            * cfg.ppo.epochs
+            * max(1, (cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets) // cfg.ppo.minibatch_size)
+        ) if getattr(cfg.ppo, "anneal_lr", False) else 0,
+    )
     normalizer_state = init_normalizer()
 
     run_dir = Path(cfg.save_dir) / f"{cfg.run_name}_jax"
@@ -489,7 +496,7 @@ def main() -> None:
         if not removable:
             return
         victim = max(removable, key=lambda entry: float(entry["winrate"]))
-        if float(victim["winrate"]) < 0.8:
+        if float(victim["winrate"]) < 0.6:
             return
         pool_entries.remove(victim)
         print(f"[pool] update={update_idx} 移除胜率最高对手 {victim['id']} "

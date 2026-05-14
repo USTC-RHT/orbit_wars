@@ -69,7 +69,7 @@ class Rollout(NamedTuple):
     done: jnp.ndarray               # [T, B, P] 是否终局
 
 
-def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float) -> TrainState:
+def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float, total_steps: int = 0) -> TrainState:
     variables = model.init(
         rng,
         sample_batch.self_features,
@@ -79,7 +79,11 @@ def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float) 
         sample_batch.map_features,
         jnp.zeros((sample_batch.self_features.shape[0],), dtype=jnp.int32),
     )
-    tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.adam(lr))
+    if total_steps > 0:
+        lr_schedule = optax.linear_schedule(init_value=lr, end_value=0.0, transition_steps=total_steps)
+    else:
+        lr_schedule = lr
+    tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.adam(lr_schedule))
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
 

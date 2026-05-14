@@ -1,6 +1,3 @@
-# JAX 对手池训练配置：nearest / selfplay-current / selfplay-lag 各 1/3（Phase 1）
-# Phase 2（稳定战胜 nearest 后）：selfplay-current / selfplay-lag 训练 + tamrazov-starwars eval 跟踪
-#
 # 设计原则：
 #   - 关闭所有 dense shaping，只用终局胜负奖励（胜 +1，负/平 -1）。
 #   - opponent: "pool" — 每 rollout 随机从对手池抽取对手类型。
@@ -60,12 +57,14 @@ ppo:
   minibatch_size: 4096
   gamma: 0.99
   gae_lambda: 0.95
-  clip_coef: 0.25
+  clip_coef: 0.15
   vf_coef: 0.5
-  ent_coef: 0.05
-  lr: 3.0e-4
+  ent_coef: 0.01
+  lr: 1.0e-4
   max_grad_norm: 0.5
   norm_adv: true
+  target_kl: 0.05
+  anneal_lr: true
 
 # 每隔多少 update 把 learner 权重同步给冻结对手（selfplay 对手）
 self_play_update_interval: 50

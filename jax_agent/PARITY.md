@@ -37,6 +37,9 @@ the main training path.
 
 - Python-only opponents, especially `sigmaborov-reinforce`, are not JIT-compatible
   and need a JAX port or a separate Python eval path.
+- JAX training intentionally treats terminal draws as losses for player 0 to
+  discourage passive self-play. This differs from Kaggle's tied-best-score
+  reward rule, where tied top players receive `+1`.
 
 ## Next Parity Tasks
 

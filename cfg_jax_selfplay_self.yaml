@@ -59,6 +59,7 @@ ppo:
   lr: 3.0e-4
   max_grad_norm: 0.5
   norm_adv: true
+  target_kl: 0.02   # KL 早停阈值；epoch 平均 approx_kl > 1.5*target_kl 时停止剩余 epoch
 
 self_play_update_interval: 50
 

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -46,6 +47,7 @@ class PPOParams:
     epochs: int = 4            # 每次 rollout 训练轮数
     minibatch_size: int = 4096 # 单个 minibatch 大小
     norm_adv: bool = True      # 是否对 advantage 做 batch 内平均方差归一化
+    target_kl: float = 0.05    # KL 早停阈值；epoch 平均 approx_kl > 1.5*target_kl 时停止剩余 epoch
 
 
 class Rollout(NamedTuple):
@@ -57,6 +59,7 @@ class Rollout(NamedTuple):
     candidate_mask: jnp.ndarray     # [T, B, P, P+1]
     amount_mask: jnp.ndarray        # [T, B, P, P+1, B]
     source_mask: jnp.ndarray        # [T, B, P] 我方星球标记
+    policy_mask: jnp.ndarray        # [T, B, P] 实际执行/真实 no-op 的动作才参与 policy loss
     fire: jnp.ndarray               # [T, B, P] bool
     target: jnp.ndarray             # [T, B, P] 目标槽位索引
     amount: jnp.ndarray             # [T, B, P] 派兵档位索引
@@ -100,7 +103,7 @@ def categorical_entropy(logits):
 
 
 def safe_logits(logits):
-    _assert_all_finite("ppo/logits_nan_check", jnp.where(jnp.isnan(logits), logits, 0.0))
+    _assert_all_finite("ppo/logits", logits)
     invalid = ~jnp.isfinite(logits).any(axis=-1)
     fixed = jnp.where(invalid[:, None], NEG_INF, logits)
     return fixed.at[:, 0].set(jnp.where(invalid, 0.0, fixed[:, 0]))
@@ -138,15 +141,17 @@ def compute_gae(rewards, dones, values, last_values, params: PPOParams):
     return returns, advantages
 
 
+@partial(jax.jit, static_argnames=("params",))
 def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, params: PPOParams, rng):
+    """PPO 多 epoch 更新，带 JIT 内 KL 早停。"""
     flat = flatten_rollout(rollout, returns, advantages)
     size = flat["source_mask"].shape[0]
+    num_minibatches = max(size // params.minibatch_size, 1)
+    keys = ["loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]
 
-    def epoch_body(_, carry):
-        ts, rng_in, metrics_acc = carry
+    def run_epoch(ts, rng_in):
         rng_in, rng_perm = jax.random.split(rng_in)
         order = jax.random.permutation(rng_perm, size)
-        num_minibatches = jnp.maximum(size // params.minibatch_size, 1)
 
         def mb_body(i, mb_carry):
             ts2, acc = mb_carry
@@ -155,22 +160,53 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
             ts2, metrics = update_minibatch(ts2, batch, params)
             return ts2, {k: acc[k] + metrics[k] for k in acc}
 
-        init_acc = {k: 0.0 for k in ["loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]}
+        init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
         ts, sums = jax.lax.fori_loop(0, num_minibatches, mb_body, (ts, init_acc))
         means = {k: sums[k] / num_minibatches for k in sums}
-        metrics_acc = {k: metrics_acc[k] + means[k] for k in metrics_acc}
-        return ts, rng_in, metrics_acc
+        return ts, rng_in, means
 
-    init_metrics = {k: 0.0 for k in ["loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]}
-    train_state, rng, metrics = jax.lax.fori_loop(0, params.epochs, epoch_body, (train_state, rng, init_metrics))
-    metrics = {k: metrics[k] / params.epochs for k in metrics}
+    def cond_fn(carry):
+        completed, _ts, _rng, _acc, last_kl = carry
+        under_epoch_limit = completed < params.epochs
+        kl_ok = (params.target_kl <= 0.0) | (completed == 0) | (last_kl <= 1.5 * params.target_kl)
+        return under_epoch_limit & kl_ok
+
+    def body_fn(carry):
+        completed, ts, rng_in, acc, _last_kl = carry
+        ts, rng_in, epoch_metrics = run_epoch(ts, rng_in)
+        acc = {k: acc[k] + epoch_metrics[k] for k in keys}
+        completed = completed + 1
+        return completed, ts, rng_in, acc, epoch_metrics["approx_kl"]
+
+    init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
+    init_carry = (
+        jnp.array(0, dtype=jnp.int32),
+        train_state,
+        rng,
+        init_acc,
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    completed, train_state, rng, metrics_acc, _last_kl = jax.lax.while_loop(cond_fn, body_fn, init_carry)
+    denom = jnp.maximum(completed.astype(jnp.float32), 1.0)
+    metrics = {k: metrics_acc[k] / denom for k in metrics_acc}
+    metrics["n_epochs_run"] = completed.astype(jnp.float32)
     return train_state, metrics
 
 
 def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams):
     """单个 minibatch 梯度更新。"""
     def loss_fn(model_params):
-        outputs = train_state.apply_fn(
+        zero_target = jnp.zeros_like(batch["target"])
+        value_outputs = train_state.apply_fn(
+            {"params": model_params},
+            batch["self_features"],
+            batch["candidate_features"],
+            batch["global_features"],
+            batch["candidate_mask"],
+            batch["map_features"],
+            zero_target,
+        )
+        action_outputs = train_state.apply_fn(
             {"params": model_params},
             batch["self_features"],
             batch["candidate_features"],
@@ -179,33 +215,42 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
             batch["map_features"],
             batch["target"],
         )
-        logp, entropy = log_prob_entropy(outputs, batch["fire"], batch["target"], batch["amount"], batch["candidate_mask"], batch["amount_mask"])
+        logp, entropy = log_prob_entropy(action_outputs, batch["fire"], batch["target"], batch["amount"], batch["candidate_mask"], batch["amount_mask"])
         logp = _assert_all_finite("ppo/logp", logp)
         entropy = _assert_all_finite("ppo/entropy", entropy)
         adv = batch["advantages"]
-        mask_bool = batch["source_mask"]  # 只对我方星球计损失
-        mask = mask_bool.astype(jnp.float32)
+        policy_mask_bool = batch["policy_mask"]  # 只让真实执行动作/真实 no-op 更新策略
+        value_mask_bool = batch["source_mask"]    # value 仍学习所有我方 source 的状态回报
+        policy_mask = policy_mask_bool.astype(jnp.float32)
+        value_mask = value_mask_bool.astype(jnp.float32)
         if params.norm_adv:
             # batch 内平均方差归一化优势，稳定训练
-            denom_adv = jnp.maximum(mask.sum(), 1.0)
-            adv_mean = (adv * mask).sum() / denom_adv
-            adv_var = (jnp.square(adv - adv_mean) * mask).sum() / denom_adv
+            denom_adv = jnp.maximum(policy_mask.sum(), 1.0)
+            adv_mean = (adv * policy_mask).sum() / denom_adv
+            adv_var = (jnp.square(adv - adv_mean) * policy_mask).sum() / denom_adv
             adv = (adv - adv_mean) / (jnp.sqrt(adv_var) + 1e-8)
-        log_ratio = jnp.where(mask_bool, logp - batch["old_logp"], 0.0)
+        log_ratio = jnp.where(policy_mask_bool, logp - batch["old_logp"], 0.0)
+        # [数值安全] 截断 log_ratio 防止 exp() 在 float32 下溢出（exp(88) > 1e38）。
+        # 训练中后期 policy 变锐利时，rare-action 样本会出现 log_ratio > 88 → ratio=inf → loss=nan。
+        # 这是 0513 训练崩溃的直接原因（参考 _assert_all_finite("ppo/loss") 抛出 FloatingPointError）。
+        log_ratio = jnp.clip(log_ratio, -20.0, 20.0)
         ratio = jnp.exp(log_ratio)  # 新旧策略概率比
         pg1 = adv * ratio
         pg2 = adv * jnp.clip(ratio, 1.0 - params.clip_coef, 1.0 + params.clip_coef)  # 弹性 clip
-        denom = jnp.maximum(mask.sum(), 1.0)
-        policy_loss = -(jnp.minimum(pg1, pg2) * mask).sum() / denom  # PPO-clip 目标
+        policy_denom = jnp.maximum(policy_mask.sum(), 1.0)
+        value_denom = jnp.maximum(value_mask.sum(), 1.0)
+        policy_loss = -(jnp.minimum(pg1, pg2) * policy_mask).sum() / policy_denom  # PPO-clip 目标
         # 价值函数：clip 旧价值，限制单步更新幅度
-        value = _assert_all_finite("ppo/value", outputs.value)
+        # rollout 里的 old_value 来自第一次前向（selected_target=0），
+        # PPO 更新也用同一条件的 value，避免 value clipping 两侧条件化不一致。
+        value = _assert_all_finite("ppo/value", value_outputs.value)
         value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
-        value_loss = (jnp.square(batch["returns"] - value_pred) * mask).sum() / denom
-        entropy_mean = (entropy * mask).sum() / denom
+        value_loss = (jnp.square(batch["returns"] - value_pred) * value_mask).sum() / value_denom
+        entropy_mean = (entropy * policy_mask).sum() / policy_denom
         loss = policy_loss + params.vf_coef * value_loss - params.ent_coef * entropy_mean
         loss = _assert_all_finite("ppo/loss", loss)
-        approx_kl = (((ratio - 1.0) - log_ratio) * mask).sum() / denom
-        clipfrac = (((jnp.abs(ratio - 1.0) > params.clip_coef).astype(jnp.float32)) * mask).sum() / denom
+        approx_kl = (((ratio - 1.0) - log_ratio) * policy_mask).sum() / policy_denom
+        clipfrac = (((jnp.abs(ratio - 1.0) > params.clip_coef).astype(jnp.float32)) * policy_mask).sum() / policy_denom
         return loss, {
             "loss": loss,
             "policy_loss": policy_loss,
@@ -217,8 +262,7 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
     del loss
-    # NaN/Inf 梯度替换为 0，防止参数被污染（熵崩等情况下会产生 NaN 梯度）
-    grads = jax.tree_util.tree_map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads)
+    grads = jax.tree_util.tree_map(lambda g: _assert_all_finite("ppo/grads", g), grads)
     return train_state.apply_gradients(grads=grads), metrics
 
 
@@ -257,6 +301,7 @@ def flatten_rollout(rollout: Rollout, returns, advantages):
         "candidate_mask": flat(rollout.candidate_mask),
         "amount_mask": flat(rollout.amount_mask),
         "source_mask": flat(rollout.source_mask),
+        "policy_mask": flat(rollout.policy_mask),
         "fire": flat(rollout.fire),
         "target": flat(rollout.target),
         "amount": flat(rollout.amount),

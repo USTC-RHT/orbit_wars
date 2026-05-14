@@ -43,6 +43,7 @@ from .fast_env import (  # noqa: E402
     MAX_COMET_SPAWNS,
     EnvParams,
     EnvState,
+    comet_arrays_from_observation,
     comet_planet_mask,
     load_state_bank,
     point_segment_distance_sq,
@@ -106,7 +107,7 @@ def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
     """将 kaggle_environments 单步 observation 转换为 batch=1 的 EnvState。
 
     用于在 Python 游戏循环中把 kaggle obs 喂给 JAX 模型。
-    彗星字段全部清零（对特征编码影响极小）。
+    同步解析 observation.comets，保证网页推理阶段的彗星特征和瞄准可用。
     """
     P = env_params.max_planets
     F = env_params.max_fleets
@@ -114,10 +115,12 @@ def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
 
     planets = np.zeros((P, 7), dtype=np.float32)
     planet_alive = np.zeros(P, dtype=bool)
+    planet_id_to_slot: dict[int, int] = {}
     for p in state.planets:
         if p.id < P:
             planets[p.id] = [p.id, p.owner, p.x, p.y, p.radius, p.ships, p.production]
             planet_alive[p.id] = True
+            planet_id_to_slot[p.id] = p.id
 
     initial_planets = planets.copy()
     for p in state.initial_planets:
@@ -129,6 +132,11 @@ def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
     for i, fl in enumerate(state.fleets[:F]):
         fleets[i] = [fl.id, fl.owner, fl.x, fl.y, fl.angle, fl.from_planet_id, fl.ships]
         fleet_alive[i] = True
+    comet_paths, comet_lengths, comet_ships, comet_valid, comet_path_index, comet_slots = comet_arrays_from_observation(
+        obs,
+        planet_id_to_slot,
+        planets,
+    )
 
     return EnvState(
         planets=jnp.array(planets[None]),          # [1, P, 7]
@@ -138,23 +146,74 @@ def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
         fleet_alive=jnp.array(fleet_alive[None]),
         step=jnp.array([state.step], dtype=jnp.int32),
         angular_velocity=jnp.array([state.angular_velocity], dtype=jnp.float32),
-        next_fleet_id=jnp.array([len(state.fleets)], dtype=jnp.int32),
+        next_fleet_id=jnp.array([int(read_obs_field(obs, "next_fleet_id", len(state.fleets)) or 0)], dtype=jnp.int32),
         done=jnp.array([False]),
         winner=jnp.array([-1], dtype=jnp.int32),
         overflow_fleets=jnp.zeros(1, dtype=jnp.int32),
-        comet_paths=jnp.zeros((1, MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2), dtype=jnp.float32),
-        comet_lengths=jnp.zeros((1, MAX_COMET_SPAWNS, COMETS_PER_SPAWN), dtype=jnp.int32),
-        comet_ships=jnp.zeros((1, MAX_COMET_SPAWNS), dtype=jnp.float32),
-        comet_valid=jnp.zeros((1, MAX_COMET_SPAWNS), dtype=bool),
-        comet_path_index=jnp.full((1, MAX_COMET_SPAWNS), -2, dtype=jnp.int32),
-        comet_slots=jnp.full((1, MAX_COMET_SPAWNS, COMETS_PER_SPAWN), -1, dtype=jnp.int32),
+        comet_paths=jnp.array(comet_paths[None]),
+        comet_lengths=jnp.array(comet_lengths[None]),
+        comet_ships=jnp.array(comet_ships[None]),
+        comet_valid=jnp.array(comet_valid[None]),
+        comet_path_index=jnp.array(comet_path_index[None]),
+        comet_slots=jnp.array(comet_slots[None]),
     )
+
+
+def read_obs_field(obs, key: str, default=None):
+    if isinstance(obs, dict):
+        return obs.get(key, default)
+    return getattr(obs, key, default)
 
 
 def jax_actions_to_kaggle(actions_arr) -> list:
     """将 JAX actions_from_decisions 输出 [1, P, 3] 转为 kaggle 格式 [[from, angle, ships], ...]。"""
     arr = np.array(actions_arr[0])  # [P, 3]
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
+
+
+def deterministic_policy_actions(train_state, state, feat_params, norm_state, norm_params):
+    """argmax 推理路径，用于网页/外部评估/JAX 内部 eval 保持一致。"""
+    raw_enc = encode_batch(state, feat_params)
+    enc = normalize_encoded(raw_enc, norm_state, norm_params)
+    flat = flatten_sources(enc)
+    zeros = jnp.zeros((flat.self_features.shape[0],), dtype=jnp.int32)
+    out1 = train_state.apply_fn(
+        {"params": train_state.params},
+        flat.self_features,
+        flat.candidate_features,
+        flat.global_features,
+        flat.candidate_mask,
+        flat.map_features,
+        zeros,
+    )
+    has_target = flat.candidate_mask.at[:, 0].set(False).any(axis=-1) & flat.source_mask
+    fire = (jax.nn.sigmoid(out1.fire_logits) > 0.5) & has_target
+    target_logits = jnp.where(flat.candidate_mask.at[:, 0].set(False), out1.target_logits, NEG_INF)
+    target_logits = jnp.where(fire[:, None], target_logits, NEG_INF).at[:, 0].set(
+        jnp.where(fire, target_logits[:, 0], 0.0)
+    )
+    target = jnp.argmax(safe_logits(target_logits), axis=-1)
+    out2 = train_state.apply_fn(
+        {"params": train_state.params},
+        flat.self_features,
+        flat.candidate_features,
+        flat.global_features,
+        flat.candidate_mask,
+        flat.map_features,
+        target,
+    )
+    selected_amount_mask = jnp.take_along_axis(flat.amount_mask, target[:, None, None], axis=1).squeeze(1)
+    amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
+    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[:, None], 0.0, amount_logits)
+    amount = jnp.argmax(amount_logits, axis=-1)
+    return actions_from_decisions(
+        state,
+        enc,
+        fire.reshape(state.planets.shape[:2]),
+        target.reshape(state.planets.shape[:2]),
+        amount.reshape(state.planets.shape[:2]),
+        feat_params,
+    )
 
 
 def eval_vs_nearest_jax(
@@ -165,42 +224,19 @@ def eval_vs_nearest_jax(
     rng, reset_key = jax.random.split(rng)
     state = reset_from_bank(bank, reset_key, num_games)
 
-    def step_fn(carry, _):
-        st, key = carry
-        key, ak, rk = jax.random.split(key, 3)
-        raw_enc = encode_batch(st, feat_params)
-        enc = normalize_encoded(raw_enc, norm_state, norm_params)
-        flat = flatten_sources(enc)
-        fire, target, amount, _, _ = policy_sample(train_state, model, flat, ak)
-        learner_acts = actions_from_decisions(
-            st, enc, fire.reshape(st.planets.shape[:2]),
-            target.reshape(st.planets.shape[:2]),
-            amount.reshape(st.planets.shape[:2]), feat_params,
-        )
+    def step_fn(st, _):
+        learner_acts = deterministic_policy_actions(train_state, st, feat_params, norm_state, norm_params)
         opp_acts = nearest_opponent_actions(st, player=1, params=feat_params)
         joint = jnp.stack([learner_acts, opp_acts], axis=1)
         next_st = step_batch(st, joint, env_params)
-        reset_st = reset_from_bank(bank, rk, num_games)
-        # 已结束的环境重置（但保留 winner 用于统计最后一局）
-        next_st = jax.tree_util.tree_map(
-            lambda a, b: jnp.where(
-                st.done.reshape((-1,) + (1,) * (a.ndim - 1)), b, a
-            ),
-            next_st, reset_st,
-        )
-        return (next_st, key), (st.done, st.winner)
+        return next_st, None
 
-    (final_state, _), (all_done, all_winners) = jax.lax.scan(
-        step_fn, (state, rng), None, length=env_params.episode_steps
-    )
-    # all_done: [episode_steps, num_games], all_winners: [episode_steps, num_games]
-    # 统计每次 done=True 时的 winner（游戏结束后会被重置，最终状态不可靠）
-    all_done_np = np.array(all_done)    # bool [T, G]
-    all_winners_np = np.array(all_winners)  # int [T, G]
-    wins = int(((all_winners_np == 0) & all_done_np).sum())
-    losses = int(((all_winners_np == 1) & all_done_np).sum())
-    draws = int(((all_winners_np == 2) & all_done_np).sum())
-    total = max(wins + losses + draws, 1)
+    final_state, _ = jax.lax.scan(step_fn, state, None, length=env_params.episode_steps)
+    winners_np = np.array(final_state.winner)
+    wins = int((winners_np == 0).sum())
+    losses = int((winners_np == 1).sum())
+    draws = int((winners_np == 2).sum())
+    total = max(num_games, 1)
     return {"wins": wins, "losses": losses, "draws": draws,
             "win_rate": wins / total, "loss_rate": losses / total}
 
@@ -225,38 +261,7 @@ def eval_vs_external(
     # JIT 单步推理（batch=1）
     @jax.jit
     def infer(st):
-        raw_enc = encode_batch(st, feat_params)
-        enc = normalize_encoded(raw_enc, norm_state, norm_params)
-        flat = flatten_sources(enc)
-        zeros = jnp.zeros((flat.self_features.shape[0],), dtype=jnp.int32)
-        out1 = train_state.apply_fn({"params": train_state.params},
-                                    flat.self_features, flat.candidate_features,
-                                    flat.global_features, flat.candidate_mask,
-                                    flat.map_features, zeros)
-        # 贪心取 argmax（确定性策略）
-        fire = jax.nn.sigmoid(out1.fire_logits) > 0.5
-        has_target = flat.candidate_mask.at[:, 0].set(False).any(axis=-1) & flat.source_mask
-        fire = fire & has_target
-        tgt_logits = jnp.where(flat.candidate_mask.at[:, 0].set(False), out1.target_logits, NEG_INF)
-        tgt_logits = jnp.where(fire[:, None], tgt_logits, NEG_INF).at[:, 0].set(
-            jnp.where(fire, tgt_logits[:, 0], 0.0))
-        target = jnp.argmax(safe_logits(tgt_logits), axis=-1)
-        out2 = train_state.apply_fn({"params": train_state.params},
-                                    flat.self_features, flat.candidate_features,
-                                    flat.global_features, flat.candidate_mask,
-                                    flat.map_features, target)
-        sel_amt_mask = jnp.take_along_axis(flat.amount_mask, target[:, None, None], axis=1).squeeze(1)
-        amt_logits = jnp.where(sel_amt_mask, out2.amount_logits, NEG_INF)
-        amt_logits = jnp.where((~sel_amt_mask.any(axis=-1))[:, None], 0.0, amt_logits)
-        amount = jnp.argmax(amt_logits, axis=-1)
-        acts = actions_from_decisions(
-            st, enc,
-            fire.reshape(st.planets.shape[:2]),
-            target.reshape(st.planets.shape[:2]),
-            amount.reshape(st.planets.shape[:2]),
-            feat_params,
-        )
-        return acts
+        return deterministic_policy_actions(train_state, st, feat_params, norm_state, norm_params)
 
     for g in range(num_games):
         seed = base_seed + g
@@ -331,6 +336,7 @@ def main() -> None:
         epochs=cfg.ppo.epochs,
         minibatch_size=min(cfg.ppo.minibatch_size, cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets),
         norm_adv=cfg.ppo.norm_adv,
+        target_kl=getattr(cfg.ppo, "target_kl", 0.05),
     )
     bank_path = Path(args.bank)
     if not bank_path.exists():
@@ -387,6 +393,7 @@ def main() -> None:
             "entropy",
             "approx_kl",
             "clipfrac",
+            "n_epochs_run",
             *eval_metric_fields,
         ])
     print(f"JAX trainer run_dir={run_dir} envs={cfg.ppo.num_envs} rollout_steps={cfg.ppo.rollout_steps} device={jax.devices()}")
@@ -426,16 +433,16 @@ def main() -> None:
 
     self_play = getattr(cfg, "opponent", "nearest") == "self"
     use_pool = getattr(cfg, "opponent", "nearest") == "pool"
-    # 对手池模式：nearest / selfplay / selfplay-lag 各 1/3（Phase 1）
-    # Phase 2（稳定战胜 nearest 后）：selfplay / selfplay-lag 各 1/2
+    # 对手池模式：PFSP 胜率加权采样，优先训练当前打不过的对手。
     pool_phase = 1
     pool_lag_interval = getattr(cfg, "pool_lag_interval", 50)
+    pool_prune_interval = 100
     promote_nearest_win_rate = getattr(cfg, "promote_nearest_win_rate", 0.8)
     promote_consecutive_evals = getattr(cfg, "promote_consecutive_evals", 3)
     recent_nearest_win_rates: list[float] = []
     pool_rng = random.Random(cfg.seed + 12345)
     if use_pool:
-        print(f"opponent=pool (lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+        print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, prune_interval={pool_prune_interval})")
     else:
         print(f"opponent={'self_play' if self_play else 'nearest'}")
     opponent_update_freq = cfg.self_play_update_interval  # 默认 25
@@ -449,25 +456,62 @@ def main() -> None:
 
     # 冻结对手权重（初始与学习器相同，每 opponent_update_freq 步同步一次）
     opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
-    # 滞后对手权重（每 pool_lag_interval 步更新，用于对抗 50 步前的自己）
-    lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    # lag_snapshot 保存“上一个 interval 的当前策略”；到下一个 interval 时加入池子，成为 50 步前 checkpoint。
+    lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    pool_entries: list[dict] = []
+    if use_pool:
+        pool_entries = [
+            {"id": "nearest", "type": "nearest", "params": None, "winrate": 0.5},
+            {"id": "selfplay-current", "type": "current", "params": None, "winrate": 0.5},
+        ]
+
+    def _copy_params(params):
+        return jax.tree_util.tree_map(lambda x: x, params)
+
+    def _pfsp_sample(entries: list[dict]) -> dict:
+        weights = [(1.0 - float(entry["winrate"]) + 0.1) ** 2 for entry in entries]
+        return pool_rng.choices(entries, weights=weights, k=1)[0]
+
+    def _pool_summary(entries: list[dict]) -> str:
+        return ", ".join(f"{entry['id']}:{float(entry['winrate']):.2f}" for entry in entries)
+
+    def _add_lag_to_pool(update_idx: int, params) -> None:
+        pool_entries.append({
+            "id": f"selfplay-lag-{max(update_idx - pool_lag_interval, 0):06d}",
+            "type": "lag",
+            "params": _copy_params(params),
+            "winrate": 0.5,
+        })
+        print(f"[pool] update={update_idx} 加入 50 步前 checkpoint，对手池: {_pool_summary(pool_entries)}")
+
+    def _prune_pool(update_idx: int) -> None:
+        removable = [entry for entry in pool_entries if entry["id"] != "selfplay-current"]
+        if not removable:
+            return
+        victim = max(removable, key=lambda entry: float(entry["winrate"]))
+        if float(victim["winrate"]) < 0.8:
+            return
+        pool_entries.remove(victim)
+        print(f"[pool] update={update_idx} 移除胜率最高对手 {victim['id']} "
+              f"(winrate={float(victim['winrate']):.3f})，对手池: {_pool_summary(pool_entries)}")
 
     # 两个 JIT 编译的训练步（nearest 对手 / self-play 对手），供 pool 模式按需调用
-    train_step_nearest = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_and_update(
+    # rollout 收集 + GAE 和 PPO 更新分别 JIT；PPO 的 KL 早停在 JIT 内完成。
+    _jit_nearest = jax.jit(
+        lambda ts, opp_p, st, ns, key: collect_rollout(
             ts, opp_p, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, False,
         )
     )
-    train_step_selfplay = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_and_update(
+    _jit_selfplay = jax.jit(
+        lambda ts, opp_p, st, ns, key: collect_rollout(
             ts, opp_p, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, True,
         )
     )
     # 兼容旧配置（opponent: nearest / self）
-    train_step = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_and_update(
+    _jit_step = jax.jit(
+        lambda ts, opp_p, st, ns, key: collect_rollout(
             ts,
             opp_p,
             st,
@@ -485,51 +529,48 @@ def main() -> None:
         )
     )
 
-    for update in range(1, cfg.ppo.total_updates + 1):
-        # 每隔 opponent_update_freq 步把当前权重同步给 self-play 对手
-        if update % opponent_update_freq == 1:
-            opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
-            if self_play or use_pool:
-                print(f"[pool] update={update} 同步 selfplay 对手权重")
+    def _run_step(jit_fn, ts, opp_p, st, ns, key):
+        """JIT 收集 rollout，然后在 Python 层执行 PPO 更新（含 KL 早停）。"""
+        ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, st, ns, key)
+        ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng)
+        return ts, st, ns, {**ppo_metrics, **ep_metrics}
 
-        # 每隔 pool_lag_interval 步更新滞后对手权重（pool 模式使用）
-        if use_pool and update % pool_lag_interval == 1:
-            lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
-            print(f"[pool] update={update} 同步 lagged 对手权重 (lag={pool_lag_interval})")
+    for update in range(1, cfg.ppo.total_updates + 1):
+        selected_pool_entry = None
+        selected_pool_id = ""
+
+        # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
+        if update % opponent_update_freq == 1:
+            opponent_params = _copy_params(train_state.params)
+            if self_play or use_pool:
+                print(f"[pool] update={update} 同步 selfplay-current 对手权重")
 
         start = time.perf_counter()
         rng, step_key = jax.random.split(rng)
 
         if use_pool:
-            u = pool_rng.random()
-            if pool_phase == 1:
-                # Phase 1: nearest / selfplay-current / selfplay-lag 各 1/3
-                if u < 1 / 3:
-                    train_state, state, normalizer_state, metrics = train_step_nearest(
-                        train_state, opponent_params, state, normalizer_state, step_key)
-                elif u < 2 / 3:
-                    train_state, state, normalizer_state, metrics = train_step_selfplay(
-                        train_state, opponent_params, state, normalizer_state, step_key)
-                else:
-                    train_state, state, normalizer_state, metrics = train_step_selfplay(
-                        train_state, lagged_params, state, normalizer_state, step_key)
+            selected_pool_entry = _pfsp_sample(pool_entries)
+            selected_pool_id = str(selected_pool_entry["id"])
+            if selected_pool_entry["type"] == "nearest":
+                train_state, state, normalizer_state, metrics = _run_step(
+                    _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
+            elif selected_pool_entry["type"] == "current":
+                train_state, state, normalizer_state, metrics = _run_step(
+                    _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
             else:
-                # Phase 2: selfplay-current / selfplay-lag 各 1/2
-                # sigma 为外部 Python 进程，无法 JIT 编译（速度慢 ~100x），训练仍用 self-play
-                # sigma 进度通过 eval 跟踪
-                if u < 0.5:
-                    train_state, state, normalizer_state, metrics = train_step_selfplay(
-                        train_state, opponent_params, state, normalizer_state, step_key)
-                else:
-                    train_state, state, normalizer_state, metrics = train_step_selfplay(
-                        train_state, lagged_params, state, normalizer_state, step_key)
+                train_state, state, normalizer_state, metrics = _run_step(
+                    _jit_selfplay, train_state, selected_pool_entry["params"], state, normalizer_state, step_key)
         else:
             # 兼容旧配置（opponent: nearest / self）
             if self_play and update % opponent_update_freq == 1:
                 pass  # already synced above
-            train_state, state, normalizer_state, metrics = train_step(
-                train_state, opponent_params, state, normalizer_state, step_key)
+            train_state, state, normalizer_state, metrics = _run_step(
+                _jit_step, train_state, opponent_params, state, normalizer_state, step_key)
         metrics = jax.device_get(metrics)
+        if use_pool and selected_pool_entry is not None and float(metrics["episodes_per_rollout"]) > 0.0:
+            old_wr = float(selected_pool_entry["winrate"])
+            selected_pool_entry["winrate"] = 0.95 * old_wr + 0.05 * float(metrics["win_rate"])
+            metrics["pool_selected_winrate"] = selected_pool_entry["winrate"]
         elapsed = time.perf_counter() - start
         samples = cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets
         sps = samples / max(elapsed, 1e-9)
@@ -537,9 +578,19 @@ def main() -> None:
             f"update={update} sps={sps:.1f} loss={metrics['loss']:.4f} "
             f"ep_reward={metrics['episode_reward']:.3f} winrate={metrics['win_rate']:.3f} "
             f"return={metrics['mean_return']:.3f} eps={metrics['episodes_per_rollout']:.0f} "
-            f"ent={metrics['entropy']:.3f} kl={metrics['approx_kl']:.5f}"
+            f"ent={metrics['entropy']:.3f} kl={metrics['approx_kl']:.5f} "
+            f"epochs={metrics.get('n_epochs_run', cfg.ppo.epochs):.0f}"
         )
+        if use_pool:
+            selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
+            line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
         print(line, flush=True)
+
+        if use_pool and update % pool_lag_interval == 0:
+            _add_lag_to_pool(update, lag_snapshot_params)
+            lag_snapshot_params = _copy_params(train_state.params)
+        if use_pool and update % pool_prune_interval == 0:
+            _prune_pool(update)
 
         eval_metrics = {field: "" for field in eval_metric_fields}
         if eval_enabled and eval_interval > 0 and update % eval_interval == 0:
@@ -588,7 +639,7 @@ def main() -> None:
                         and all(r >= promote_nearest_win_rate for r in recent_nearest_win_rates)):
                     pool_phase = 2
                     print(f"[pool] update={update} ★ 升阶 Phase 2：连续 {promote_consecutive_evals} 次 "
-                          f"nearest win_rate >= {promote_nearest_win_rate:.2f}，切换为 selfplay/selfplay-lag 训练 + sigma eval")
+                          f"nearest win_rate >= {promote_nearest_win_rate:.2f}，切换为 selfplay-current/selfplay-lag 训练 + tamrazov-starwars eval")
 
             # 评估 3：vs tamrazov-starwars（kaggle_environments）
             tamr_res = {}
@@ -611,25 +662,14 @@ def main() -> None:
             if use_wandb:
                 log_dict: dict = {
                     "eval/nearest_win_rate": float(near_res["win_rate"]),
-                    "eval/nearest_loss_rate": float(near_res["loss_rate"]),
-                    "eval/nearest_wins": float(near_res["wins"]),
-                    "eval/nearest_losses": float(near_res["losses"]),
-                    "eval/nearest_draws": float(near_res["draws"]),
                 }
                 if sigma_res:
                     log_dict["eval/sigma_win_rate"] = float(sigma_res["win_rate"])
-                    log_dict["eval/sigma_loss_rate"] = float(sigma_res["loss_rate"])
-                    log_dict["eval/sigma_wins"] = float(sigma_res["wins"])
-                    log_dict["eval/sigma_losses"] = float(sigma_res["losses"])
-                    log_dict["eval/sigma_draws"] = float(sigma_res["draws"])
                 if tamr_res:
                     log_dict["eval/tamrazov_win_rate"] = float(tamr_res["win_rate"])
-                    log_dict["eval/tamrazov_loss_rate"] = float(tamr_res["loss_rate"])
-                    log_dict["eval/tamrazov_wins"] = float(tamr_res["wins"])
-                    log_dict["eval/tamrazov_losses"] = float(tamr_res["losses"])
-                    log_dict["eval/tamrazov_draws"] = float(tamr_res["draws"])
                 if use_pool:
                     log_dict["pool/phase"] = float(pool_phase)
+                    log_dict["pool/size"] = float(len(pool_entries))
                     if recent_nearest_win_rates:
                         log_dict["pool/recent_nearest_win_rate"] = float(np.mean(recent_nearest_win_rates))
                 _wandb.log(log_dict, step=update)
@@ -648,6 +688,7 @@ def main() -> None:
                 f"{metrics['entropy']:.8f}",
                 f"{metrics['approx_kl']:.8f}",
                 f"{metrics['clipfrac']:.8f}",
+                f"{metrics.get('n_epochs_run', cfg.ppo.epochs):.1f}",
                 *[eval_metrics[field] for field in eval_metric_fields],
             ])
         if use_wandb:
@@ -662,7 +703,14 @@ def main() -> None:
                 "losses/entropy": float(metrics["entropy"]),
                 "losses/approx_kl": float(metrics["approx_kl"]),
                 "losses/clipfrac": float(metrics["clipfrac"]),
+                "losses/n_epochs_run": float(metrics.get("n_epochs_run", cfg.ppo.epochs)),
             }, step=update)
+            if use_pool:
+                selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
+                _wandb.log({
+                    "pool/selected_win_rate": selected_wr,
+                    "pool/size": float(len(pool_entries)),
+                }, step=update)
 
         # ── 定期保存 checkpoint ───────────────────────────────────
         if update % checkpoint_every == 0:
@@ -685,12 +733,14 @@ def reset_from_bank(bank: EnvState, rng, num_envs: int) -> EnvState:
     return select_from_bank(bank, idx)
 
 
-def collect_and_update(train_state, opponent_params, state, normalizer_state, rng, bank, env_params, feat_params, norm_params, reward_params, ppo_params, model, rollout_steps: int, self_play: bool = False):
-    """收集 rollout 并执行 PPO 更新。
+def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, bank, env_params, feat_params, norm_params, reward_params, ppo_params, model, rollout_steps: int, self_play: bool = False):
+    """收集 rollout，计算 GAE 和 episode 统计（JIT 安全，不含 PPO 更新）。
 
     1. lax.scan 循环 rollout_steps 步：特征展开 + 采样 + step 环境 + 奖励 + done 处理。
     2. 计算最后状态价值 + GAE 估计。
-    3. ppo_update 执行多 epoch/minibatch 梯度更新。
+    3. 计算 episode 统计（win_rate, episode_reward 等）。
+    注：PPO 更新由调用方单独执行；ppo_update 自身是 JIT 编译的，
+    KL 早停在 JIT 内用 while_loop 完成。
 
     opponent_params: 冻结的对手权重 pytree（self_play=True 时使用）。
     """
@@ -704,7 +754,17 @@ def collect_and_update(train_state, opponent_params, state, normalizer_state, rn
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
         flat = flatten_sources(encoded)
         fire, target, amount, logp, value = policy_sample(ts, model, flat, action_key)
-        learner_actions = actions_from_decisions(st, encoded, fire.reshape(st.planets.shape[:2]), target.reshape(st.planets.shape[:2]), amount.reshape(st.planets.shape[:2]), feat_params)
+        fire_2d = fire.reshape(st.planets.shape[:2])
+        target_2d = target.reshape(st.planets.shape[:2])
+        amount_2d = amount.reshape(st.planets.shape[:2])
+        learner_actions, learner_policy_mask = actions_from_decisions_with_policy_mask(
+            st,
+            encoded,
+            fire_2d,
+            target_2d,
+            amount_2d,
+            feat_params,
+        )
         # 对手动作：自博弈时用冻结 opponent_params 跑翻转局面；否则用最近敌方启发式
         if self_play:
             flipped = flip_state(st)
@@ -730,9 +790,10 @@ def collect_and_update(train_state, opponent_params, state, normalizer_state, rn
             encoded.candidate_mask,
             encoded.amount_mask,
             encoded.source_mask,
-            fire.reshape(st.planets.shape[:2]),
-            target.reshape(st.planets.shape[:2]),
-            amount.reshape(st.planets.shape[:2]),
+            learner_policy_mask,
+            fire_2d,
+            target_2d,
+            amount_2d,
             logp.reshape(st.planets.shape[:2]),
             value.reshape(st.planets.shape[:2]),
             reward,
@@ -754,11 +815,9 @@ def collect_and_update(train_state, opponent_params, state, normalizer_state, rn
     )
     last_values = last_out.value.reshape(state.planets.shape[:2])
     returns, advantages = compute_gae(rollout.reward, rollout.done, rollout.old_value, last_values, ppo_params)
-    train_state, ppo_metrics = ppo_update(train_state, rollout, returns, advantages, ppo_params, rng)
     # rollout.done: [T, B, P]，每步每 env 的结束标志（P 维相同）
     # rollout.reward: [T, B, P]，只有 done=True 那步有 ±1，其余为 0
     finished = rollout.done.any(axis=-1)          # [T, B] 该步是否有局结束
-    finished_any = finished.any(axis=0)           # [B] 该 env 在本 rollout 是否结束过
     ep_reward = rollout.reward.mean(axis=-1)       # [T, B] 对 P 维平均（P 维全同）
     # episode_reward：只统计已结束局的终局奖励均值（非零步），反映真实胜负
     ep_reward_sum = jnp.where(finished, ep_reward, 0.0).sum()
@@ -769,14 +828,14 @@ def collect_and_update(train_state, opponent_params, state, normalizer_state, rn
     win_rate = wins / episodes
     # mean_return：rollout 内所有样本 return（GAE 回报）的均值，反映 value 估计水平
     mean_return = returns.mean()
-    metrics = {
-        **ppo_metrics,
+    ep_metrics = {
         "episode_reward": episode_reward,   # 已结束局的终局奖励均值（接近 ±1）
         "win_rate": win_rate,               # 已结束局中的胜率
         "mean_return": mean_return,         # GAE 回报均值
         "episodes_per_rollout": finished.sum().astype(jnp.float32),  # 每次 rollout 完成的局数
     }
-    return train_state, state, normalizer_state, metrics
+    # 返回 rollout 数据供 Python 层调用 ppo_update（rng 供 ppo_update 中 minibatch shuffle）
+    return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
 
 
 def policy_sample(train_state, model, flat, rng):
@@ -827,6 +886,17 @@ def actions_from_decisions(state, encoded, fire, target, amount, params: Feature
 
     fire=False 或 target=0 (属于 no-op) 时输出全 0。
     """
+    actions, _policy_mask = actions_from_decisions_with_policy_mask(state, encoded, fire, target, amount, params)
+    return actions
+
+
+def actions_from_decisions_with_policy_mask(state, encoded, fire, target, amount, params: FeatureParams):
+    """转换动作，并返回 PPO policy mask。
+
+    fire=True 但物理瞄准不可达的动作会被安全层变成 no-op；这类样本不应
+    用 raw fire/target/amount 的 logp 更新 policy。真实 no-op(fire=False)
+    和真实执行动作继续参与 policy loss。
+    """
     b, p = fire.shape
     source_ids = encoded.source_ids.astype(jnp.float32)
     ships = jnp.take_along_axis(encoded.ship_buckets, amount[..., None], axis=-1).squeeze(-1)
@@ -842,7 +912,9 @@ def actions_from_decisions(state, encoded, fire, target, amount, params: Feature
         ships,
     )
     valid = fire & (target > 0) & encoded.source_mask & aim_hit
-    return jnp.stack(
+    attempted_invalid = fire & (target > 0) & encoded.source_mask & (~aim_hit)
+    policy_mask = encoded.source_mask & (~attempted_invalid)
+    actions = jnp.stack(
         [
             jnp.where(valid, source_ids, 0.0),
             jnp.where(valid, angle, 0.0),
@@ -850,63 +922,211 @@ def actions_from_decisions(state, encoded, fire, target, amount, params: Feature
         ],
         axis=-1,
     )
+    return actions, policy_mask
 
 
 def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
-    """60 步轨迹预测打射角度，匹配 PyTorch 版 src/physics.aim_with_prediction。
+    """与 src/physics.py 的 aim_with_prediction 同步的 JAX 批量瞄准。
 
-    支持静止星球、旋转星球和彗星局态。
-    验证：第一碰撜体为目标且舰队路径不经过太阳。
+    流程保持一致：
+    1. 在 60 回合视野内粗扫描 f(T) 的正到负符号变化。
+    2. 二分 12 次得到连续命中时间 T*。
+    3. 只验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
+    4. 每个候选回合都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
     """
 
     horizon = 60
+    n_coarse = 60
+    n_bisect = 12
     clearance = 0.1
     speed = fleet_speed_local(jnp.maximum(ships, 1.0))
-    turns = jnp.arange(1, horizon + 1, dtype=jnp.float32)
-    all_px_t, all_py_t = all_planet_pos_at_turns(state, horizon)  # [B, P, horizon+1]
-    gather_idx = jnp.broadcast_to(target_idx[..., None], target_idx.shape + (horizon + 1,))
-    target_px_seq = jnp.take_along_axis(all_px_t, gather_idx, axis=1)
-    target_py_seq = jnp.take_along_axis(all_py_t, gather_idx, axis=1)
-    px_scan = target_px_seq[..., 1:]
-    py_scan = target_py_seq[..., 1:]
-    # 计算舰队在每个时刻是否已碰到目标
-    dist = jnp.sqrt((px_scan - src[..., None, 2]) ** 2 + (py_scan - src[..., None, 3]) ** 2)
-    f = dist - (src[..., None, 4] + clearance + turns * speed[..., None]) - target[..., None, 4]
-    hit_candidates = f <= 0.0
-    has_hit = hit_candidates.any(axis=-1)
-    first_idx = jnp.argmax(hit_candidates, axis=-1)  # 最早到达时刻
-    hit_turn = first_idx.astype(jnp.float32) + 1.0
-    aim_turn = jnp.maximum(hit_turn.astype(jnp.int32) - 1, 0)  # 提前一步预判目标位置
-    px = jnp.take_along_axis(target_px_seq, aim_turn[..., None], axis=-1).squeeze(-1)
-    py = jnp.take_along_axis(target_py_seq, aim_turn[..., None], axis=-1).squeeze(-1)
-    angle = jnp.arctan2(py - src[..., 3], px - src[..., 2])
+    max_turns = target_max_turns_jax(state, target_idx, horizon).astype(jnp.float32)
+    can_search = max_turns >= 1.0
+
+    samples = jnp.arange(1, n_coarse + 1, dtype=jnp.float32)
+    dt = max_turns[..., None] / float(n_coarse)
+    ts = samples * dt
+    f_cur = aim_f_jax(src, target, target_idx, state, speed, ts)
+    f_prev0 = aim_f_jax(src, target, target_idx, state, speed, jnp.full_like(max_turns, 1e-6))
+    f_prev = jnp.concatenate([f_prev0[..., None], f_cur[..., :-1]], axis=-1)
+    crossing = (f_prev > 0.0) & (f_cur <= 0.0) & can_search[..., None]
+    has_interval = crossing.any(axis=-1)
+    first_i = jnp.argmax(crossing, axis=-1).astype(jnp.float32)
+    t_lo = first_i * (max_turns / float(n_coarse))
+    t_hi = (first_i + 1.0) * (max_turns / float(n_coarse))
+
+    def bisect_body(_, carry):
+        lo, hi = carry
+        mid = 0.5 * (lo + hi)
+        f_lo = aim_f_jax(src, target, target_idx, state, speed, lo)
+        f_mid = aim_f_jax(src, target, target_idx, state, speed, mid)
+        use_left = (f_lo * f_mid) <= 0.0
+        return jnp.where(use_left, lo, mid), jnp.where(use_left, mid, hi)
+
+    t_lo, t_hi = jax.lax.fori_loop(0, n_bisect, bisect_body, (t_lo, t_hi))
+    t_star = 0.5 * (t_lo + t_hi)
+    t_floor = jnp.floor(t_star).astype(jnp.int32)
+    candidates = jnp.stack(
+        [
+            jnp.maximum(t_floor - 1, 1),
+            jnp.maximum(t_floor, 1),
+            t_floor + 1,
+        ],
+        axis=-1,
+    )
+    candidate_turns = candidates.astype(jnp.float32)
+    candidate_in_range = (candidate_turns >= 1.0) & (candidate_turns <= max_turns[..., None])
+
+    aim_t = candidate_turns - 1.0
+    px, py, target_pos_valid = target_pos_at_time_jax(state, target_idx, aim_t)
+    angle = jnp.arctan2(py - src[..., None, 3], px - src[..., None, 2])
     cos_a = jnp.cos(angle)
     sin_a = jnp.sin(angle)
-    fx0 = src[..., 2] + cos_a * (src[..., 4] + clearance)  # 舰队起始坐标
-    fy0 = src[..., 3] + sin_a * (src[..., 4] + clearance)
-    fx_end = fx0 + hit_turn * speed * cos_a
-    fy_end = fy0 + hit_turn * speed * sin_a
-    sun_hit = point_segment_distance_sq(50.0, 50.0, fx0, fy0, fx_end, fy_end) < 100.0  # 太阳半径=10
+    fx0 = src[..., None, 2] + cos_a * (src[..., None, 4] + clearance)
+    fy0 = src[..., None, 3] + sin_a * (src[..., None, 4] + clearance)
+    fx_t = fx0 + candidate_turns * speed[..., None] * cos_a
+    fy_t = fy0 + candidate_turns * speed[..., None] * sin_a
+
+    sun_hit = point_segment_distance_sq(50.0, 50.0, fx0, fy0, fx_t, fy_t) < 100.0
     first_collision_ok = target_is_first_collision_jax(
         src,
         target_idx,
         state,
         fx0,
         fy0,
-        speed,
+        speed[..., None],
         cos_a,
         sin_a,
-        hit_turn,
+        candidates,
     )
-    valid = has_hit & (~sun_hit) & first_collision_ok & (ships > 0.0)
+
+    fx_prev = fx0 + (candidate_turns - 1.0) * speed[..., None] * cos_a
+    fy_prev = fy0 + (candidate_turns - 1.0) * speed[..., None] * sin_a
+    move_d2 = point_segment_distance_sq(px, py, fx_prev, fy_prev, fx_t, fy_t)
+    move_hits_target = move_d2 < target[..., None, 4] ** 2
+
+    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns)
+    target_moved = ((px_next - px) ** 2 + (py_next - py) ** 2) > 1e-9
+    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px, py, px_next, py_next)
+    sweep_hits_target = target_moved & target_next_valid & (sweep_d2 < target[..., None, 4] ** 2)
+
+    candidate_valid = (
+        has_interval[..., None]
+        & candidate_in_range
+        & target_pos_valid
+        & (~sun_hit)
+        & first_collision_ok
+        & (move_hits_target | sweep_hits_target)
+        & (ships[..., None] > 0.0)
+    )
+    has_valid = candidate_valid.any(axis=-1)
+    chosen = jnp.argmax(candidate_valid, axis=-1)
+    chosen_angle = jnp.take_along_axis(angle, chosen[..., None], axis=-1).squeeze(-1)
     direct_angle = jnp.arctan2(target[..., 3] - src[..., 3], target[..., 2] - src[..., 2])
-    return jnp.where(valid, angle, direct_angle), valid
+    return jnp.where(has_valid, chosen_angle, direct_angle), has_valid
+
+
+def aim_f_jax(src, target, target_idx, state: EnvState, speed, turns):
+    """f(T)=dist(src,target(T))-(src.radius+clearance+T*speed)-target.radius。"""
+    px, py, valid = target_pos_at_time_jax(state, target_idx, turns)
+    src_x = _expand_like_time(src[..., 2], turns)
+    src_y = _expand_like_time(src[..., 3], turns)
+    src_radius = _expand_like_time(src[..., 4], turns)
+    speed_t = _expand_like_time(speed, turns)
+    target_radius = _expand_like_time(target[..., 4], turns)
+    dist = jnp.sqrt((px - src_x) ** 2 + (py - src_y) ** 2)
+    value = dist - (src_radius + 0.1 + turns * speed_t) - target_radius
+    return jnp.where(valid, value, jnp.inf)
+
+
+def target_pos_at_time_jax(state: EnvState, target_idx, turns):
+    """目标星球在浮点 turns 后的位置，支持普通星球和彗星线性插值。"""
+    b, p = target_idx.shape
+    batch_idx = jnp.arange(b)[:, None]
+    planets = state.planets[batch_idx, target_idx]
+    initial = state.initial_planets[batch_idx, target_idx]
+    alive = state.planet_alive[batch_idx, target_idx]
+
+    base_x = _expand_like_time(planets[..., 2], turns)
+    base_y = _expand_like_time(planets[..., 3], turns)
+    dx = initial[..., 2] - 50.0
+    dy = initial[..., 3] - 50.0
+    orbit_r = jnp.sqrt(dx * dx + dy * dy)
+    phi_cur = jnp.arctan2(planets[..., 3] - 50.0, planets[..., 2] - 50.0)
+    phi = _expand_like_time(phi_cur, turns) + _expand_like_time(state.angular_velocity[:, None], turns) * turns
+    rot_x = 50.0 + _expand_like_time(orbit_r, turns) * jnp.cos(phi)
+    rot_y = 50.0 + _expand_like_time(orbit_r, turns) * jnp.sin(phi)
+    comet_mask = jax.vmap(comet_planet_mask)(state)
+    is_comet = comet_mask[batch_idx, target_idx]
+    rotating = (orbit_r + initial[..., 4] < 50.0) & alive & (~is_comet)
+    px = jnp.where(_expand_like_time(rotating, turns), rot_x, base_x)
+    py = jnp.where(_expand_like_time(rotating, turns), rot_y, base_y)
+    valid = _expand_like_time(alive, turns)
+
+    comet_x, comet_y, comet_valid = comet_target_pos_at_time_jax(state, target_idx, turns)
+    is_comet_t = _expand_like_time(is_comet, turns)
+    px = jnp.where(is_comet_t, comet_x, px)
+    py = jnp.where(is_comet_t, comet_y, py)
+    valid = jnp.where(is_comet_t, comet_valid, valid)
+    return px, py, valid
+
+
+def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
+    """彗星目标在浮点 turns 后的位置。非彗星返回无效占位。"""
+    extra = turns.ndim - target_idx.ndim
+    one_shape = (1,) * extra
+    slots = state.comet_slots.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    target_e = target_idx.reshape(target_idx.shape + one_shape + (1, 1))
+    active = (
+        (state.comet_slots >= 0)
+        & (state.comet_path_index[:, :, None] >= -1)
+        & (state.comet_lengths > 0)
+    ).reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    match = (slots == target_e) & active
+
+    path_index = state.comet_path_index.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, 1))
+    lengths = state.comet_lengths.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    fi = path_index + turns[..., None, None]
+    i0 = jnp.floor(fi).astype(jnp.int32)
+    frac = fi - i0.astype(jnp.float32)
+    valid_i0 = (i0 >= 0) & (i0 < lengths)
+    i1 = jnp.minimum(i0 + 1, lengths - 1)
+    has_i1 = i0 + 1 < lengths
+    i0_safe = jnp.clip(i0, 0, MAX_COMET_PATH - 1)
+    i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
+    path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
+    paths = state.comet_paths.reshape(path_shape)
+    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
+    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
+    pos0 = (one0[..., None] * paths).sum(axis=-2)
+    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
+    weights = (match & valid_i0).astype(jnp.float32)
+    has = weights.sum(axis=(-2, -1)) > 0.0
+    px = (pos[..., 0] * weights).sum(axis=(-2, -1))
+    py = (pos[..., 1] * weights).sum(axis=(-2, -1))
+    return px, py, has
+
+
+def target_max_turns_jax(state: EnvState, target_idx, horizon: int):
+    """普通目标搜索 horizon；彗星目标按 src/physics.py 限制为 remaining_life-1。"""
+    b, p = target_idx.shape
+    slots = state.comet_slots[:, None, :, :]
+    target_e = target_idx[:, :, None, None]
+    active = (state.comet_slots[:, None, :, :] >= 0) & (state.comet_path_index[:, None, :, None] >= -1)
+    match = (slots == target_e) & active
+    remaining = state.comet_lengths[:, None, :, :] - state.comet_path_index[:, None, :, None]
+    comet_remaining = jnp.where(match, remaining, 0).max(axis=(-2, -1))
+    comet_has = match.any(axis=(-2, -1))
+    comet_max = jnp.minimum(jnp.asarray(horizon, dtype=jnp.int32), jnp.maximum(0, comet_remaining - 1))
+    return jnp.where(comet_has, comet_max, horizon)
 
 
 def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, speed, cos_a, sin_a, hit_turn):
-    """验证目标星球是否为舰队路径上第一碰撜体。"""
+    """按引擎阶段验证候选回合的第一碰撞对象就是目标。"""
     horizon = 60
-    turns = jnp.arange(1, horizon + 1, dtype=jnp.float32)
+    turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
+    turns = turns_i.astype(jnp.float32)
     planets = state.planets
     planet_alive = state.planet_alive
     px_t, py_t = all_planet_pos_at_turns(state, horizon)
@@ -914,46 +1134,61 @@ def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, sp
     fy_prev = fy0[..., None] + (turns - 1.0) * speed[..., None] * sin_a[..., None]
     fx_cur = fx0[..., None] + turns * speed[..., None] * cos_a[..., None]
     fy_cur = fy0[..., None] + turns * speed[..., None] * sin_a[..., None]
+    active_step = turns_i.reshape((1,) * hit_turn.ndim + (horizon,)) <= hit_turn[..., None]
+    in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
+    in_bounds_until_hit = (in_bounds | (~active_step)).all(axis=-1)
 
-    px_old = px_t[:, None, :, :-1]
-    py_old = py_t[:, None, :, :-1]
-    px_new = px_t[:, None, :, 1:]
-    py_new = py_t[:, None, :, 1:]
-    radii = planets[:, None, :, 4]
-    alive = planet_alive[:, None, :, None]
-    before_or_at_hit = turns[None, None, None, :] <= hit_turn[..., None, None]
+    src_axes = (None,) * (hit_turn.ndim - 1)
+    px_old = px_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
+    py_old = py_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
+    px_new = px_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
+    py_new = py_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
+    radii = planets[(slice(None),) + src_axes + (slice(None), 4)]
+    alive = planet_alive[(slice(None),) + src_axes + (slice(None), None)]
 
     move_d2 = point_segment_distance_sq(
         px_old,
         py_old,
-        fx_prev[:, :, None, :],
-        fy_prev[:, :, None, :],
-        fx_cur[:, :, None, :],
-        fy_cur[:, :, None, :],
+        fx_prev[..., None, :],
+        fy_prev[..., None, :],
+        fx_cur[..., None, :],
+        fy_cur[..., None, :],
     )
-    move_hit = (move_d2 < radii[..., None] ** 2) & alive & before_or_at_hit
+    move_hit = (move_d2 < radii[..., None] ** 2) & alive & active_step[..., None, :]
 
     sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
     sweep_d2 = point_segment_distance_sq(
-        fx_cur[:, :, None, :],
-        fy_cur[:, :, None, :],
+        fx_cur[..., None, :],
+        fy_cur[..., None, :],
         px_old,
         py_old,
         px_new,
         py_new,
     )
-    sweep_hit = (sweep_d2 < radii[..., None] ** 2) & alive & sweep_active & before_or_at_hit
+    sweep_hit = (sweep_d2 < radii[..., None] ** 2) & alive & sweep_active & active_step[..., None, :]
 
     large = jnp.int32(2 * (horizon + 1) + 1)
-    step_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
-    move_keys = (2 * step_i)[None, None, None, :]
-    sweep_keys = (2 * step_i + 1)[None, None, None, :]
+    move_keys = (2 * turns_i).reshape((1,) * (move_hit.ndim - 1) + (horizon,))
+    sweep_keys = (2 * turns_i + 1).reshape((1,) * (sweep_hit.ndim - 1) + (horizon,))
     first_move = jnp.where(move_hit, move_keys, large).min(axis=-1)
     first_sweep = jnp.where(sweep_hit, sweep_keys, large).min(axis=-1)
     first_by_planet = jnp.minimum(first_move, first_sweep)
     first_planet = first_by_planet.argmin(axis=-1)
     first_key = first_by_planet.min(axis=-1)
-    return (first_key < large) & (first_planet == target_idx)
+    target_key_lo = 2 * hit_turn
+    target_key_hi = 2 * hit_turn + 1
+    return (
+        in_bounds_until_hit
+        & (first_key < large)
+        & (first_planet == target_idx[..., None])
+        & (first_key >= target_key_lo)
+        & (first_key <= target_key_hi)
+    )
+
+
+def _expand_like_time(x, turns):
+    """把 [B,P] 标量特征扩展到 turns 的 [B,P,...] 形状。"""
+    return x.reshape(x.shape + (1,) * (turns.ndim - x.ndim))
 
 
 def all_planet_pos_at_turns(state: EnvState, horizon: int):

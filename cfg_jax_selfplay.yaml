@@ -1,5 +1,5 @@
-# JAX 对手池训练配置：nearest / selfplay / selfplay-lag 各 1/3（Phase 1）
-# Phase 2（稳定战胜 nearest 后）：selfplay / selfplay-lag 各 1/2 + sigma eval 跟踪
+# JAX 对手池训练配置：nearest / selfplay-current / selfplay-lag 各 1/3（Phase 1）
+# Phase 2（稳定战胜 nearest 后）：selfplay-current / selfplay-lag 训练 + tamrazov-starwars eval 跟踪
 #
 # 设计原则：
 #   - 关闭所有 dense shaping，只用终局胜负奖励（胜 +1，负/平 -1）。
@@ -12,7 +12,7 @@
 #   python -m jax_agent.train_jax --config cfg_jax_selfplay.yaml
 
 seed: 42
-run_name: "jax_pool_0513"
+run_name: "jax_PFSP_0514"
 save_dir: outputs
 checkpoint_every: 100
 opponent: "pool"
@@ -72,12 +72,12 @@ self_play_update_interval: 50
 # 对手池配置
 pool_lag_interval: 50           # 每隔多少 update 更新 lagged 对手权重（对抗 50 步前的自己）
 promote_nearest_win_rate: 1.0   # nearest win_rate 达到此阈值触发升阶（全胜才升）
-promote_consecutive_evals: 3    # 连续多少次评估超过阈值才升阶至 Phase 2
+promote_consecutive_evals: 2    # 连续多少次评估超过阈值才升阶至 Phase 2
 
 eval:
   enabled: true
-  every: 200         # 每 200 次 update 评估一次
-  games: 10          # 每次评估局数
+  every: 100         # 每 100 次 update 评估一次
+  games: 20          # 每次评估局数
   seed: 200000
 
 wandb:

@@ -1,8 +1,8 @@
 """Orbit Wars JAX 奖励塑造模块。
 
-与 PyTorch 版 src/env_wrapper.py 的奖励逻辑严格对齐：
+与 PyTorch 版 src/env_wrapper.py 的奖励组件基本对齐；终局平局按当前训练策略有意惩罚：
 - terminal_reward_player0: 利用 scores() 重新计算得分（不依赖 winner 字段）。
-  赢: +1，平局: 0，输或0-0: -1。
+  赢: +1，平局/输/0-0: -1。
 - neutral_capture: 掌控中立星球奖励，较近且较早时加成。
 - enemy_capture: 占领敌方星球奖励。
 - lose_planet: 失去己方星球惩罚。

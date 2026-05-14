@@ -130,6 +130,7 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
     fleets_np = np.zeros((params.max_fleets, 7), dtype=np.float32)
     planet_alive = np.zeros((params.max_planets,), dtype=bool)
     fleet_alive = np.zeros((params.max_fleets,), dtype=bool)
+    planet_id_to_slot: dict[int, int] = {}
 
     planets = list(read(observation, "planets", []) or [])[: params.max_planets]
     initial = list(read(observation, "initial_planets", planets) or planets)[: params.max_planets]
@@ -137,6 +138,7 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
     if planets:
         planets_np[: len(planets)] = np.asarray(planets, dtype=np.float32)
         planet_alive[: len(planets)] = True
+        planet_id_to_slot = {int(row[0]): i for i, row in enumerate(planets)}
     if initial:
         initial_np[: len(initial)] = np.asarray(initial, dtype=np.float32)
     else:
@@ -144,6 +146,11 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
     if fleets:
         fleets_np[: len(fleets)] = np.asarray(fleets, dtype=np.float32)
         fleet_alive[: len(fleets)] = True
+    comet_paths, comet_lengths, comet_ships, comet_valid, comet_path_index, comet_slots = comet_arrays_from_observation(
+        observation,
+        planet_id_to_slot,
+        planets_np,
+    )
 
     return state._replace(
         planets=jnp.asarray(planets_np),
@@ -154,7 +161,68 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
         step=jnp.asarray(int(read(observation, "step", 0) or 0), dtype=jnp.int32),
         angular_velocity=jnp.asarray(float(read(observation, "angular_velocity", 0.0) or 0.0), dtype=jnp.float32),
         next_fleet_id=jnp.asarray(int(read(observation, "next_fleet_id", len(fleets)) or 0), dtype=jnp.int32),
+        comet_paths=jnp.asarray(comet_paths),
+        comet_lengths=jnp.asarray(comet_lengths),
+        comet_ships=jnp.asarray(comet_ships),
+        comet_valid=jnp.asarray(comet_valid),
+        comet_path_index=jnp.asarray(comet_path_index),
+        comet_slots=jnp.asarray(comet_slots),
     )
+
+
+def comet_arrays_from_observation(
+    observation: Any,
+    planet_id_to_slot: dict[int, int],
+    planets_np: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Convert live Kaggle comet groups into fixed JAX arrays.
+
+    Kaggle observations keep comets as dynamic groups:
+      {"planet_ids": [...], "paths": [[[x,y], ...], ...], "path_index": k}
+    JAX features/aiming need the same data in fixed slots, keyed by the
+    planet slot currently occupied by each comet.
+    """
+
+    def read(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    comet_paths = np.zeros((MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2), dtype=np.float32)
+    comet_lengths = np.zeros((MAX_COMET_SPAWNS, COMETS_PER_SPAWN), dtype=np.int32)
+    comet_ships = np.zeros((MAX_COMET_SPAWNS,), dtype=np.float32)
+    comet_valid = np.zeros((MAX_COMET_SPAWNS,), dtype=bool)
+    comet_path_index = np.full((MAX_COMET_SPAWNS,), -2, dtype=np.int32)
+    comet_slots = np.full((MAX_COMET_SPAWNS, COMETS_PER_SPAWN), -1, dtype=np.int32)
+
+    groups = list(read(observation, "comets", []) or [])[:MAX_COMET_SPAWNS]
+    for group_idx, group in enumerate(groups):
+        planet_ids = list(read(group, "planet_ids", []) or [])[:COMETS_PER_SPAWN]
+        paths = list(read(group, "paths", []) or [])[:COMETS_PER_SPAWN]
+        path_index = int(read(group, "path_index", -2) or 0)
+        any_valid = False
+        first_ships = 0.0
+        for comet_idx, pid_raw in enumerate(planet_ids):
+            pid = int(pid_raw)
+            slot = planet_id_to_slot.get(pid, -1)
+            if slot < 0:
+                continue
+            path = paths[comet_idx] if comet_idx < len(paths) else []
+            arr = np.asarray(path[:MAX_COMET_PATH], dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[-1] != 2 or arr.shape[0] == 0:
+                continue
+            length = min(arr.shape[0], MAX_COMET_PATH)
+            comet_paths[group_idx, comet_idx, :length] = arr[:length]
+            comet_lengths[group_idx, comet_idx] = length
+            comet_slots[group_idx, comet_idx] = slot
+            any_valid = True
+            if first_ships <= 0.0:
+                first_ships = float(planets_np[slot, 5])
+        if any_valid:
+            comet_valid[group_idx] = True
+            comet_path_index[group_idx] = path_index
+            comet_ships[group_idx] = first_ships
+    return comet_paths, comet_lengths, comet_ships, comet_valid, comet_path_index, comet_slots
 
 
 def load_state_bank(path: str | Path, params: EnvParams = EnvParams()) -> EnvState:
@@ -324,8 +392,10 @@ def _expire_comets(state: EnvState) -> EnvState:
     idx = state.comet_path_index
     min_len = jnp.where(state.comet_lengths > 0, state.comet_lengths, MAX_COMET_PATH + 1).min(axis=1)
     expired = (idx >= min_len) & (idx >= -1)
-    slots = jnp.where(state.comet_slots >= 0, state.comet_slots, 0)
-    slot_expired = jnp.zeros_like(state.planet_alive).at[slots.reshape(-1)].set(jnp.repeat(expired[:, None], COMETS_PER_SPAWN, axis=1).reshape(-1))
+    valid_slots = state.comet_slots >= 0
+    slots = jnp.where(valid_slots, state.comet_slots, 0)
+    expired_slots = valid_slots & expired[:, None]
+    slot_expired = jnp.zeros_like(state.planet_alive).at[slots.reshape(-1)].max(expired_slots.reshape(-1))
     planet_alive = state.planet_alive & (~slot_expired)
     planets = jnp.where(slot_expired[:, None], jnp.zeros_like(state.planets), state.planets)
     initial_planets = jnp.where(slot_expired[:, None], jnp.zeros_like(state.initial_planets), state.initial_planets)

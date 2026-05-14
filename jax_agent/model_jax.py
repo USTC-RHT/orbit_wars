@@ -82,15 +82,18 @@ class ActorCritic(nn.Module):
 
         # 单头 scaled dot-product cross-attention 实现目标选择
         # query = 来源星球 context 经非线性变换 + L2 归一化
+        # 注意：用 sqrt(max(sum(x²), eps²)) 而非 max(norm(x), eps)。
+        # 后者在 x=0 时反向传播会产生 0/0=NaN（norm 梯度 = x/norm(x)，
+        # 即使 max 截断使前向为 eps，反向仍通过 d(norm)/dx=x/0 产生 NaN 梯度）。
         q = nn.Dense(self.hidden_size)(context_h)
         q = nn.relu(q)
         q = nn.Dense(self.hidden_size)(q)
-        q = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-6)
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
         # key = 候选星球编码 + L2 归一化；slot 0 用可学习 no-op key 覆盖
         keys = nn.Dense(self.hidden_size)(cand_h)
         noop_key = self.param("noop_key", nn.initializers.zeros, (self.hidden_size,))
         keys = keys.at[:, 0, :].set(noop_key)
-        keys = keys / jnp.maximum(jnp.linalg.norm(keys, axis=-1, keepdims=True), 1e-6)
+        keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
         # logit = q · key / sqrt(d)，非法目标置 -inf
         target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
         target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)

@@ -135,7 +135,10 @@ class TrainConfig:
     opponent_pool: list[str] = field(default_factory=lambda: ["nearest"])
     opponent_pool_weights: list[float] = field(default_factory=lambda: [1.0])
     self_play_update_interval: int = 25
-    # self-play 对手本质上是在“推理”旧策略，默认用 argmax 保持行为稳定。
+    pool_lag_interval: int = 50
+    promote_nearest_win_rate: float = 0.8
+    promote_consecutive_evals: int = 3
+    # self-play 对手本质上是在"推理"旧策略，默认用 argmax 保持行为稳定。
     self_play_deterministic: bool = True
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)

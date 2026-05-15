@@ -440,16 +440,22 @@ def main() -> None:
 
     self_play = getattr(cfg, "opponent", "nearest") == "self"
     use_pool = getattr(cfg, "opponent", "nearest") == "pool"
-    # 对手池模式：PFSP 胜率加权采样，优先训练当前打不过的对手。
+    # 对手池模式：
+    # - pfsp: 胜率加权采样，优先训练当前打不过的对手。
+    # - fixed: 旧版固定比例采样，Phase 1 nearest/current/lag 各 1/3，Phase 2 current/lag 各 1/2。
     pool_phase = 1
+    pool_mode = getattr(cfg, "pool_mode", "pfsp")
     pool_lag_interval = getattr(cfg, "pool_lag_interval", 50)
-    pool_prune_interval = 100
+    pool_max_size = getattr(cfg, "pool_max_size", 4)
     promote_nearest_win_rate = getattr(cfg, "promote_nearest_win_rate", 0.8)
     promote_consecutive_evals = getattr(cfg, "promote_consecutive_evals", 3)
     recent_nearest_win_rates: list[float] = []
     pool_rng = random.Random(cfg.seed + 12345)
     if use_pool:
-        print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, prune_interval={pool_prune_interval})")
+        if pool_mode == "fixed":
+            print(f"opponent=pool fixed (lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+        else:
+            print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size})")
     else:
         print(f"opponent={'self_play' if self_play else 'nearest'}")
     opponent_update_freq = cfg.self_play_update_interval  # 默认 25
@@ -465,6 +471,7 @@ def main() -> None:
     opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     # lag_snapshot 保存“上一个 interval 的当前策略”；到下一个 interval 时加入池子，成为 50 步前 checkpoint。
     lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     pool_entries: list[dict] = []
     if use_pool:
         pool_entries = [
@@ -490,16 +497,17 @@ def main() -> None:
             "winrate": 0.5,
         })
         print(f"[pool] update={update_idx} 加入 50 步前 checkpoint，对手池: {_pool_summary(pool_entries)}")
+        _prune_pool(update_idx)
 
     def _prune_pool(update_idx: int) -> None:
+        if len(pool_entries) <= pool_max_size:
+            return
         removable = [entry for entry in pool_entries if entry["id"] != "selfplay-current"]
         if not removable:
             return
         victim = max(removable, key=lambda entry: float(entry["winrate"]))
-        if float(victim["winrate"]) < 0.6:
-            return
         pool_entries.remove(victim)
-        print(f"[pool] update={update_idx} 移除胜率最高对手 {victim['id']} "
+        print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除胜率最高对手 {victim['id']} "
               f"(winrate={float(victim['winrate']):.3f})，对手池: {_pool_summary(pool_entries)}")
 
     # 两个 JIT 编译的训练步（nearest 对手 / self-play 对手），供 pool 模式按需调用
@@ -556,17 +564,40 @@ def main() -> None:
         rng, step_key = jax.random.split(rng)
 
         if use_pool:
-            selected_pool_entry = _pfsp_sample(pool_entries)
-            selected_pool_id = str(selected_pool_entry["id"])
-            if selected_pool_entry["type"] == "nearest":
-                train_state, state, normalizer_state, metrics = _run_step(
-                    _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
-            elif selected_pool_entry["type"] == "current":
-                train_state, state, normalizer_state, metrics = _run_step(
-                    _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+            if pool_mode == "fixed":
+                u = pool_rng.random()
+                if pool_phase == 1 and u < 1 / 3:
+                    selected_pool_id = "nearest"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
+                elif pool_phase == 1 and u < 2 / 3:
+                    selected_pool_id = "selfplay-current"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+                elif pool_phase == 1:
+                    selected_pool_id = "selfplay-lag"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, lagged_params, state, normalizer_state, step_key)
+                elif u < 0.5:
+                    selected_pool_id = "selfplay-current"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+                else:
+                    selected_pool_id = "selfplay-lag"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, lagged_params, state, normalizer_state, step_key)
             else:
-                train_state, state, normalizer_state, metrics = _run_step(
-                    _jit_selfplay, train_state, selected_pool_entry["params"], state, normalizer_state, step_key)
+                selected_pool_entry = _pfsp_sample(pool_entries)
+                selected_pool_id = str(selected_pool_entry["id"])
+                if selected_pool_entry["type"] == "nearest":
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
+                elif selected_pool_entry["type"] == "current":
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+                else:
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, selected_pool_entry["params"], state, normalizer_state, step_key)
         else:
             # 兼容旧配置（opponent: nearest / self）
             if self_play and update % opponent_update_freq == 1:
@@ -574,7 +605,7 @@ def main() -> None:
             train_state, state, normalizer_state, metrics = _run_step(
                 _jit_step, train_state, opponent_params, state, normalizer_state, step_key)
         metrics = jax.device_get(metrics)
-        if use_pool and selected_pool_entry is not None and float(metrics["episodes_per_rollout"]) > 0.0:
+        if use_pool and pool_mode == "pfsp" and selected_pool_entry is not None and float(metrics["episodes_per_rollout"]) > 0.0:
             old_wr = float(selected_pool_entry["winrate"])
             selected_pool_entry["winrate"] = 0.95 * old_wr + 0.05 * float(metrics["win_rate"])
             metrics["pool_selected_winrate"] = selected_pool_entry["winrate"]
@@ -589,15 +620,20 @@ def main() -> None:
             f"epochs={metrics.get('n_epochs_run', cfg.ppo.epochs):.0f}"
         )
         if use_pool:
-            selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
-            line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
+            if pool_mode == "pfsp":
+                selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
+                line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
+            else:
+                line += f" opp={selected_pool_id}"
         print(line, flush=True)
 
         if use_pool and update % pool_lag_interval == 0:
-            _add_lag_to_pool(update, lag_snapshot_params)
-            lag_snapshot_params = _copy_params(train_state.params)
-        if use_pool and update % pool_prune_interval == 0:
-            _prune_pool(update)
+            if pool_mode == "fixed":
+                lagged_params = _copy_params(train_state.params)
+                print(f"[pool] update={update} 同步 fixed lagged 对手权重 (lag={pool_lag_interval})")
+            else:
+                _add_lag_to_pool(update, lag_snapshot_params)
+                lag_snapshot_params = _copy_params(train_state.params)
 
         eval_metrics = {field: "" for field in eval_metric_fields}
         if eval_enabled and eval_interval > 0 and update % eval_interval == 0:
@@ -713,11 +749,11 @@ def main() -> None:
                 "losses/n_epochs_run": float(metrics.get("n_epochs_run", cfg.ppo.epochs)),
             }, step=update)
             if use_pool:
-                selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
-                _wandb.log({
-                    "pool/selected_win_rate": selected_wr,
-                    "pool/size": float(len(pool_entries)),
-                }, step=update)
+                pool_log = {"pool/size": float(len(pool_entries) if pool_mode == "pfsp" else 3)}
+                if pool_mode == "pfsp":
+                    selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
+                    pool_log["pool/selected_win_rate"] = selected_wr
+                _wandb.log(pool_log, step=update)
 
         # ── 定期保存 checkpoint ───────────────────────────────────
         if update % checkpoint_every == 0:

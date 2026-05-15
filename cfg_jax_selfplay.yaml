@@ -45,6 +45,10 @@ reward:
 model:
   hidden_size: 128
   use_cnn: True
+  use_transformer: True
+  num_transformer_layers: 1
+  num_heads: 2
+  max_fleet_tokens: 16
 
 state_norm:
   enabled: true

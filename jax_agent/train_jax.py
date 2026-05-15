@@ -51,7 +51,7 @@ from .fast_env import (  # noqa: E402
     select_from_bank,
     step_batch,
 )
-from .features_jax import FeatureParams, encode_batch, flatten_sources  # noqa: E402
+from .features_jax import FLEET_DIM, FeatureParams, encode_batch, flatten_sources  # noqa: E402
 from .model_jax import ActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
 from .ppo_jax import PPOParams, Rollout, compute_gae, log_prob_entropy, make_train_state, ppo_update, safe_logits  # noqa: E402
@@ -75,30 +75,34 @@ def flip_state(state: EnvState) -> EnvState:
     return state._replace(planets=new_planets, fleets=new_fleets)
 
 
-def policy_sample_params(params, model, flat, rng):
+def policy_sample_params(params, model, encoded, rng):
     """与 policy_sample 相同，但直接接受 params pytree（用于冻结对手）。"""
-    zeros = jnp.zeros((flat.self_features.shape[0],), dtype=jnp.int32)
+    zeros = jnp.zeros(encoded.self_features.shape[:-1], dtype=jnp.int32)
     out1 = model.apply(
         {"params": params},
-        flat.self_features, flat.candidate_features, flat.global_features,
-        flat.candidate_mask, flat.map_features, zeros,
+        encoded.self_features, encoded.candidate_features, encoded.global_features,
+        encoded.candidate_mask, encoded.map_features, zeros,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
     )
     rng_fire, rng_target, rng_amount = jax.random.split(rng, 3)
-    has_target = flat.candidate_mask.at[:, 0].set(False).any(axis=-1) & flat.source_mask
+    has_target = encoded.candidate_mask.at[..., 0].set(False).any(axis=-1) & encoded.source_mask
     fire_logits = jnp.where(has_target, out1.fire_logits, -1.0e8)
     fire = jax.random.uniform(rng_fire, fire_logits.shape) < jax.nn.sigmoid(fire_logits)
-    target_logits = jnp.where(flat.candidate_mask.at[:, 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[:, None], target_logits, NEG_INF).at[:, 0].set(jnp.where(fire, target_logits[:, 0], 0.0))
+    target_logits = jnp.where(encoded.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
+    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(jnp.where(fire, target_logits[..., 0], 0.0))
     target_logits = safe_logits(target_logits)
     target = jax.random.categorical(rng_target, target_logits, axis=-1)
     out2 = model.apply(
         {"params": params},
-        flat.self_features, flat.candidate_features, flat.global_features,
-        flat.candidate_mask, flat.map_features, target,
+        encoded.self_features, encoded.candidate_features, encoded.global_features,
+        encoded.candidate_mask, encoded.map_features, target,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
     )
-    selected_amount_mask = jnp.take_along_axis(flat.amount_mask, target[:, None, None], axis=1).squeeze(1)
+    selected_amount_mask = jnp.take_along_axis(encoded.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
     amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[:, None], 0.0, amount_logits)
+    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
     amount = jax.random.categorical(rng_amount, amount_logits, axis=-1)
     return fire, target, amount, None, out1.value
 
@@ -175,43 +179,46 @@ def deterministic_policy_actions(train_state, state, feat_params, norm_state, no
     """argmax 推理路径，用于网页/外部评估/JAX 内部 eval 保持一致。"""
     raw_enc = encode_batch(state, feat_params)
     enc = normalize_encoded(raw_enc, norm_state, norm_params)
-    flat = flatten_sources(enc)
-    zeros = jnp.zeros((flat.self_features.shape[0],), dtype=jnp.int32)
+    zeros = jnp.zeros(enc.self_features.shape[:-1], dtype=jnp.int32)
     out1 = train_state.apply_fn(
         {"params": train_state.params},
-        flat.self_features,
-        flat.candidate_features,
-        flat.global_features,
-        flat.candidate_mask,
-        flat.map_features,
+        enc.self_features,
+        enc.candidate_features,
+        enc.global_features,
+        enc.candidate_mask,
+        enc.map_features,
         zeros,
+        fleet_features=enc.fleet_features,
+        fleet_mask=enc.fleet_mask,
     )
-    has_target = flat.candidate_mask.at[:, 0].set(False).any(axis=-1) & flat.source_mask
+    has_target = enc.candidate_mask.at[..., 0].set(False).any(axis=-1) & enc.source_mask
     fire = (jax.nn.sigmoid(out1.fire_logits) > 0.5) & has_target
-    target_logits = jnp.where(flat.candidate_mask.at[:, 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[:, None], target_logits, NEG_INF).at[:, 0].set(
-        jnp.where(fire, target_logits[:, 0], 0.0)
+    target_logits = jnp.where(enc.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
+    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(
+        jnp.where(fire, target_logits[..., 0], 0.0)
     )
     target = jnp.argmax(safe_logits(target_logits), axis=-1)
     out2 = train_state.apply_fn(
         {"params": train_state.params},
-        flat.self_features,
-        flat.candidate_features,
-        flat.global_features,
-        flat.candidate_mask,
-        flat.map_features,
+        enc.self_features,
+        enc.candidate_features,
+        enc.global_features,
+        enc.candidate_mask,
+        enc.map_features,
         target,
+        fleet_features=enc.fleet_features,
+        fleet_mask=enc.fleet_mask,
     )
-    selected_amount_mask = jnp.take_along_axis(flat.amount_mask, target[:, None, None], axis=1).squeeze(1)
+    selected_amount_mask = jnp.take_along_axis(enc.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
     amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[:, None], 0.0, amount_logits)
+    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
     amount = jnp.argmax(amount_logits, axis=-1)
     return actions_from_decisions(
         state,
         enc,
-        fire.reshape(state.planets.shape[:2]),
-        target.reshape(state.planets.shape[:2]),
-        amount.reshape(state.planets.shape[:2]),
+        fire,
+        target,
+        amount,
         feat_params,
     )
 
@@ -346,7 +353,8 @@ def main() -> None:
     rng = jax.random.PRNGKey(cfg.seed)
     rng, rng_reset, rng_model = jax.random.split(rng, 3)
     state = reset_from_bank(bank, rng_reset, cfg.ppo.num_envs)
-    sample = flatten_sources(encode_batch(state, feat_params))
+    raw_sample = encode_batch(state, feat_params)
+    sample = raw_sample if getattr(cfg.model, "use_transformer", False) else flatten_sources(raw_sample)
     model = ActorCritic(
         self_dim=sample.self_features.shape[-1],
         candidate_dim=sample.candidate_features.shape[-1],
@@ -355,6 +363,11 @@ def main() -> None:
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
         use_cnn=cfg.model.use_cnn,
+        use_transformer=getattr(cfg.model, "use_transformer", False),
+        fleet_dim=FLEET_DIM,
+        max_fleet_tokens=feat_params.max_fleet_tokens,
+        num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
+        num_heads=getattr(cfg.model, "num_heads", 4),
     )
     train_state = make_train_state(
         rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
@@ -426,6 +439,10 @@ def main() -> None:
                 "epochs": cfg.ppo.epochs,
                 "hidden_size": cfg.model.hidden_size,
                 "use_cnn": cfg.model.use_cnn,
+                "use_transformer": getattr(cfg.model, "use_transformer", False),
+                "num_transformer_layers": getattr(cfg.model, "num_transformer_layers", 2),
+                "num_heads": getattr(cfg.model, "num_heads", 4),
+                "max_fleet_tokens": feat_params.max_fleet_tokens,
                 "max_planets": cfg.env.max_planets,
                 "opponent": getattr(cfg, "opponent", "nearest"),
             },
@@ -795,11 +812,7 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        flat = flatten_sources(encoded)
-        fire, target, amount, logp, value = policy_sample(ts, model, flat, action_key)
-        fire_2d = fire.reshape(st.planets.shape[:2])
-        target_2d = target.reshape(st.planets.shape[:2])
-        amount_2d = amount.reshape(st.planets.shape[:2])
+        fire_2d, target_2d, amount_2d, logp, value = policy_sample(ts, model, encoded, action_key)
         learner_actions, learner_policy_mask = actions_from_decisions_with_policy_mask(
             st,
             encoded,
@@ -813,9 +826,8 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             flipped = flip_state(st)
             raw_enc_opp = encode_batch(flipped, feat_params)
             enc_opp = normalize_encoded(raw_enc_opp, ns, norm_params)  # 只读，不更新归一化器
-            flat_opp = flatten_sources(enc_opp)
-            f_opp, t_opp, a_opp, _, _ = policy_sample_params(opponent_params, model, flat_opp, opp_key)
-            opponent_actions = actions_from_decisions(flipped, enc_opp, f_opp.reshape(flipped.planets.shape[:2]), t_opp.reshape(flipped.planets.shape[:2]), a_opp.reshape(flipped.planets.shape[:2]), feat_params)
+            f_opp, t_opp, a_opp, _, _ = policy_sample_params(opponent_params, model, enc_opp, opp_key)
+            opponent_actions = actions_from_decisions(flipped, enc_opp, f_opp, t_opp, a_opp, feat_params)
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)  # 对手：最近敌方简单基线
         joint = jnp.stack([learner_actions, opponent_actions], axis=1)  # 双方动作合并
@@ -830,6 +842,8 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             encoded.candidate_features,
             encoded.global_features,
             encoded.map_features,
+            encoded.fleet_features,
+            encoded.fleet_mask,
             encoded.candidate_mask,
             encoded.amount_mask,
             encoded.source_mask,
@@ -837,8 +851,8 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             fire_2d,
             target_2d,
             amount_2d,
-            logp.reshape(st.planets.shape[:2]),
-            value.reshape(st.planets.shape[:2]),
+            logp,
+            value,
             reward,
             done,
         )
@@ -846,7 +860,7 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
 
     (train_state, state, normalizer_state, rng), rollout = jax.lax.scan(body, (train_state, state, normalizer_state, rollout_key), None, length=rollout_steps)
     last_raw_encoded = encode_batch(state, feat_params)
-    last_encoded = flatten_sources(normalize_encoded(last_raw_encoded, normalizer_state, norm_params))
+    last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
     last_out = train_state.apply_fn(
         {"params": train_state.params},
         last_encoded.self_features,
@@ -854,9 +868,11 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
         last_encoded.global_features,
         last_encoded.candidate_mask,
         last_encoded.map_features,
-        jnp.zeros((last_encoded.self_features.shape[0],), dtype=jnp.int32),
+        jnp.zeros(last_encoded.self_features.shape[:-1], dtype=jnp.int32),
+        fleet_features=last_encoded.fleet_features,
+        fleet_mask=last_encoded.fleet_mask,
     )
-    last_values = last_out.value.reshape(state.planets.shape[:2])
+    last_values = last_out.value
     returns, advantages = compute_gae(rollout.reward, rollout.done, rollout.old_value, last_values, ppo_params)
     # rollout.done: [T, B, P]，每步每 env 的结束标志（P 维相同）
     # rollout.reward: [T, B, P]，只有 done=True 那步有 ±1，其余为 0
@@ -881,46 +897,50 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
     return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
 
 
-def policy_sample(train_state, model, flat, rng):
+def policy_sample(train_state, model, encoded, rng):
     """两阶段采样策略。
 
     第一步：传入 zeros target 前向 -> 采 fire/target。
     第二步：传入真实 target 前向 -> 采 amount，并计算联合 logp。
     与 log_prob_entropy 训练路径完全一致。
     """
-    zeros = jnp.zeros((flat.self_features.shape[0],), dtype=jnp.int32)
+    zeros = jnp.zeros(encoded.self_features.shape[:-1], dtype=jnp.int32)
     out1 = train_state.apply_fn(
         {"params": train_state.params},
-        flat.self_features,
-        flat.candidate_features,
-        flat.global_features,
-        flat.candidate_mask,
-        flat.map_features,
+        encoded.self_features,
+        encoded.candidate_features,
+        encoded.global_features,
+        encoded.candidate_mask,
+        encoded.map_features,
         zeros,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
     )
     rng_fire, rng_target, rng_amount = jax.random.split(rng, 3)
-    has_target = flat.candidate_mask.at[:, 0].set(False).any(axis=-1) & flat.source_mask
+    has_target = encoded.candidate_mask.at[..., 0].set(False).any(axis=-1) & encoded.source_mask
     fire_logits = jnp.where(has_target, out1.fire_logits, -1.0e8)  # 没有可用目标时强制 fire=0
     fire = jax.random.uniform(rng_fire, fire_logits.shape) < jax.nn.sigmoid(fire_logits)
     # 屏蔽 no-op slot，使 target 必须是阵中星球
-    target_logits = jnp.where(flat.candidate_mask.at[:, 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[:, None], target_logits, NEG_INF).at[:, 0].set(jnp.where(fire, target_logits[:, 0], 0.0))
+    target_logits = jnp.where(encoded.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
+    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(jnp.where(fire, target_logits[..., 0], 0.0))
     target_logits = safe_logits(target_logits)
     target = jax.random.categorical(rng_target, target_logits, axis=-1)
     out2 = train_state.apply_fn(
         {"params": train_state.params},
-        flat.self_features,
-        flat.candidate_features,
-        flat.global_features,
-        flat.candidate_mask,
-        flat.map_features,
+        encoded.self_features,
+        encoded.candidate_features,
+        encoded.global_features,
+        encoded.candidate_mask,
+        encoded.map_features,
         target,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
     )
-    selected_amount_mask = jnp.take_along_axis(flat.amount_mask, target[:, None, None], axis=1).squeeze(1)
+    selected_amount_mask = jnp.take_along_axis(encoded.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
     amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[:, None], 0.0, amount_logits)
+    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
     amount = jax.random.categorical(rng_amount, amount_logits, axis=-1)
-    logp, _entropy = log_prob_entropy(out2, fire, target, amount, flat.candidate_mask, flat.amount_mask)
+    logp, _entropy = log_prob_entropy(out2, fire, target, amount, encoded.candidate_mask, encoded.amount_mask)
     return fire, target, amount, logp, out1.value
 
 

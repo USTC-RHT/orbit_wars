@@ -149,20 +149,21 @@ def normalize_encoded(encoded: EncodedBatch, state: NormalizerState, params: Nor
     )
     global_features = global_features.at[..., GLOBAL_NORMALIZE_INDICES].set(global_norm)
     return EncodedBatch(
-        self_features,
-        candidate_features,
-        global_features,
-        encoded.map_features,
-        encoded.candidate_mask,
-        encoded.amount_mask,
-        encoded.source_ids,
-        encoded.source_ships,
-        encoded.candidate_ids,
-        encoded.ship_buckets,
-        encoded.source_mask,
+        self_features=self_features,
+        candidate_features=candidate_features,
+        global_features=global_features,
+        map_features=encoded.map_features,
+        candidate_mask=encoded.candidate_mask,
+        amount_mask=encoded.amount_mask,
+        source_ids=encoded.source_ids,
+        source_ships=encoded.source_ships,
+        candidate_ids=encoded.candidate_ids,
+        ship_buckets=encoded.ship_buckets,
+        source_mask=encoded.source_mask,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
     )
 
 
 def normalize_values(values: jnp.ndarray, mean: jnp.ndarray, var: jnp.ndarray, params: NormalizerParams) -> jnp.ndarray:
     return jnp.clip((values - mean) / jnp.sqrt(var + params.eps), -params.clip, params.clip)
-

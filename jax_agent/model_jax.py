@@ -2,11 +2,9 @@
 
 架构说明：
 - 三头输出：fire（是否发射）、target（指针注意力选星球）、amount（派兵档位）。
-- context 由三部分拼接：self_h + global_h + map_h（+ CNN）。
-- map_h = max/mean 混合池化候选层表示，得到全局感知。
-- 目标选择：单头 scaled dot-product cross-attention（query 来源星球、key 目标星球）。
-- 候选星球之间没有 self-attention，与标准 Transformer 的区别在此。
-- 与 PyTorch 版 src/model.py 架构对齐，可将权重可靠地反序列化。
+- legacy 路径保持原 per-source MLP + 单头 cross-attn，用于旧 checkpoint fallback。
+- Transformer 路径使用 [CLS | planet tokens | fleet tokens] 编码全局关系，
+  再用 source contextual embedding 对 planet tokens 做 pointer 选目标。
 """
 
 from __future__ import annotations
@@ -40,6 +38,31 @@ class MLP(nn.Module):
         return nn.relu(x)
 
 
+class TransformerEncoderLayer(nn.Module):
+    """Pre-LN Transformer encoder block for planet/fleet tokens."""
+    hidden_size: int
+    num_heads: int
+    mlp_ratio: int = 4
+
+    @nn.compact
+    def __call__(self, x, mask=None):
+        h = nn.LayerNorm()(x)
+        attn_mask = mask[:, None, None, :] if mask is not None else None
+        h = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.hidden_size,
+            out_features=self.hidden_size,
+            dropout_rate=0.0,
+            deterministic=True,
+        )(h, h, mask=attn_mask)
+        x = x + h
+        h = nn.LayerNorm()(x)
+        h = nn.Dense(self.hidden_size * self.mlp_ratio)(h)
+        h = nn.gelu(h)
+        h = nn.Dense(self.hidden_size)(h)
+        return x + h
+
+
 class ActorCritic(nn.Module):
     """主策略网络，封装 fire/target/amount/value 四个头。"""
     self_dim: int          # 来源星球特征维度 (SELF_DIM=18)
@@ -51,9 +74,56 @@ class ActorCritic(nn.Module):
     use_cnn: bool = False  # 是否启用 CNN 小地图分支
     map_channels: int = 6  # CNN 输入通道数
     map_grid_size: int = 8 # CNN 输入分辨率
+    use_transformer: bool = False
+    fleet_dim: int = 16
+    max_fleet_tokens: int = 32
+    num_transformer_layers: int = 2
+    num_heads: int = 4
 
     @nn.compact
-    def __call__(self, self_features, candidate_features, global_features, candidate_mask, map_features=None, selected_targets=None):
+    def __call__(
+        self,
+        self_features,
+        candidate_features,
+        global_features,
+        candidate_mask,
+        map_features=None,
+        selected_targets=None,
+        fleet_features=None,
+        fleet_mask=None,
+    ):
+        if self.use_transformer:
+            if self_features.ndim == 3:
+                return self._forward_transformer_grouped(
+                    self_features,
+                    candidate_features,
+                    global_features,
+                    candidate_mask,
+                    map_features,
+                    selected_targets,
+                    fleet_features,
+                    fleet_mask,
+                )
+            return self._forward_transformer(
+                self_features,
+                candidate_features,
+                global_features,
+                candidate_mask,
+                map_features,
+                selected_targets,
+                fleet_features,
+                fleet_mask,
+            )
+        return self._forward_legacy(
+            self_features,
+            candidate_features,
+            global_features,
+            candidate_mask,
+            map_features,
+            selected_targets,
+        )
+
+    def _forward_legacy(self, self_features, candidate_features, global_features, candidate_mask, map_features=None, selected_targets=None):
         # 将三类输入分别编码为等长 hidden 向量
         self_h = MLP(self.hidden_size)(self_features)
         cand_h = MLP(self.hidden_size)(candidate_features)
@@ -116,3 +186,192 @@ class ActorCritic(nn.Module):
         value_h = nn.relu(nn.Dense(self.hidden_size)(context_h))
         value = nn.Dense(1)(value_h).squeeze(-1)
         return PolicyOutput(fire_logits, target_logits, amount_logits, value)
+
+    def _forward_transformer(
+        self,
+        self_features,
+        candidate_features,
+        global_features,
+        candidate_mask,
+        map_features=None,
+        selected_targets=None,
+        fleet_features=None,
+        fleet_mask=None,
+    ):
+        batch_size = self_features.shape[0]
+        hidden = self.hidden_size
+        planet_h = MLP(hidden)(candidate_features)
+        if fleet_features is None:
+            fleet_features = jnp.zeros((batch_size, self.max_fleet_tokens, self.fleet_dim), dtype=planet_h.dtype)
+        if fleet_mask is None:
+            fleet_mask = jnp.zeros((batch_size, self.max_fleet_tokens), dtype=bool)
+        fleet_h = MLP(hidden)(fleet_features)
+        cls = self.param("cls_token", nn.initializers.normal(0.02), (1, 1, hidden))
+        cls = jnp.broadcast_to(cls, (batch_size, 1, hidden))
+        type_embed = self.param("type_embed", nn.initializers.normal(0.02), (3, hidden))
+        cls = cls + type_embed[0]
+        planet_h = planet_h + type_embed[1]
+        fleet_h = fleet_h + type_embed[2]
+        tokens = jnp.concatenate([cls, planet_h, fleet_h], axis=1)
+        cls_mask = jnp.ones((batch_size, 1), dtype=bool)
+        planet_alive = candidate_features[..., 1] > 0.5
+        planet_alive = planet_alive.at[:, 0].set(True)
+        token_mask = jnp.concatenate([cls_mask, planet_alive, fleet_mask], axis=1)
+        x = tokens
+        for _ in range(self.num_transformer_layers):
+            x = TransformerEncoderLayer(hidden, self.num_heads)(x, mask=token_mask)
+        x = nn.LayerNorm()(x)
+        cls_out = x[:, 0, :]
+        planet_out = x[:, 1:1 + self.candidate_count, :]
+
+        self_h = MLP(hidden)(self_features)
+        global_h = MLP(hidden)(global_features)
+        source_token_mask = candidate_features[..., 2:3] * (candidate_features[..., 1:2] > 0.5)
+        source_ctx = (planet_out * source_token_mask).sum(axis=1) / jnp.maximum(source_token_mask.sum(axis=1), 1.0)
+        context_parts = [self_h, global_h, source_ctx, cls_out]
+        if self.use_cnn:
+            if map_features is None:
+                map_features = jnp.zeros((batch_size, self.map_channels, self.map_grid_size, self.map_grid_size), dtype=self_h.dtype)
+            m = jnp.transpose(map_features, (0, 2, 3, 1))
+            m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
+            m = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(m))
+            m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
+            m = m.mean(axis=(1, 2))
+            m = nn.relu(nn.Dense(16)(m))
+            context_parts.append(m)
+        context_h = jnp.concatenate(context_parts, axis=-1)
+
+        q = nn.Dense(hidden)(context_h)
+        q = nn.relu(q)
+        q = nn.Dense(hidden)(q)
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
+        keys = nn.Dense(hidden)(planet_out)
+        noop_key = self.param("noop_key", nn.initializers.zeros, (hidden,))
+        keys = keys.at[:, 0, :].set(noop_key)
+        keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
+        target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(hidden))
+        target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
+
+        fire_logits = nn.Dense(hidden)(context_h)
+        fire_logits = nn.relu(fire_logits)
+        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+
+        if selected_targets is None:
+            selected_targets = jnp.zeros((batch_size,), dtype=jnp.int32)
+        row = jnp.arange(selected_targets.shape[0])
+        selected_h = planet_out[row, selected_targets]
+        amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
+        amount_h = nn.relu(nn.Dense(hidden)(amount_h))
+        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+
+        value_h = nn.relu(nn.Dense(hidden)(cls_out))
+        value = nn.Dense(1)(value_h).squeeze(-1)
+        return PolicyOutput(fire_logits, target_logits, amount_logits, value)
+
+    def _forward_transformer_grouped(
+        self,
+        self_features,
+        candidate_features,
+        global_features,
+        candidate_mask,
+        map_features=None,
+        selected_targets=None,
+        fleet_features=None,
+        fleet_mask=None,
+    ):
+        batch_size, source_count = self_features.shape[:2]
+        hidden = self.hidden_size
+        planet_features = self._shared_planet_features(candidate_features[:, 0])
+        planet_h = MLP(hidden)(planet_features)
+        if fleet_features is None:
+            fleet_features = jnp.zeros((batch_size, source_count, self.max_fleet_tokens, self.fleet_dim), dtype=planet_h.dtype)
+        if fleet_mask is None:
+            fleet_mask = jnp.zeros((batch_size, source_count, self.max_fleet_tokens), dtype=bool)
+        shared_fleet_features = fleet_features[:, 0]
+        shared_fleet_mask = fleet_mask[:, 0]
+        fleet_h = MLP(hidden)(shared_fleet_features)
+        cls = self.param("cls_token", nn.initializers.normal(0.02), (1, 1, hidden))
+        cls = jnp.broadcast_to(cls, (batch_size, 1, hidden))
+        type_embed = self.param("type_embed", nn.initializers.normal(0.02), (3, hidden))
+        cls = cls + type_embed[0]
+        planet_h = planet_h + type_embed[1]
+        fleet_h = fleet_h + type_embed[2]
+        tokens = jnp.concatenate([cls, planet_h, fleet_h], axis=1)
+        cls_mask = jnp.ones((batch_size, 1), dtype=bool)
+        planet_alive = planet_features[..., 1] > 0.5
+        planet_alive = planet_alive.at[:, 0].set(True)
+        token_mask = jnp.concatenate([cls_mask, planet_alive, shared_fleet_mask], axis=1)
+        x = tokens
+        for _ in range(self.num_transformer_layers):
+            x = TransformerEncoderLayer(hidden, self.num_heads)(x, mask=token_mask)
+        x = nn.LayerNorm()(x)
+        cls_out = x[:, 0, :]
+        planet_out = x[:, 1:1 + self.candidate_count, :]
+
+        self_h = MLP(hidden)(self_features)
+        global_h = MLP(hidden)(global_features)
+        source_token_mask = candidate_features[..., 2:3] * (candidate_features[..., 1:2] > 0.5)
+        source_ctx = (planet_out[:, None, :, :] * source_token_mask).sum(axis=2) / jnp.maximum(source_token_mask.sum(axis=2), 1.0)
+        cls_per_source = jnp.broadcast_to(cls_out[:, None, :], (batch_size, source_count, hidden))
+        context_parts = [self_h, global_h, source_ctx, cls_per_source]
+        if self.use_cnn:
+            if map_features is None:
+                map_features = jnp.zeros((batch_size, source_count, self.map_channels, self.map_grid_size, self.map_grid_size), dtype=self_h.dtype)
+            m = jnp.reshape(map_features, (batch_size * source_count,) + map_features.shape[2:])
+            m = jnp.transpose(m, (0, 2, 3, 1))
+            m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
+            m = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(m))
+            m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
+            m = m.mean(axis=(1, 2))
+            m = nn.relu(nn.Dense(16)(m))
+            m = jnp.reshape(m, (batch_size, source_count, 16))
+            context_parts.append(m)
+        context_h = jnp.concatenate(context_parts, axis=-1)
+
+        relative_h = MLP(hidden)(self._relative_candidate_features(candidate_features))
+        q = nn.Dense(hidden)(context_h)
+        q = nn.relu(q)
+        q = nn.Dense(hidden)(q)
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
+        base_keys = nn.Dense(hidden)(planet_out)
+        keys = base_keys[:, None, :, :] + relative_h
+        noop_key = self.param("noop_key", nn.initializers.zeros, (hidden,))
+        keys = keys.at[:, :, 0, :].set(noop_key)
+        keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
+        target_logits = jnp.einsum("bph,bpch->bpc", q, keys) / jnp.sqrt(float(hidden))
+        target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
+
+        fire_logits = nn.Dense(hidden)(context_h)
+        fire_logits = nn.relu(fire_logits)
+        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+
+        if selected_targets is None:
+            selected_targets = jnp.zeros((batch_size, source_count), dtype=jnp.int32)
+        amount_keys = base_keys[:, None, :, :] + relative_h
+        selected_h = jnp.take_along_axis(amount_keys, selected_targets[..., None, None], axis=2).squeeze(2)
+        amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
+        amount_h = nn.relu(nn.Dense(hidden)(amount_h))
+        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+
+        value_h = nn.relu(nn.Dense(hidden)(cls_per_source))
+        value = nn.Dense(1)(value_h).squeeze(-1)
+        return PolicyOutput(fire_logits, target_logits, amount_logits, value)
+
+    def _shared_planet_features(self, candidate_features):
+        """Strip source-relative fields before the state-level Transformer."""
+        features = candidate_features
+        relative_dims = jnp.asarray([2, 8, 9, 10, 16, 17, 24, 25], dtype=jnp.int32)
+        features = features.at[..., relative_dims].set(0.0)
+        alive = features[..., 1] > 0.5
+        is_neutral = features[..., 3] > 0.5
+        is_enemy = features[..., 5] > 0.5
+        is_mine = alive & (~is_neutral) & (~is_enemy)
+        features = features.at[..., 4].set(is_mine.astype(features.dtype))
+        features = features.at[..., 0, 4].set(0.0)
+        return features
+
+    def _relative_candidate_features(self, candidate_features):
+        """Keep only source-relative target features for per-source pointer keys."""
+        keep_dims = jnp.asarray([2, 8, 9, 10, 16, 17, 24, 25], dtype=jnp.int32)
+        out = jnp.zeros_like(candidate_features)
+        return out.at[..., keep_dims].set(candidate_features[..., keep_dims])

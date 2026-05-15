@@ -38,6 +38,8 @@ from .fast_env import (
 SELF_DIM = 18         # 来源星球自身特征维度
 CANDIDATE_DIM = 26    # 单个目标候选星球特征维度
 GLOBAL_DIM = 11       # 全局局势特征维度
+FLEET_DIM = 16        # 单支舰队 token 特征维度
+MAX_FLEET_TOKENS = 32 # 每个 source 选择进入 Transformer 的舰队 token 数
 MAP_CHANNELS = 6      # CNN 小地图通道数（来源星/友方/敌方/中立/友方舰队/敌方舰队）
 MAP_GRID_SIZE = 8     # CNN 小地图分辨率（8x8）
 INBOUND_HORIZON = 60.0  # 预测舰队第局 N 回合内贫心星球
@@ -56,9 +58,11 @@ class FeatureParams:
     target_filter_enabled: bool = False  # 是否启用 Proto-guided 目标过滤
     attack_top_k: int = 6         # 最多保留 K 个进攻候选
     defense_top_k: int = 3        # 最多保留 K 个防守/输送候选
+    max_fleet_tokens: int = MAX_FLEET_TOKENS
 
     @classmethod
     def from_train_config(cls, cfg) -> "FeatureParams":
+        model_cfg = getattr(cfg, "model", None)
         return cls(
             max_planets=int(cfg.env.max_planets),
             ship_bucket_count=int(cfg.env.ship_bucket_count),
@@ -68,6 +72,7 @@ class FeatureParams:
             target_filter_enabled=bool(cfg.env.target_filter_enabled),
             attack_top_k=int(cfg.env.attack_top_k),
             defense_top_k=int(cfg.env.defense_top_k),
+            max_fleet_tokens=int(getattr(model_cfg, "max_fleet_tokens", MAX_FLEET_TOKENS)),
         )
 
 
@@ -83,6 +88,8 @@ class EncodedBatch(NamedTuple):
     candidate_ids: jnp.ndarray
     ship_buckets: jnp.ndarray
     source_mask: jnp.ndarray
+    fleet_features: jnp.ndarray
+    fleet_mask: jnp.ndarray
 
 
 def target_count(params: FeatureParams) -> int:
@@ -103,9 +110,10 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
     source_ships = planets[:, 5]
     global_f = build_global_features(state, params)
     inbound = precompute_inbound(state, params)
+    fleet_f, fleet_m = build_fleet_features(state, params)
 
     def source_row(src_idx):
-        return build_source_decision(state, src_idx, global_f, inbound, params)
+        return build_source_decision(state, src_idx, global_f, inbound, fleet_f, fleet_m, params)
 
     rows = jax.vmap(source_row)(jnp.arange(params.max_planets))
     return EncodedBatch(
@@ -120,10 +128,20 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
         candidate_ids=rows.candidate_ids,
         ship_buckets=rows.ship_buckets,
         source_mask=source_mask,
+        fleet_features=rows.fleet_features,
+        fleet_mask=rows.fleet_mask,
     )
 
 
-def build_source_decision(state: EnvState, src_idx: jnp.ndarray, global_f: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams) -> EncodedBatch:
+def build_source_decision(
+    state: EnvState,
+    src_idx: jnp.ndarray,
+    global_f: jnp.ndarray,
+    inbound: jnp.ndarray,
+    fleet_f: jnp.ndarray,
+    fleet_m: jnp.ndarray,
+    params: FeatureParams,
+) -> EncodedBatch:
     src = state.planets[src_idx]
     self_f = build_self_features(state, src_idx, inbound, params)
     cand_f, cand_mask, amount_mask, candidate_ids, ship_buckets = build_candidate_features(state, src_idx, inbound, params)
@@ -140,6 +158,8 @@ def build_source_decision(state: EnvState, src_idx: jnp.ndarray, global_f: jnp.n
         candidate_ids=candidate_ids,
         ship_buckets=ship_buckets,
         source_mask=(src[1].astype(jnp.int32) == 0) & state.planet_alive[src_idx],
+        fleet_features=fleet_f,
+        fleet_mask=fleet_m,
     )
 
 
@@ -479,6 +499,60 @@ def compute_defense_pressure(planets: jnp.ndarray, inbound: jnp.ndarray) -> jnp.
     return jnp.where(enemy_inbound > 0.0, enemy_inbound - projected_defense, 0.0)
 
 
+def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """构建 per-state top-K 舰队 token，用于 Transformer 编码。"""
+    fleets = state.fleets
+    alive = state.fleet_alive
+    dist_center = jnp.sqrt((fleets[:, 2] - CENTER) ** 2 + (fleets[:, 3] - CENTER) ** 2)
+    score = jnp.where(alive, -fleets[:, 6] + 0.01 * dist_center, jnp.inf)
+    order = jnp.argsort(score)[: params.max_fleet_tokens]
+    sel = fleets[order]
+    sel_alive = alive[order]
+    owner = sel[:, 1].astype(jnp.int32)
+    from_id = sel[:, 5].astype(jnp.int32)
+    planet_match = (state.planets[:, None, 0].astype(jnp.int32) == from_id[None, :]) & state.planet_alive[:, None]
+    from_slot = jnp.argmax(planet_match, axis=0)
+    has_from = planet_match.any(axis=0)
+    from_planets = state.planets[from_slot]
+    speed = fleet_speed(jnp.maximum(sel[:, 6], 1.0))
+
+    planet_owner = state.planets[:, 1].astype(jnp.int32)
+    planet_alive = state.planet_alive
+    dx_planet = state.planets[:, None, 2] - sel[None, :, 2]
+    dy_planet = state.planets[:, None, 3] - sel[None, :, 3]
+    dist_planet = jnp.sqrt(dx_planet * dx_planet + dy_planet * dy_planet)
+
+    def nearest_dist(mask):
+        d = jnp.where(mask[:, None], dist_planet, jnp.inf).min(axis=0)
+        return jnp.where(jnp.isfinite(d), d / BOARD_SIZE, 1.0)
+
+    dist_from_origin = jnp.sqrt((sel[:, 2] - from_planets[:, 2]) ** 2 + (sel[:, 3] - from_planets[:, 3]) ** 2)
+    launch_offset = from_planets[:, 4] + 0.1
+    launch_age = jnp.maximum(dist_from_origin - launch_offset, 0.0) / jnp.maximum(speed, 1e-6)
+    features = jnp.stack(
+        [
+            (owner == 0).astype(jnp.float32),
+            sel[:, 2] / BOARD_SIZE,
+            sel[:, 3] / BOARD_SIZE,
+            jnp.cos(sel[:, 4]),
+            jnp.sin(sel[:, 4]),
+            clip01(sel[:, 6] / params.max_ships),
+            speed / 6.0,
+            clip01(launch_age / params.episode_steps),
+            jnp.where(has_from, from_planets[:, 2] / BOARD_SIZE, 0.0),
+            jnp.where(has_from, from_planets[:, 3] / BOARD_SIZE, 0.0),
+            (has_from & (from_planets[:, 1].astype(jnp.int32) == 0)).astype(jnp.float32),
+            jnp.where(has_from, clip01(from_planets[:, 5] / params.max_ships), 0.0),
+            jnp.where(has_from, dist_from_origin / BOARD_SIZE, 0.0),
+            nearest_dist(planet_alive & (planet_owner == 1)),
+            nearest_dist(planet_alive & (planet_owner == -1)),
+            nearest_dist(planet_alive & (planet_owner == 0)),
+        ],
+        axis=-1,
+    )
+    return jnp.where(sel_alive[:, None], features, 0.0), sel_alive
+
+
 def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
     grid = jnp.zeros((MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=jnp.float32)
     planets = state.planets
@@ -549,6 +623,8 @@ def flatten_sources(encoded: EncodedBatch) -> EncodedBatch:
         candidate_ids=flat(encoded.candidate_ids),
         ship_buckets=flat(encoded.ship_buckets),
         source_mask=flat(encoded.source_mask),
+        fleet_features=flat(encoded.fleet_features),
+        fleet_mask=flat(encoded.fleet_mask),
     )
 
 

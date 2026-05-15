@@ -59,6 +59,10 @@ class RewardConfig:
 class ModelConfig:
     hidden_size: int = 128
     use_cnn: bool = False
+    use_transformer: bool = False
+    num_transformer_layers: int = 2
+    num_heads: int = 4
+    max_fleet_tokens: int = 32
 
 
 @dataclass(slots=True)

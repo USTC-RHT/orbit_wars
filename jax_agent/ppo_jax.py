@@ -56,6 +56,8 @@ class Rollout(NamedTuple):
     candidate_features: jnp.ndarray # [T, B, P, P+1, CAND_DIM]
     global_features: jnp.ndarray    # [T, B, P, GLOBAL_DIM]
     map_features: jnp.ndarray       # [T, B, P, C, H, W]
+    fleet_features: jnp.ndarray     # [T, B, P, K, FLEET_DIM]
+    fleet_mask: jnp.ndarray         # [T, B, P, K]
     candidate_mask: jnp.ndarray     # [T, B, P, P+1]
     amount_mask: jnp.ndarray        # [T, B, P, P+1, B]
     source_mask: jnp.ndarray        # [T, B, P] 我方星球标记
@@ -77,7 +79,9 @@ def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float, 
         sample_batch.global_features,
         sample_batch.candidate_mask,
         sample_batch.map_features,
-        jnp.zeros((sample_batch.self_features.shape[0],), dtype=jnp.int32),
+        jnp.zeros(sample_batch.self_features.shape[:-1], dtype=jnp.int32),
+        fleet_features=sample_batch.fleet_features,
+        fleet_mask=sample_batch.fleet_mask,
     )
     if total_steps > 0:
         lr_schedule = optax.linear_schedule(init_value=lr, end_value=0.0, transition_steps=total_steps)
@@ -109,12 +113,12 @@ def categorical_entropy(logits):
 def safe_logits(logits):
     _assert_all_finite("ppo/logits", logits)
     invalid = ~jnp.isfinite(logits).any(axis=-1)
-    fixed = jnp.where(invalid[:, None], NEG_INF, logits)
-    return fixed.at[:, 0].set(jnp.where(invalid, 0.0, fixed[:, 0]))
+    fixed = jnp.where(invalid[..., None], NEG_INF, logits)
+    return fixed.at[..., 0].set(jnp.where(invalid, 0.0, fixed[..., 0]))
 
 
 def fire_target_mask(candidate_mask):
-    return candidate_mask.at[:, 0].set(False)
+    return candidate_mask.at[..., 0].set(False)
 
 
 def _fire_entropy(logits):
@@ -150,7 +154,9 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
     """PPO 多 epoch 更新，带 JIT 内 KL 早停。"""
     flat = flatten_rollout(rollout, returns, advantages)
     size = flat["source_mask"].shape[0]
-    num_minibatches = max(size // params.minibatch_size, 1)
+    source_count = flat["source_mask"].shape[1]
+    states_per_minibatch = min(max(params.minibatch_size // source_count, 1), size)
+    num_minibatches = max(size // states_per_minibatch, 1)
     keys = ["loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]
 
     def run_epoch(ts, rng_in):
@@ -159,7 +165,7 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
 
         def mb_body(i, mb_carry):
             ts2, acc = mb_carry
-            idx = jax.lax.dynamic_slice(order, (i * params.minibatch_size,), (params.minibatch_size,))
+            idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
             batch = {k: v[idx] for k, v in flat.items()}
             ts2, metrics = update_minibatch(ts2, batch, params)
             return ts2, {k: acc[k] + metrics[k] for k in acc}
@@ -209,6 +215,8 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
             batch["candidate_mask"],
             batch["map_features"],
             zero_target,
+            fleet_features=batch["fleet_features"],
+            fleet_mask=batch["fleet_mask"],
         )
         action_outputs = train_state.apply_fn(
             {"params": model_params},
@@ -218,6 +226,8 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
             batch["candidate_mask"],
             batch["map_features"],
             batch["target"],
+            fleet_features=batch["fleet_features"],
+            fleet_mask=batch["fleet_mask"],
         )
         logp, entropy = log_prob_entropy(action_outputs, batch["fire"], batch["target"], batch["amount"], batch["candidate_mask"], batch["amount_mask"])
         logp = _assert_all_finite("ppo/logp", logp)
@@ -279,13 +289,13 @@ def log_prob_entropy(outputs, fire, target, amount, candidate_mask, amount_mask)
     fire_logp = bernoulli_log_prob(outputs.fire_logits, fire)
     # 重建采样时的 target logits（与 policy_sample 完全同步）
     target_logits = jnp.where(fire_target_mask(candidate_mask), outputs.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[:, None], target_logits, NEG_INF)
-    target_logits = target_logits.at[:, 0].set(jnp.where(fire, target_logits[:, 0], 0.0))
+    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF)
+    target_logits = target_logits.at[..., 0].set(jnp.where(fire, target_logits[..., 0], 0.0))
     target_logits = safe_logits(target_logits)
     target_logp = categorical_log_prob(target_logits, target)
-    selected_amount_mask = jnp.take_along_axis(amount_mask, target[:, None, None], axis=1).squeeze(1)
+    selected_amount_mask = jnp.take_along_axis(amount_mask, target[..., None, None], axis=-2).squeeze(-2)
     amount_logits = jnp.where(selected_amount_mask, outputs.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[:, None], 0.0, amount_logits)
+    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
     amount_logp = categorical_log_prob(amount_logits, amount)
     # fire=False 时 target/amount 的 logp 不计入总 logp
     logp = fire_logp + fire.astype(jnp.float32) * (target_logp + amount_logp)
@@ -295,13 +305,15 @@ def log_prob_entropy(outputs, fire, target, amount, candidate_mask, amount_mask)
 
 def flatten_rollout(rollout: Rollout, returns, advantages):
     def flat(x):
-        return x.reshape((-1,) + x.shape[3:]) if x.ndim >= 3 else x.reshape((-1,))
+        return x.reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
 
     data = {
         "self_features": flat(rollout.self_features),
         "candidate_features": flat(rollout.candidate_features),
         "global_features": flat(rollout.global_features),
         "map_features": flat(rollout.map_features),
+        "fleet_features": flat(rollout.fleet_features),
+        "fleet_mask": flat(rollout.fleet_mask),
         "candidate_mask": flat(rollout.candidate_mask),
         "amount_mask": flat(rollout.amount_mask),
         "source_mask": flat(rollout.source_mask),

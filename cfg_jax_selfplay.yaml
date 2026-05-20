@@ -1,15 +1,14 @@
 # 设计原则：
 #   - 关闭所有 dense shaping，只用终局胜负奖励（胜 +1，负/平 -1）。
-#   - opponent: "pool" — 每 rollout 随机从对手池抽取对手类型。
-#   - lagged 对手为 pool_lag_interval 步前的自己，防止策略过快收敛。
-#   - 连续 promote_consecutive_evals 次 nearest win_rate >= promote_nearest_win_rate
-#     自动升阶至 Phase 2。
+#   - opponent: "pool" + pool_mode: lag_checkpoint — 二阶段课程训练：
+#       Phase 1：只对 pool_lag_interval 步前 checkpoint 打，nearest 仅用于 eval benchmark。
+#       Phase 2：对 selfplay-current / selfplay-lag 轮流训练。
 #
 # 启动示例（从 rl-agent/ 目录）：
 #   python -m jax_agent.train_jax --config cfg_jax_selfplay.yaml
 
 seed: 42
-run_name: "jax_PFSP_0515"
+run_name: "jax_transformer_lag_checkpoint_0519"
 save_dir: outputs
 checkpoint_every: 100
 opponent: "pool"
@@ -46,8 +45,8 @@ model:
   hidden_size: 128
   use_cnn: True
   use_transformer: True
-  num_transformer_layers: 1
-  num_heads: 2
+  num_transformer_layers: 2
+  num_heads: 4
   max_fleet_tokens: 16
 
 state_norm:
@@ -59,27 +58,39 @@ ppo:
   num_envs: 64
   rollout_steps: 128
   total_updates: 5000
-  epochs: 4
+  epochs: 4            # 1→4：让 KL 早停真正起作用（epochs=1 时早停永远不触发）
   minibatch_size: 4096
   gamma: 0.99
   gae_lambda: 0.95
-  clip_coef: 0.15
+  clip_coef: 0.15      # 0.05→0.15：Transformer 漂移大，0.05 会全饱和导致梯度为零
   vf_coef: 0.5
-  ent_coef: 0.01
-  lr: 1.0e-4
+  ent_coef: 0.05       # 0.03→0.05：防止熵过早塌缩（Transformer 收敛更快）
+  ent_coef_fire: 0.02
+  ent_coef_target: 0.04
+  ent_coef_amount: 0.01
+  ent_schedule: linear_decay
+  ent_min_ratio: 0.25
+  lr: 3e-4
+  lr_schedule: warmup_cosine
+  warmup_updates: 100
+  min_lr_ratio: 0.05
   max_grad_norm: 0.5
   norm_adv: true
-  target_kl: 0.05
-  anneal_lr: true
+  target_kl: 0.03      # 0.005→0.03：配合 epochs=4 的合理 KL 阈值
 
-# 每隔多少 update 把 learner 权重同步给冻结对手（selfplay 对手）
+# 每隔多少 update 把 learner 权重同步给冻结对手（selfplay-current）
 self_play_update_interval: 50
-# 对手池配置
-pool_mode: pfsp                  # pfsp=胜率加权采样；fixed=旧版固定比例 nearest/current/lag
-pool_lag_interval: 50           # 每隔多少 update 更新 lagged 对手权重（对抗 50 步前的自己）
-pool_max_size: 4                # PFSP 对手池最多保留几个对手；超出后删除胜率最高的非 current 对手
-promote_nearest_win_rate: 1.0   # nearest win_rate 达到此阈值触发升阶（全胜才升）
-promote_consecutive_evals: 2    # 连续多少次评估超过阈值才升阶至 Phase 2
+# 对手池配置（二阶段 lag_checkpoint 模式）
+pool_mode: lag_checkpoint        # 新接口：lag 对手严格按 pool_lag_interval 延迟发布
+pool_start_phase: 1              # 1=从 Phase1(只打 lag checkpoint) 开始；2=跳过直接进 Phase2(selfplay)
+pool_lag_interval: 50            # 每隔多少 update 更新 lagged 对手权重（对抗 50 步前的自己）
+pool_lag_checkpoint_phase1_opponents:
+  - selfplay-lag
+pool_lag_checkpoint_phase2_opponents:
+  - selfplay-current
+  - selfplay-lag
+promote_nearest_win_rate: 1.0    # nearest win_rate 达到此阈值触发升阶（全胜才升）
+promote_consecutive_evals: 2     # 连续多少次评估超过阈值才升阶至 Phase 2
 
 eval:
   enabled: true

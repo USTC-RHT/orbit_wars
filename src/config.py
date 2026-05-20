@@ -53,6 +53,8 @@ class RewardConfig:
     lose_planet_penalty: float = 0.0
     wasted_attack_penalty: float = 0.0
     step_clip: float = 0.20
+    failed_capture_penalty: float = 0.0   # 发射后 N 步内目标未变我方的惩罚（0=关闭）
+    failed_capture_window: int = 50       # 检测窗口步数
 
 
 @dataclass(slots=True)
@@ -82,6 +84,7 @@ class EvalConfig:
     every: int = 100
     games: int = 20
     seed: int = 100000
+    opponents: list[str] = field(default_factory=lambda: ["nearest", "sigma", "tamrazov"])
 
 
 @dataclass(slots=True)
@@ -100,8 +103,16 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
     ent_coef: float = 0.01
+    ent_coef_fire: float = -1.0
+    ent_coef_target: float = -1.0
+    ent_coef_amount: float = -1.0
+    ent_schedule: str = "constant"
+    ent_min_ratio: float = 1.0
     vf_coef: float = 0.5
     lr: float = 3e-4
+    lr_schedule: str = "auto"
+    warmup_updates: int = 0
+    min_lr_ratio: float = 0.0
     max_grad_norm: float = 0.5
     anneal_lr: bool = True
     norm_adv: bool = True
@@ -138,12 +149,23 @@ class TrainConfig:
     opponent: str = "nearest"
     opponent_pool: list[str] = field(default_factory=lambda: ["nearest"])
     opponent_pool_weights: list[float] = field(default_factory=lambda: [1.0])
+    init_from_checkpoint: str | None = None
+    start_update_from_checkpoint: bool = True
+    opponent_checkpoint: str | None = None
+    eval_checkpoint: str | None = None
     self_play_update_interval: int = 25
     pool_mode: str = "pfsp"
+    pool_start_phase: int = 1
+    pool_include_nearest: bool = True
+    pool_lag_checkpoint_phase1_opponents: list[str] = field(default_factory=lambda: ["selfplay-lag"])
+    pool_lag_checkpoint_phase2_opponents: list[str] = field(default_factory=lambda: ["selfplay-current", "selfplay-lag"])
     pool_lag_interval: int = 50
     pool_max_size: int = 4
     promote_nearest_win_rate: float = 0.8
     promote_consecutive_evals: int = 3
+    # snapshot pool: 每 snapshot_interval 存一个快照，按 snapshot_current_ratio 概率选当前策略
+    snapshot_interval: int = 200
+    snapshot_current_ratio: float = 0.2
     # self-play 对手本质上是在"推理"旧策略，默认用 argmax 保持行为稳定。
     self_play_deterministic: bool = True
     alternate_player_sides: bool = True

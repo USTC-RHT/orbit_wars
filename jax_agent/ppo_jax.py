@@ -42,6 +42,9 @@ class PPOParams:
     gae_lambda: float = 0.95   # GAE 将来奖励平滞系数
     clip_coef: float = 0.2     # PPO 策略梯度剥裁系数 ε
     ent_coef: float = 0.01     # 熵奖励系数（鼓励探索）
+    ent_coef_fire: float = 0.01
+    ent_coef_target: float = 0.01
+    ent_coef_amount: float = 0.01
     vf_coef: float = 0.5       # 价值函数损失系数
     max_grad_norm: float = 0.5 # 梯度裁剔阈値
     epochs: int = 4            # 每次 rollout 训练轮数
@@ -71,7 +74,51 @@ class Rollout(NamedTuple):
     done: jnp.ndarray               # [T, B, P] 是否终局
 
 
-def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float, total_steps: int = 0) -> TrainState:
+def make_lr_schedule(
+    lr: float,
+    total_steps: int = 0,
+    schedule_name: str = "constant",
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.0,
+):
+    """Build an Optax learning-rate schedule.
+
+    schedule_name:
+    - constant: 固定 lr
+    - linear: 线性衰减到 lr * min_lr_ratio
+    - warmup_cosine: 先 warmup 到 lr，再 cosine 衰减到 lr * min_lr_ratio
+    """
+    name = (schedule_name or "constant").lower()
+    end_lr = lr * max(float(min_lr_ratio), 0.0)
+    if name == "constant" or total_steps <= 0:
+        return lr
+    if name == "linear":
+        return optax.linear_schedule(init_value=lr, end_value=end_lr, transition_steps=max(total_steps, 1))
+    if name in {"warmup_cosine", "cosine_warmup"}:
+        warmup_steps = max(int(warmup_steps), 0)
+        if warmup_steps <= 0:
+            return optax.cosine_decay_schedule(init_value=lr, decay_steps=max(total_steps, 1), alpha=max(float(min_lr_ratio), 0.0))
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=lr,
+            warmup_steps=warmup_steps,
+            decay_steps=max(total_steps, warmup_steps + 1),
+            end_value=end_lr,
+        )
+    raise ValueError(f"Unknown lr_schedule: {schedule_name}")
+
+
+def make_train_state(
+    rng,
+    model,
+    sample_batch,
+    lr: float,
+    max_grad_norm: float,
+    total_steps: int = 0,
+    lr_schedule: str = "constant",
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.0,
+) -> TrainState:
     variables = model.init(
         rng,
         sample_batch.self_features,
@@ -83,10 +130,7 @@ def make_train_state(rng, model, sample_batch, lr: float, max_grad_norm: float, 
         fleet_features=sample_batch.fleet_features,
         fleet_mask=sample_batch.fleet_mask,
     )
-    if total_steps > 0:
-        lr_schedule = optax.linear_schedule(init_value=lr, end_value=0.0, transition_steps=total_steps)
-    else:
-        lr_schedule = lr
+    lr_schedule = make_lr_schedule(lr, total_steps, lr_schedule, warmup_steps, min_lr_ratio)
     tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.adam(lr_schedule))
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
@@ -150,14 +194,25 @@ def compute_gae(rewards, dones, values, last_values, params: PPOParams):
 
 
 @partial(jax.jit, static_argnames=("params",))
-def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, params: PPOParams, rng):
+def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, params: PPOParams, rng, ent_scale=1.0):
     """PPO 多 epoch 更新，带 JIT 内 KL 早停。"""
     flat = flatten_rollout(rollout, returns, advantages)
     size = flat["source_mask"].shape[0]
     source_count = flat["source_mask"].shape[1]
     states_per_minibatch = min(max(params.minibatch_size // source_count, 1), size)
     num_minibatches = max(size // states_per_minibatch, 1)
-    keys = ["loss", "policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac"]
+    keys = [
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "entropy_fire",
+        "entropy_target",
+        "entropy_amount",
+        "approx_kl",
+        "clipfrac",
+        "max_abs_log_ratio",
+    ]
 
     def run_epoch(ts, rng_in):
         rng_in, rng_perm = jax.random.split(rng_in)
@@ -167,7 +222,7 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
             ts2, acc = mb_carry
             idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
             batch = {k: v[idx] for k, v in flat.items()}
-            ts2, metrics = update_minibatch(ts2, batch, params)
+            ts2, metrics = update_minibatch(ts2, batch, params, ent_scale)
             return ts2, {k: acc[k] + metrics[k] for k in acc}
 
         init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
@@ -203,7 +258,7 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
     return train_state, metrics
 
 
-def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams):
+def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams, ent_scale=1.0):
     """单个 minibatch 梯度更新。"""
     def loss_fn(model_params):
         zero_target = jnp.zeros_like(batch["target"])
@@ -229,7 +284,14 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
             fleet_features=batch["fleet_features"],
             fleet_mask=batch["fleet_mask"],
         )
-        logp, entropy = log_prob_entropy(action_outputs, batch["fire"], batch["target"], batch["amount"], batch["candidate_mask"], batch["amount_mask"])
+        logp, entropy, entropy_fire, entropy_target, entropy_amount = log_prob_entropy(
+            action_outputs,
+            batch["fire"],
+            batch["target"],
+            batch["amount"],
+            batch["candidate_mask"],
+            batch["amount_mask"],
+        )
         logp = _assert_all_finite("ppo/logp", logp)
         entropy = _assert_all_finite("ppo/entropy", entropy)
         adv = batch["advantages"]
@@ -243,11 +305,10 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
             adv_mean = (adv * policy_mask).sum() / denom_adv
             adv_var = (jnp.square(adv - adv_mean) * policy_mask).sum() / denom_adv
             adv = (adv - adv_mean) / (jnp.sqrt(adv_var) + 1e-8)
-        log_ratio = jnp.where(policy_mask_bool, logp - batch["old_logp"], 0.0)
-        # [数值安全] 截断 log_ratio 防止 exp() 在 float32 下溢出（exp(88) > 1e38）。
-        # 训练中后期 policy 变锐利时，rare-action 样本会出现 log_ratio > 88 → ratio=inf → loss=nan。
-        # 这是 0513 训练崩溃的直接原因（参考 _assert_all_finite("ppo/loss") 抛出 FloatingPointError）。
-        log_ratio = jnp.clip(log_ratio, -20.0, 20.0)
+        raw_log_ratio = jnp.where(policy_mask_bool, logp - batch["old_logp"], 0.0)
+        # [数值安全] 先截断 log_ratio 再 exp，避免 rare-action 样本把 ratio/KL 单点打爆。
+        # 上界 log(10) 等价于 ratio <= 10，下界 -5 等价于 ratio >= 0.0067。
+        log_ratio = jnp.clip(raw_log_ratio, -5.0, jnp.log(jnp.array(10.0, dtype=jnp.float32)))
         ratio = jnp.exp(log_ratio)  # 新旧策略概率比
         pg1 = adv * ratio
         pg2 = adv * jnp.clip(ratio, 1.0 - params.clip_coef, 1.0 + params.clip_coef)  # 弹性 clip
@@ -261,17 +322,31 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
         value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
         value_loss = (jnp.square(batch["returns"] - value_pred) * value_mask).sum() / value_denom
         entropy_mean = (entropy * policy_mask).sum() / policy_denom
-        loss = policy_loss + params.vf_coef * value_loss - params.ent_coef * entropy_mean
+        fired_policy_mask = policy_mask * batch["fire"].astype(jnp.float32)
+        entropy_fire_mean = (entropy_fire * policy_mask).sum() / policy_denom
+        entropy_target_mean = (entropy_target * fired_policy_mask).sum() / policy_denom
+        entropy_amount_mean = (entropy_amount * fired_policy_mask).sum() / policy_denom
+        entropy_bonus = ent_scale * (
+            params.ent_coef_fire * entropy_fire_mean
+            + params.ent_coef_target * entropy_target_mean
+            + params.ent_coef_amount * entropy_amount_mean
+        )
+        loss = policy_loss + params.vf_coef * value_loss - entropy_bonus
         loss = _assert_all_finite("ppo/loss", loss)
         approx_kl = (((ratio - 1.0) - log_ratio) * policy_mask).sum() / policy_denom
         clipfrac = (((jnp.abs(ratio - 1.0) > params.clip_coef).astype(jnp.float32)) * policy_mask).sum() / policy_denom
+        max_abs_log_ratio = (jnp.abs(raw_log_ratio) * policy_mask).max()
         return loss, {
             "loss": loss,
             "policy_loss": policy_loss,
             "value_loss": value_loss,
             "entropy": entropy_mean,
+            "entropy_fire": entropy_fire_mean,
+            "entropy_target": entropy_target_mean,
+            "entropy_amount": entropy_amount_mean,
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
+            "max_abs_log_ratio": max_abs_log_ratio,
         }
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
@@ -299,8 +374,11 @@ def log_prob_entropy(outputs, fire, target, amount, candidate_mask, amount_mask)
     amount_logp = categorical_log_prob(amount_logits, amount)
     # fire=False 时 target/amount 的 logp 不计入总 logp
     logp = fire_logp + fire.astype(jnp.float32) * (target_logp + amount_logp)
-    entropy = _fire_entropy(outputs.fire_logits) + fire.astype(jnp.float32) * (categorical_entropy(target_logits) + categorical_entropy(amount_logits))
-    return logp, entropy
+    entropy_fire = _fire_entropy(outputs.fire_logits)
+    entropy_target = categorical_entropy(target_logits)
+    entropy_amount = categorical_entropy(amount_logits)
+    entropy = entropy_fire + fire.astype(jnp.float32) * (entropy_target + entropy_amount)
+    return logp, entropy, entropy_fire, entropy_target, entropy_amount
 
 
 def flatten_rollout(rollout: Rollout, returns, advantages):

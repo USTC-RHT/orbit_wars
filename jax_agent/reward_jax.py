@@ -35,6 +35,8 @@ class RewardParams:
     lose_planet_penalty: float = 0.0          # 失去星球惩罚系数
     wasted_attack_penalty: float = 0.0        # 攻击己方惩罚系数
     step_clip: float = 0.0                    # 单步塑形奖励幅度剪裁
+    failed_capture_penalty: float = 0.0       # 发射后 N 步内目标未变我方的惩罚
+    failed_capture_window: int = 50           # 检测窗口（步数）
 
     @classmethod
     def from_train_config(cls, cfg) -> "RewardParams":
@@ -53,6 +55,8 @@ class RewardParams:
             lose_planet_penalty=float(getattr(reward, "lose_planet_penalty", 0.0)),
             wasted_attack_penalty=float(getattr(reward, "wasted_attack_penalty", 0.0)),
             step_clip=float(getattr(reward, "step_clip", 0.0)),
+            failed_capture_penalty=float(getattr(reward, "failed_capture_penalty", 0.0)),
+            failed_capture_window=int(getattr(reward, "failed_capture_window", 50)),
         )
 
 

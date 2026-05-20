@@ -10,10 +10,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+
+
+HIDDEN_INIT = nn.initializers.orthogonal(math.sqrt(2.0))
+ACTOR_LOGIT_INIT = nn.initializers.orthogonal(0.01)
+VALUE_OUT_INIT = nn.initializers.orthogonal(1.0)
+BIAS_ZERO = nn.initializers.zeros
+
+
+def hidden_dense(features: int) -> nn.Dense:
+    return nn.Dense(features, kernel_init=HIDDEN_INIT, bias_init=BIAS_ZERO)
+
+
+def actor_logit_dense(features: int) -> nn.Dense:
+    return nn.Dense(features, kernel_init=ACTOR_LOGIT_INIT, bias_init=BIAS_ZERO)
+
+
+def value_out_dense(features: int) -> nn.Dense:
+    return nn.Dense(features, kernel_init=VALUE_OUT_INIT, bias_init=BIAS_ZERO)
 
 
 @dataclass(frozen=True)
@@ -31,10 +50,10 @@ class MLP(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.hidden_size)(x)
+        x = hidden_dense(self.hidden_size)(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        x = nn.Dense(self.hidden_size)(x)
+        x = hidden_dense(self.hidden_size)(x)
         return nn.relu(x)
 
 
@@ -57,9 +76,9 @@ class TransformerEncoderLayer(nn.Module):
         )(h, h, mask=attn_mask)
         x = x + h
         h = nn.LayerNorm()(x)
-        h = nn.Dense(self.hidden_size * self.mlp_ratio)(h)
+        h = hidden_dense(self.hidden_size * self.mlp_ratio)(h)
         h = nn.gelu(h)
-        h = nn.Dense(self.hidden_size)(h)
+        h = hidden_dense(self.hidden_size)(h)
         return x + h
 
 
@@ -79,6 +98,7 @@ class ActorCritic(nn.Module):
     max_fleet_tokens: int = 32
     num_transformer_layers: int = 2
     num_heads: int = 4
+    value_use_context: bool = True  # True=用 context_h（per-source，推荐）；False=用 cls_per_source（旧行为，兼容旧 ckpt）
 
     @nn.compact
     def __call__(
@@ -131,22 +151,35 @@ class ActorCritic(nn.Module):
         # 全图池化：对存活星球做 max/mean 混合池，得到全局感知
         # safe_mask 保证当没有星球时至少保留 slot 0 参与池化
         planet_mask = candidate_features[..., 1] > 0.5
-        safe_mask = jnp.where(planet_mask.any(axis=-1, keepdims=True), planet_mask, jnp.arange(self.candidate_count)[None, :] == 0)
+        safe_mask = jnp.where(
+            planet_mask.any(axis=-1, keepdims=True),
+            planet_mask,
+            jnp.arange(self.candidate_count) == 0,
+        )
         masked = jnp.where(safe_mask[..., None], cand_h, jnp.finfo(jnp.float32).min)
-        max_pool = masked.max(axis=1)
-        mean_pool = (cand_h * safe_mask[..., None]).sum(axis=1) / jnp.maximum(safe_mask.sum(axis=1, keepdims=True), 1)
+        max_pool = masked.max(axis=-2)
+        mean_pool = (cand_h * safe_mask[..., None]).sum(axis=-2) / jnp.maximum(
+            safe_mask.sum(axis=-1, keepdims=True),
+            1,
+        )
         map_h = 0.5 * (max_pool + mean_pool)  # 全图池化结果
         context_parts = [self_h, global_h, map_h]
         if self.use_cnn:
             if map_features is None:
-                map_features = jnp.zeros((self_h.shape[0], self.map_channels, self.map_grid_size, self.map_grid_size), dtype=self_h.dtype)
+                map_features = jnp.zeros(
+                    self_h.shape[:-1] + (self.map_channels, self.map_grid_size, self.map_grid_size),
+                    dtype=self_h.dtype,
+                )
             # Flax Conv expects NHWC.
-            x = jnp.transpose(map_features, (0, 2, 3, 1))
+            leading_shape = map_features.shape[:-3]
+            x = map_features.reshape((-1,) + map_features.shape[-3:])
+            x = jnp.transpose(x, (0, 2, 3, 1))
             x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
             x = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(x))
             x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
             x = x.mean(axis=(1, 2))
-            x = nn.relu(nn.Dense(16)(x))
+            x = nn.relu(hidden_dense(16)(x))
+            x = x.reshape(leading_shape + (x.shape[-1],))
             context_parts.append(x)
         context_h = jnp.concatenate(context_parts, axis=-1)  # [B, hidden*3 (+ cnn_out)]
 
@@ -155,36 +188,35 @@ class ActorCritic(nn.Module):
         # 注意：用 sqrt(max(sum(x²), eps²)) 而非 max(norm(x), eps)。
         # 后者在 x=0 时反向传播会产生 0/0=NaN（norm 梯度 = x/norm(x)，
         # 即使 max 截断使前向为 eps，反向仍通过 d(norm)/dx=x/0 产生 NaN 梯度）。
-        q = nn.Dense(self.hidden_size)(context_h)
+        q = hidden_dense(self.hidden_size)(context_h)
         q = nn.relu(q)
-        q = nn.Dense(self.hidden_size)(q)
+        q = actor_logit_dense(self.hidden_size)(q)
         q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
         # key = 候选星球编码 + L2 归一化；slot 0 用可学习 no-op key 覆盖
-        keys = nn.Dense(self.hidden_size)(cand_h)
+        keys = actor_logit_dense(self.hidden_size)(cand_h)
         noop_key = self.param("noop_key", nn.initializers.zeros, (self.hidden_size,))
-        keys = keys.at[:, 0, :].set(noop_key)
+        keys = keys.at[..., 0, :].set(noop_key)
         keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
         # logit = q · key / sqrt(d)，非法目标置 -inf
-        target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
+        target_logits = jnp.einsum("...h,...ch->...c", q, keys) / jnp.sqrt(float(self.hidden_size))
         target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
 
         # fire 头：二分类逻辑回归
-        fire_logits = nn.Dense(self.hidden_size)(context_h)
+        fire_logits = hidden_dense(self.hidden_size)(context_h)
         fire_logits = nn.relu(fire_logits)
-        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+        fire_logits = actor_logit_dense(1)(fire_logits).squeeze(-1)
 
         # amount 头：拼接已选目标和 context，输出派兵档位 logits
         if selected_targets is None:
-            selected_targets = jnp.zeros((self_h.shape[0],), dtype=jnp.int32)
-        row = jnp.arange(selected_targets.shape[0])
-        selected_h = cand_h[row, selected_targets]
+            selected_targets = jnp.zeros(self_h.shape[:-1], dtype=jnp.int32)
+        selected_h = jnp.take_along_axis(cand_h, selected_targets[..., None, None], axis=-2).squeeze(-2)
         amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
-        amount_h = nn.relu(nn.Dense(self.hidden_size)(amount_h))
-        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+        amount_h = nn.relu(hidden_dense(self.hidden_size)(amount_h))
+        amount_logits = actor_logit_dense(self.ship_bucket_count)(amount_h)
 
         # critic 头：当前状态价值
-        value_h = nn.relu(nn.Dense(self.hidden_size)(context_h))
-        value = nn.Dense(1)(value_h).squeeze(-1)
+        value_h = nn.relu(hidden_dense(self.hidden_size)(context_h))
+        value = value_out_dense(1)(value_h).squeeze(-1)
         return PolicyOutput(fire_logits, target_logits, amount_logits, value)
 
     def _forward_transformer(
@@ -237,35 +269,35 @@ class ActorCritic(nn.Module):
             m = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(m))
             m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
             m = m.mean(axis=(1, 2))
-            m = nn.relu(nn.Dense(16)(m))
+            m = nn.relu(hidden_dense(16)(m))
             context_parts.append(m)
         context_h = jnp.concatenate(context_parts, axis=-1)
 
-        q = nn.Dense(hidden)(context_h)
+        q = hidden_dense(hidden)(context_h)
         q = nn.relu(q)
-        q = nn.Dense(hidden)(q)
+        q = actor_logit_dense(hidden)(q)
         q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
-        keys = nn.Dense(hidden)(planet_out)
+        keys = actor_logit_dense(hidden)(planet_out)
         noop_key = self.param("noop_key", nn.initializers.zeros, (hidden,))
         keys = keys.at[:, 0, :].set(noop_key)
         keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
         target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(hidden))
         target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
 
-        fire_logits = nn.Dense(hidden)(context_h)
+        fire_logits = hidden_dense(hidden)(context_h)
         fire_logits = nn.relu(fire_logits)
-        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+        fire_logits = actor_logit_dense(1)(fire_logits).squeeze(-1)
 
         if selected_targets is None:
             selected_targets = jnp.zeros((batch_size,), dtype=jnp.int32)
         row = jnp.arange(selected_targets.shape[0])
         selected_h = planet_out[row, selected_targets]
         amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
-        amount_h = nn.relu(nn.Dense(hidden)(amount_h))
-        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+        amount_h = nn.relu(hidden_dense(hidden)(amount_h))
+        amount_logits = actor_logit_dense(self.ship_bucket_count)(amount_h)
 
-        value_h = nn.relu(nn.Dense(hidden)(cls_out))
-        value = nn.Dense(1)(value_h).squeeze(-1)
+        value_h = nn.relu(hidden_dense(hidden)(cls_out))
+        value = value_out_dense(1)(value_h).squeeze(-1)
         return PolicyOutput(fire_logits, target_logits, amount_logits, value)
 
     def _forward_transformer_grouped(
@@ -323,17 +355,17 @@ class ActorCritic(nn.Module):
             m = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(m))
             m = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(m))
             m = m.mean(axis=(1, 2))
-            m = nn.relu(nn.Dense(16)(m))
+            m = nn.relu(hidden_dense(16)(m))
             m = jnp.reshape(m, (batch_size, source_count, 16))
             context_parts.append(m)
         context_h = jnp.concatenate(context_parts, axis=-1)
 
         relative_h = MLP(hidden)(self._relative_candidate_features(candidate_features))
-        q = nn.Dense(hidden)(context_h)
+        q = hidden_dense(hidden)(context_h)
         q = nn.relu(q)
-        q = nn.Dense(hidden)(q)
+        q = actor_logit_dense(hidden)(q)
         q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
-        base_keys = nn.Dense(hidden)(planet_out)
+        base_keys = actor_logit_dense(hidden)(planet_out)
         keys = base_keys[:, None, :, :] + relative_h
         noop_key = self.param("noop_key", nn.initializers.zeros, (hidden,))
         keys = keys.at[:, :, 0, :].set(noop_key)
@@ -341,20 +373,24 @@ class ActorCritic(nn.Module):
         target_logits = jnp.einsum("bph,bpch->bpc", q, keys) / jnp.sqrt(float(hidden))
         target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
 
-        fire_logits = nn.Dense(hidden)(context_h)
+        fire_logits = hidden_dense(hidden)(context_h)
         fire_logits = nn.relu(fire_logits)
-        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+        fire_logits = actor_logit_dense(1)(fire_logits).squeeze(-1)
 
         if selected_targets is None:
             selected_targets = jnp.zeros((batch_size, source_count), dtype=jnp.int32)
         amount_keys = base_keys[:, None, :, :] + relative_h
         selected_h = jnp.take_along_axis(amount_keys, selected_targets[..., None, None], axis=2).squeeze(2)
         amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
-        amount_h = nn.relu(nn.Dense(hidden)(amount_h))
-        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+        amount_h = nn.relu(hidden_dense(hidden)(amount_h))
+        amount_logits = actor_logit_dense(self.ship_bucket_count)(amount_h)
 
-        value_h = nn.relu(nn.Dense(hidden)(cls_per_source))
-        value = nn.Dense(1)(value_h).squeeze(-1)
+        # value_use_context=True（推荐）：用 context_h，per-source 独立，与 legacy 路径一致。
+        # value_use_context=False（旧行为）：用 cls_per_source，同 batch 内所有 source 共享相同 value，
+        #   param shape 更小，可兼容旧 checkpoint。
+        value_input = context_h if self.value_use_context else cls_per_source
+        value_h = nn.relu(hidden_dense(hidden)(value_input))
+        value = value_out_dense(1)(value_h).squeeze(-1)
         return PolicyOutput(fire_logits, target_logits, amount_logits, value)
 
     def _shared_planet_features(self, candidate_features):

@@ -1,15 +1,14 @@
-# JAX 纯自博弈训练配置（对应原 jax_selfplay_0513 run，使用修复后的代码）
-# 修复：draw 奖励 0 → -1，ent_coef 0.02 → 0.05
-# 对手：始终为当前策略网络镜像（online self-play）
+# 从 jax_pool_0514/ckpt_000400.pkl 继续 fine-tune 的 legacy 配置。
 #
-# 启动示例（从 rl-agent/ 目录）：
-#   python -m jax_agent.train_jax --config cfg_jax_selfplay_self.yaml
-
 seed: 42
-run_name: "jax_selfplay_0513b"
+run_name: "jax_pool_0514_vs_ckpt400"
 save_dir: outputs
 checkpoint_every: 100
-opponent: "self"
+opponent: "checkpoint"
+init_from_checkpoint: "agent/weights/ckpt_000400.pkl"
+start_update_from_checkpoint: true
+opponent_checkpoint: "agent/weights/ckpt_000400.pkl"
+eval_checkpoint: "agent/weights/ckpt_000400.pkl"
 
 env:
   episode_steps: 500
@@ -17,7 +16,7 @@ env:
   max_planets: 45
   max_ships: 500.0
   max_production: 5.0
-  target_filter_enabled: true
+  target_filter_enabled: True
   attack_top_k: 6
   defense_top_k: 3
 
@@ -38,7 +37,11 @@ reward:
 
 model:
   hidden_size: 128
-  use_cnn: false
+  use_cnn: False
+  use_transformer: False
+  num_transformer_layers: 2
+  num_heads: 4
+  max_fleet_tokens: 16
 
 state_norm:
   enabled: true
@@ -53,20 +56,28 @@ ppo:
   minibatch_size: 4096
   gamma: 0.99
   gae_lambda: 0.95
-  clip_coef: 0.25
+  clip_coef: 0.15
   vf_coef: 0.5
-  ent_coef: 0.05
-  lr: 3.0e-4
+  ent_coef: 0.02
+  lr: 1.0e-4
   max_grad_norm: 0.5
   norm_adv: true
-  target_kl: 0.02   # KL 早停阈值；epoch 平均 approx_kl > 1.5*target_kl 时停止剩余 epoch
+  target_kl: 0.03
+  anneal_lr: true
 
 self_play_update_interval: 50
+pool_mode: fixed
+pool_start_phase: 2
+pool_include_nearest: true
+pool_lag_interval: 50
+pool_max_size: 4
+promote_nearest_win_rate: 1.0
+promote_consecutive_evals: 2
 
 eval:
   enabled: true
-  every: 200
-  games: 10
+  every: 100
+  games: 20
   seed: 200000
 
 wandb:

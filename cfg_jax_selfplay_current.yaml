@@ -1,0 +1,87 @@
+# 设计原则：
+#   - 关闭所有 dense shaping，只用终局胜负奖励（胜 +1，负/平 -1）。
+#   - 全程只对 selfplay-current 训练；每个 update 前同步当前 learner 权重。
+#
+# 启动示例（从 rl-agent/ 目录）：
+#   python -m jax_agent.train_jax --config cfg_jax_selfplay_current.yaml
+
+seed: 42
+run_name: "jax_transformer_current_0519"
+save_dir: outputs
+checkpoint_every: 100
+opponent: "pool"
+
+env:
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: True
+  attack_top_k: 10
+  defense_top_k: 5
+
+reward:
+  terminal_weight: 1.0
+  ships_weight: 0.0
+  production_weight: 0.0
+  planet_weight: 0.0
+  time_penalty: 0.0
+  launch_penalty: 0.0
+  neutral_capture_weight: 0.0
+  neutral_capture_eta_scale: 12.0
+  neutral_capture_early_steps: 150
+  enemy_capture_weight: 0.0
+  lose_planet_penalty: 0.0
+  wasted_attack_penalty: 0.0
+  step_clip: 0.0
+
+model:
+  hidden_size: 128
+  use_cnn: True
+  use_transformer: True
+  num_transformer_layers: 2
+  num_heads: 4
+  max_fleet_tokens: 16
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+ppo:
+  num_envs: 64
+  rollout_steps: 128
+  total_updates: 5000
+  epochs: 4
+  minibatch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.15
+  vf_coef: 0.5
+  ent_coef: 0.05
+  ent_coef_fire: 0.02
+  ent_coef_target: 0.04
+  ent_coef_amount: 0.01
+  ent_schedule: linear_decay
+  ent_min_ratio: 0.25
+  lr: 3e-4
+  lr_schedule: warmup_cosine
+  warmup_updates: 100
+  min_lr_ratio: 0.05
+  max_grad_norm: 0.5
+  norm_adv: true
+  target_kl: 0.03
+
+pool_mode: current
+
+eval:
+  enabled: true
+  every: 100
+  games: 20
+  seed: 200000
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"

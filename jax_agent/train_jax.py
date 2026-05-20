@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import pickle
 import random
 import sys
 import time
@@ -27,7 +29,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import load_config  # noqa: E402
-from src.opponents import ExternalScriptOpponent, NearestOpponent  # noqa: E402
 from src.state import parse_observation  # noqa: E402
 
 try:
@@ -37,6 +38,8 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 from .build_initial_state_bank import build_bank  # noqa: E402
+from .checkpoint_opponents import load_checkpoint_opponent  # noqa: E402
+from .eval_opponents import EvalContext, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
 from .fast_env import (  # noqa: E402
     COMETS_PER_SPAWN,
     MAX_COMET_PATH,
@@ -56,8 +59,56 @@ from .model_jax import ActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
 from .ppo_jax import PPOParams, Rollout, compute_gae, log_prob_entropy, make_train_state, ppo_update, safe_logits  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
+from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
 
 NEG_INF = -1.0e9
+
+
+def _resolve_lr_schedule(cfg) -> str:
+    schedule = str(getattr(cfg.ppo, "lr_schedule", "auto") or "auto").lower()
+    if schedule == "auto":
+        return "linear" if getattr(cfg.ppo, "anneal_lr", False) else "constant"
+    return schedule
+
+
+def _schedule_value(update: int, total_updates: int, schedule: str, min_ratio: float) -> float:
+    name = (schedule or "constant").lower()
+    if name == "constant" or total_updates <= 1:
+        return 1.0
+    progress = min(max((update - 1) / max(total_updates - 1, 1), 0.0), 1.0)
+    floor = max(float(min_ratio), 0.0)
+    if name in {"linear", "linear_decay"}:
+        return floor + (1.0 - floor) * (1.0 - progress)
+    if name in {"cosine", "cosine_decay"}:
+        return floor + 0.5 * (1.0 - floor) * (1.0 + math.cos(math.pi * progress))
+    return 1.0
+
+
+def _entropy_scale(cfg, update: int) -> float:
+    return _schedule_value(
+        update,
+        int(getattr(cfg.ppo, "total_updates", 1)),
+        str(getattr(cfg.ppo, "ent_schedule", "constant") or "constant"),
+        float(getattr(cfg.ppo, "ent_min_ratio", 1.0)),
+    )
+
+
+def _current_lr(cfg, optimizer_step: int, total_steps: int, warmup_steps: int) -> float:
+    schedule = _resolve_lr_schedule(cfg)
+    base_lr = float(cfg.ppo.lr)
+    min_ratio = float(getattr(cfg.ppo, "min_lr_ratio", 0.0))
+    if schedule == "constant" or total_steps <= 0:
+        return base_lr
+    if schedule == "linear":
+        progress = min(max(optimizer_step / max(total_steps, 1), 0.0), 1.0)
+        return base_lr * (min_ratio + (1.0 - min_ratio) * (1.0 - progress))
+    if schedule in {"warmup_cosine", "cosine_warmup"}:
+        if warmup_steps > 0 and optimizer_step < warmup_steps:
+            return base_lr * optimizer_step / max(warmup_steps, 1)
+        decay_steps = max(total_steps - warmup_steps, 1)
+        progress = min(max((optimizer_step - warmup_steps) / decay_steps, 0.0), 1.0)
+        return base_lr * (min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress)))
+    return base_lr
 
 
 def flip_state(state: EnvState) -> EnvState:
@@ -177,11 +228,16 @@ def jax_actions_to_kaggle(actions_arr) -> list:
 
 def deterministic_policy_actions(train_state, state, feat_params, norm_state, norm_params):
     """argmax 推理路径，用于网页/外部评估/JAX 内部 eval 保持一致。"""
+    return deterministic_policy_actions_params(train_state.params, train_state.apply_fn, state, feat_params, norm_state, norm_params)
+
+
+def deterministic_policy_actions_params(params, apply_fn, state, feat_params, norm_state, norm_params):
+    """argmax 推理路径，直接接受 params/apply_fn，用于固定 checkpoint 对手。"""
     raw_enc = encode_batch(state, feat_params)
     enc = normalize_encoded(raw_enc, norm_state, norm_params)
     zeros = jnp.zeros(enc.self_features.shape[:-1], dtype=jnp.int32)
-    out1 = train_state.apply_fn(
-        {"params": train_state.params},
+    out1 = apply_fn(
+        {"params": params},
         enc.self_features,
         enc.candidate_features,
         enc.global_features,
@@ -198,8 +254,8 @@ def deterministic_policy_actions(train_state, state, feat_params, norm_state, no
         jnp.where(fire, target_logits[..., 0], 0.0)
     )
     target = jnp.argmax(safe_logits(target_logits), axis=-1)
-    out2 = train_state.apply_fn(
-        {"params": train_state.params},
+    out2 = apply_fn(
+        {"params": params},
         enc.self_features,
         enc.candidate_features,
         enc.global_features,
@@ -221,88 +277,6 @@ def deterministic_policy_actions(train_state, state, feat_params, norm_state, no
         amount,
         feat_params,
     )
-
-
-def eval_vs_nearest_jax(
-    train_state, model, bank: EnvState, env_params: EnvParams,
-    feat_params, norm_state, norm_params, num_games: int, rng,
-) -> dict:
-    """在 JAX fast_env 中对 nearest 对手跑 num_games 局完整对局，返回胜/平/负率。"""
-    rng, reset_key = jax.random.split(rng)
-    state = reset_from_bank(bank, reset_key, num_games)
-
-    def step_fn(st, _):
-        learner_acts = deterministic_policy_actions(train_state, st, feat_params, norm_state, norm_params)
-        opp_acts = nearest_opponent_actions(st, player=1, params=feat_params)
-        joint = jnp.stack([learner_acts, opp_acts], axis=1)
-        next_st = step_batch(st, joint, env_params)
-        return next_st, None
-
-    final_state, _ = jax.lax.scan(step_fn, state, None, length=env_params.episode_steps)
-    winners_np = np.array(final_state.winner)
-    wins = int((winners_np == 0).sum())
-    losses = int((winners_np == 1).sum())
-    draws = int((winners_np == 2).sum())
-    total = max(num_games, 1)
-    return {"wins": wins, "losses": losses, "draws": draws,
-            "win_rate": wins / total, "loss_rate": losses / total}
-
-
-def eval_vs_external(
-    train_state, model, feat_params, norm_state, norm_params, env_params: EnvParams,
-    opponent_dir: Path, num_games: int, base_seed: int, rng,
-) -> dict:
-    """通过 kaggle_environments 对战外部智能体 num_games 局，返回胜平负统计。
-
-    JAX 模型以 player 0 身份出战，外部智能体为 player 1。
-    """
-    try:
-        from kaggle_environments import make as kag_make
-    except ImportError:
-        print("[eval] kaggle_environments 未安装，跳过外部智能体评估")
-        return {}
-
-    opponent = ExternalScriptOpponent(opponent_dir)
-    wins = losses = draws = 0
-
-    # JIT 单步推理（batch=1）
-    @jax.jit
-    def infer(st):
-        return deterministic_policy_actions(train_state, st, feat_params, norm_state, norm_params)
-
-    for g in range(num_games):
-        seed = base_seed + g
-        opponent.reset_env(0, seed)
-        env = kag_make("orbit_wars", configuration={"seed": seed, "randomSeed": seed}, debug=False)
-        env.reset(num_agents=2)
-        states = env.step([[], []])
-        obs = states[0]["observation"]
-        opp_obs = states[1]["observation"]
-        done = states[0]["status"] != "ACTIVE"
-        while not done:
-            jax_state = kaggle_obs_to_jax_state(obs, env_params)
-            jax_acts = infer(jax_state)
-            learner_action = jax_actions_to_kaggle(jax_acts)
-            opp_action = opponent.act_for_env(0, opp_obs)
-            states = env.step([learner_action, opp_action])
-            obs = states[0]["observation"]
-            opp_obs = states[1]["observation"]
-            done = states[0]["status"] != "ACTIVE"
-        reward = states[0].get("reward", 0.0) or 0.0
-        if reward > 0:
-            wins += 1
-            result = "win"
-        elif reward < 0:
-            losses += 1
-            result = "loss"
-        else:
-            draws += 1
-            result = "draw"
-        print(f"  [eval/{opponent_dir.name}] game={g+1} seed={seed} {result} reward={reward:.1f}")
-
-    total = num_games
-    return {"wins": wins, "losses": losses, "draws": draws,
-            "win_rate": wins / total, "loss_rate": losses / total}
 
 
 def main() -> None:
@@ -333,11 +307,17 @@ def main() -> None:
     feat_params = FeatureParams.from_train_config(cfg)
     norm_params = NormalizerParams.from_train_config(cfg)
     reward_params = RewardParams.from_train_config(cfg)
+    ent_coef_fire = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_fire", -1.0) < 0.0 else cfg.ppo.ent_coef_fire
+    ent_coef_target = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_target", -1.0) < 0.0 else cfg.ppo.ent_coef_target
+    ent_coef_amount = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_amount", -1.0) < 0.0 else cfg.ppo.ent_coef_amount
     ppo_params = PPOParams(
         gamma=cfg.ppo.gamma,
         gae_lambda=cfg.ppo.gae_lambda,
         clip_coef=cfg.ppo.clip_coef,
         ent_coef=cfg.ppo.ent_coef,
+        ent_coef_fire=ent_coef_fire,
+        ent_coef_target=ent_coef_target,
+        ent_coef_amount=ent_coef_amount,
         vf_coef=cfg.ppo.vf_coef,
         max_grad_norm=cfg.ppo.max_grad_norm,
         epochs=cfg.ppo.epochs,
@@ -355,6 +335,14 @@ def main() -> None:
     state = reset_from_bank(bank, rng_reset, cfg.ppo.num_envs)
     raw_sample = encode_batch(state, feat_params)
     sample = raw_sample if getattr(cfg.model, "use_transformer", False) else flatten_sources(raw_sample)
+    rollout_state_count = cfg.ppo.num_envs * cfg.ppo.rollout_steps
+    ppo_source_count = cfg.env.max_planets
+    ppo_states_per_minibatch = min(max(cfg.ppo.minibatch_size // ppo_source_count, 1), rollout_state_count)
+    ppo_num_minibatches = max(rollout_state_count // ppo_states_per_minibatch, 1)
+    optimizer_steps_per_update = cfg.ppo.epochs * ppo_num_minibatches
+    total_optimizer_steps = cfg.ppo.total_updates * optimizer_steps_per_update
+    warmup_steps = int(getattr(cfg.ppo, "warmup_updates", 0)) * optimizer_steps_per_update
+    lr_schedule_name = _resolve_lr_schedule(cfg)
     model = ActorCritic(
         self_dim=sample.self_features.shape[-1],
         candidate_dim=sample.candidate_features.shape[-1],
@@ -368,37 +356,91 @@ def main() -> None:
         max_fleet_tokens=feat_params.max_fleet_tokens,
         num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
         num_heads=getattr(cfg.model, "num_heads", 4),
+        value_use_context=getattr(cfg.model, "value_use_context", False),
     )
     train_state = make_train_state(
         rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
-        total_steps=(
-            cfg.ppo.total_updates
-            * cfg.ppo.epochs
-            * max(1, (cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets) // cfg.ppo.minibatch_size)
-        ) if getattr(cfg.ppo, "anneal_lr", False) else 0,
+        total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
+        lr_schedule=lr_schedule_name,
+        warmup_steps=warmup_steps,
+        min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
     )
     normalizer_state = init_normalizer()
+    start_update = 1
+    init_checkpoint_params = None
+    init_checkpoint_normalizer_state = None
+
+    def _resolve_config_path(path_value: str) -> Path:
+        path = Path(path_value)
+        return path if path.is_absolute() else Path(args.config).resolve().parent / path
+
+    def _load_checkpoint(path_value: str) -> tuple[dict, Path]:
+        ckpt_path = _resolve_config_path(path_value)
+        with ckpt_path.open("rb") as f:
+            return pickle.load(f), ckpt_path
+
+    def _assert_param_compatible(ckpt_params, ckpt_path: Path) -> None:
+        expected_leaves, expected_tree = jax.tree_util.tree_flatten(train_state.params)
+        loaded_leaves, loaded_tree = jax.tree_util.tree_flatten(ckpt_params)
+        if loaded_tree != expected_tree:
+            raise ValueError(f"Checkpoint param tree does not match current model: {ckpt_path}")
+        mismatches = [
+            (i, getattr(exp, "shape", None), getattr(got, "shape", None))
+            for i, (exp, got) in enumerate(zip(expected_leaves, loaded_leaves, strict=True))
+            if getattr(exp, "shape", None) != getattr(got, "shape", None)
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint param shapes do not match current model: {ckpt_path}; "
+                f"first mismatches={mismatches[:5]}"
+            )
+
+    init_ckpt = getattr(cfg, "init_from_checkpoint", None)
+    if init_ckpt:
+        ckpt, ckpt_path = _load_checkpoint(init_ckpt)
+        ckpt_params = ckpt["params"]
+        _assert_param_compatible(ckpt_params, ckpt_path)
+        train_state = train_state.replace(params=ckpt_params)
+        if "normalizer_state" in ckpt:
+            normalizer_state = ckpt["normalizer_state"]
+        init_checkpoint_params = ckpt_params
+        init_checkpoint_normalizer_state = ckpt.get("normalizer_state", normalizer_state)
+        if getattr(cfg, "start_update_from_checkpoint", True):
+            start_update = int(ckpt.get("update", 0)) + 1
+        print(
+            f"[init] loaded checkpoint {ckpt_path} "
+            f"(ckpt_update={ckpt.get('update', 'unknown')}, start_update={start_update}); "
+            "optimizer state is freshly initialized"
+        )
+    opponent_checkpoint = None
+    opponent_ckpt = getattr(cfg, "opponent_checkpoint", None)
+    if opponent_ckpt:
+        opponent_checkpoint = load_checkpoint_opponent(_resolve_config_path(opponent_ckpt))
+        print(
+            f"[opponent] loaded checkpoint opponent {opponent_checkpoint.path} "
+            f"(ckpt_update={opponent_checkpoint.update if opponent_checkpoint.update is not None else 'unknown'})"
+        )
+    elif init_ckpt and init_checkpoint_params is not None:
+        opponent_checkpoint = load_checkpoint_opponent(_resolve_config_path(init_ckpt))
+
+    eval_checkpoint = opponent_checkpoint
+    eval_ckpt = getattr(cfg, "eval_checkpoint", None)
+    if eval_ckpt:
+        eval_checkpoint = load_checkpoint_opponent(_resolve_config_path(eval_ckpt))
+        print(
+            f"[eval] loaded checkpoint eval opponent {eval_checkpoint.path} "
+            f"(ckpt_update={eval_checkpoint.update if eval_checkpoint.update is not None else 'unknown'})"
+        )
 
     run_dir = Path(cfg.save_dir) / f"{cfg.run_name}_jax"
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.csv"
-    eval_metric_fields = [
-        "eval_nearest_win_rate",
-        "eval_nearest_loss_rate",
-        "eval_nearest_wins",
-        "eval_nearest_losses",
-        "eval_nearest_draws",
-        "eval_sigma_win_rate",
-        "eval_sigma_loss_rate",
-        "eval_sigma_wins",
-        "eval_sigma_losses",
-        "eval_sigma_draws",
-        "eval_tamrazov_win_rate",
-        "eval_tamrazov_loss_rate",
-        "eval_tamrazov_wins",
-        "eval_tamrazov_losses",
-        "eval_tamrazov_draws",
-    ]
+    eval_opponents = default_eval_opponents(
+        ROOT,
+        checkpoint_opponent=eval_checkpoint,
+        enabled_names=getattr(cfg.eval, "opponents", None),
+    )
+    eval_metric_fields = build_eval_metric_fields(eval_opponents)
     with metrics_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             "update",
@@ -411,9 +453,15 @@ def main() -> None:
             "policy_loss",
             "value_loss",
             "entropy",
+            "entropy_fire",
+            "entropy_target",
+            "entropy_amount",
             "approx_kl",
             "clipfrac",
+            "max_abs_log_ratio",
             "n_epochs_run",
+            "lr",
+            "ent_scale",
             *eval_metric_fields,
         ])
     print(f"JAX trainer run_dir={run_dir} envs={cfg.ppo.num_envs} rollout_steps={cfg.ppo.rollout_steps} device={jax.devices()}")
@@ -433,8 +481,16 @@ def main() -> None:
                 "gae_lambda": cfg.ppo.gae_lambda,
                 "clip_coef": cfg.ppo.clip_coef,
                 "ent_coef": cfg.ppo.ent_coef,
+                "ent_coef_fire": ent_coef_fire,
+                "ent_coef_target": ent_coef_target,
+                "ent_coef_amount": ent_coef_amount,
+                "ent_schedule": getattr(cfg.ppo, "ent_schedule", "constant"),
+                "ent_min_ratio": getattr(cfg.ppo, "ent_min_ratio", 1.0),
                 "vf_coef": cfg.ppo.vf_coef,
                 "lr": cfg.ppo.lr,
+                "lr_schedule": lr_schedule_name,
+                "warmup_updates": getattr(cfg.ppo, "warmup_updates", 0),
+                "min_lr_ratio": getattr(cfg.ppo, "min_lr_ratio", 0.0),
                 "max_grad_norm": cfg.ppo.max_grad_norm,
                 "epochs": cfg.ppo.epochs,
                 "hidden_size": cfg.model.hidden_size,
@@ -455,46 +511,90 @@ def main() -> None:
     else:
         print("wandb disabled (set wandb.enabled: true in config to enable)")
 
-    self_play = getattr(cfg, "opponent", "nearest") == "self"
-    use_pool = getattr(cfg, "opponent", "nearest") == "pool"
+    opponent_name = getattr(cfg, "opponent", "nearest")
+    self_play = opponent_name == "self"
+    checkpoint_play = opponent_name == "checkpoint"
+    use_pool = opponent_name == "pool"
     # 对手池模式：
+    # - current: 全程对当前策略自博弈，每个 update 前同步 opponent_params。
+    # - lag_checkpoint: 全程/分阶段对 pool_lag_interval 步前 checkpoint。
+    # - fixed_pool: 旧版固定池，Phase 1 nearest/current/lag，Phase 2 current/lag。
     # - pfsp: 胜率加权采样，优先训练当前打不过的对手。
-    # - fixed: 旧版固定比例采样，Phase 1 nearest/current/lag 各 1/3，Phase 2 current/lag 各 1/2。
-    pool_phase = 1
-    pool_mode = getattr(cfg, "pool_mode", "pfsp")
-    pool_lag_interval = getattr(cfg, "pool_lag_interval", 50)
-    pool_max_size = getattr(cfg, "pool_max_size", 4)
-    promote_nearest_win_rate = getattr(cfg, "promote_nearest_win_rate", 0.8)
-    promote_consecutive_evals = getattr(cfg, "promote_consecutive_evals", 3)
+    raw_pool_mode = str(getattr(cfg, "pool_mode", "pfsp") or "pfsp").lower()
+    pool_mode_aliases = {
+        "current": "current",
+        "lag_checkpoint": "lag_checkpoint",
+        "fixed_lag_checkpoint": "lag_checkpoint",
+        "fixed": "fixed_pool",
+        "fixed_pool": "fixed_pool",
+        "pfsp": "pfsp",
+        "snapshot": "snapshot",
+    }
+    if raw_pool_mode not in pool_mode_aliases:
+        raise ValueError(
+            f"Unknown pool_mode={raw_pool_mode!r}; expected one of "
+            "current, lag_checkpoint, fixed_pool, pfsp, snapshot"
+        )
+    pool_mode = pool_mode_aliases[raw_pool_mode]
+    current_pool = pool_mode == "current"
+    lag_checkpoint_pool = pool_mode == "lag_checkpoint"
+    fixed_pool = pool_mode == "fixed_pool"
+    pfsp_pool = pool_mode == "pfsp"
+    snapshot_pool = pool_mode == "snapshot"
+    phased_pool = lag_checkpoint_pool or fixed_pool
+    lagged_pool = lag_checkpoint_pool or fixed_pool or pfsp_pool
+    pool_phase = int(getattr(cfg, "pool_start_phase", 1)) if phased_pool else 1
+    pool_include_nearest = bool(getattr(cfg, "pool_include_nearest", True)) if pfsp_pool else False
+    pool_lag_interval = int(getattr(cfg, "pool_lag_interval", 50)) if lagged_pool else 0
+    snapshot_interval = int(getattr(cfg, "snapshot_interval", 200)) if snapshot_pool else 0
+    snapshot_current_ratio = float(getattr(cfg, "snapshot_current_ratio", 0.2)) if snapshot_pool else 0.0
+    pool_max_size = int(getattr(cfg, "pool_max_size", 4)) if pfsp_pool else 0
+    promote_nearest_win_rate = float(getattr(cfg, "promote_nearest_win_rate", 0.8)) if phased_pool else 0.0
+    promote_consecutive_evals = int(getattr(cfg, "promote_consecutive_evals", 3)) if phased_pool else 0
     recent_nearest_win_rates: list[float] = []
     pool_rng = random.Random(cfg.seed + 12345)
     if use_pool:
-        if pool_mode == "fixed":
-            print(f"opponent=pool fixed (lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+        if current_pool:
+            print("opponent=pool current (sync_every_update=true)")
+        elif lag_checkpoint_pool:
+            print(f"opponent=pool lag_checkpoint (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+        elif fixed_pool:
+            print(f"opponent=pool fixed_pool (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+        elif snapshot_pool:
+            print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
         else:
-            print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size})")
+            print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size}, "
+                  f"include_nearest={pool_include_nearest})")
     else:
-        print(f"opponent={'self_play' if self_play else 'nearest'}")
+        print(f"opponent={'checkpoint' if checkpoint_play else ('self_play' if self_play else 'nearest')}")
     opponent_update_freq = cfg.self_play_update_interval  # 默认 25
     eval_enabled = getattr(cfg.eval, "enabled", True)
     eval_interval = cfg.eval.every            # 每多少 update 评估一次
     eval_games = cfg.eval.games               # 每次评估局数
     eval_seed = cfg.eval.seed
-    tamrazov_dir = ROOT / "orbit-wars-lab" / "agents" / "external" / "tamrazov-starwars"
-    sigma_dir = ROOT / "orbit-wars-lab" / "agents" / "external" / "sigmaborov-reinforce"
     checkpoint_every = getattr(cfg, "checkpoint_every", 100)
+    checkpoint_model = opponent_checkpoint.model if opponent_checkpoint is not None else model
+    checkpoint_feat_params = opponent_checkpoint.feat_params if opponent_checkpoint is not None else feat_params
+    checkpoint_normalizer_state = opponent_checkpoint.normalizer_state if opponent_checkpoint is not None else normalizer_state
 
     # 冻结对手权重（初始与学习器相同，每 opponent_update_freq 步同步一次）
-    opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
-    # lag_snapshot 保存“上一个 interval 的当前策略”；到下一个 interval 时加入池子，成为 50 步前 checkpoint。
+    opponent_params = (
+        jax.tree_util.tree_map(lambda x: x, opponent_checkpoint.params)
+        if checkpoint_play and opponent_checkpoint is not None
+        else jax.tree_util.tree_map(lambda x: x, train_state.params)
+    )
+    if checkpoint_play and opponent_checkpoint is None:
+        raise ValueError("opponent='checkpoint' requires opponent_checkpoint or init_from_checkpoint")
+    # lag_snapshot 保存“上一个 interval 起点的策略”；新 lag_checkpoint/PFSP 接口到下一个
+    # interval 时才发布，因此 lag 对手是真正间隔 pool_lag_interval 的 checkpoint。
     lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    snapshot_pool_entries: list[dict] = []  # snapshot pool 快照列表
     pool_entries: list[dict] = []
-    if use_pool:
-        pool_entries = [
-            {"id": "nearest", "type": "nearest", "params": None, "winrate": 0.5},
-            {"id": "selfplay-current", "type": "current", "params": None, "winrate": 0.5},
-        ]
+    if use_pool and pfsp_pool:
+        pool_entries = [{"id": "selfplay-current", "type": "current", "params": None, "winrate": 0.5}]
+        if pool_include_nearest:
+            pool_entries.insert(0, {"id": "nearest", "type": "nearest", "params": None, "winrate": 0.5})
 
     def _copy_params(params):
         return jax.tree_util.tree_map(lambda x: x, params)
@@ -522,30 +622,65 @@ def main() -> None:
         removable = [entry for entry in pool_entries if entry["id"] != "selfplay-current"]
         if not removable:
             return
-        victim = max(removable, key=lambda entry: float(entry["winrate"]))
+        strong = [entry for entry in removable if float(entry["winrate"]) > 0.60]
+        if strong:
+            victim = max(strong, key=lambda entry: float(entry["winrate"]))
+            reason = f"胜率超过 60% 的对手 {victim['id']} (winrate={float(victim['winrate']):.3f})"
+        else:
+            lag_entries = [entry for entry in removable if entry["type"] == "lag"]
+            if lag_entries:
+                victim = min(lag_entries, key=lambda entry: str(entry["id"]))
+                reason = f"最旧 lag checkpoint {victim['id']} (winrate={float(victim['winrate']):.3f})"
+            else:
+                victim = min(removable, key=lambda entry: float(entry["winrate"]))
+                reason = f"最低胜率对手 {victim['id']} (winrate={float(victim['winrate']):.3f})"
         pool_entries.remove(victim)
-        print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除胜率最高对手 {victim['id']} "
-              f"(winrate={float(victim['winrate']):.3f})，对手池: {_pool_summary(pool_entries)}")
+        print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除{reason}，"
+              f"对手池: {_pool_summary(pool_entries)}")
 
-    # 两个 JIT 编译的训练步（nearest 对手 / self-play 对手），供 pool 模式按需调用
+    fixed_phase1_opponents = ["nearest", "selfplay-current", "selfplay-lag"]
+    fixed_phase2_opponents = ["selfplay-current", "selfplay-lag"]
+    current_opponents = ["selfplay-current"]
+    lag_checkpoint_phase1_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase1_opponents", ["selfplay-lag"]))
+    lag_checkpoint_phase2_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase2_opponents", ["selfplay-current", "selfplay-lag"]))
+    valid_fixed_opponents = {"nearest", "selfplay-current", "selfplay-lag"}
+    if lag_checkpoint_pool:
+        for phase_name, phase_opponents in (
+            ("pool_lag_checkpoint_phase1_opponents", lag_checkpoint_phase1_opponents),
+            ("pool_lag_checkpoint_phase2_opponents", lag_checkpoint_phase2_opponents),
+        ):
+            if not phase_opponents:
+                raise ValueError(f"{phase_name} must contain at least one opponent")
+            invalid = sorted(set(phase_opponents) - valid_fixed_opponents)
+            if invalid:
+                raise ValueError(f"{phase_name} contains unknown opponents: {invalid}")
+
+    # JIT 编译的训练步（JAX-native 对手），供 pool 模式按需调用。
     # rollout 收集 + GAE 和 PPO 更新分别 JIT；PPO 的 KL 早停在 JIT 内完成。
     _jit_nearest = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_rollout(
-            ts, opp_p, st, ns, key, bank, env_params, feat_params, norm_params,
-            reward_params, ppo_params, model, cfg.ppo.rollout_steps, False,
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
         )
     )
     _jit_selfplay = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_rollout(
-            ts, opp_p, st, ns, key, bank, env_params, feat_params, norm_params,
-            reward_params, ppo_params, model, cfg.ppo.rollout_steps, True,
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
+        )
+    )
+    _jit_checkpoint = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
         )
     )
     # 兼容旧配置（opponent: nearest / self）
     _jit_step = jax.jit(
-        lambda ts, opp_p, st, ns, key: collect_rollout(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
             ts,
             opp_p,
+            opp_ns,
             st,
             ns,
             key,
@@ -556,73 +691,95 @@ def main() -> None:
             reward_params,
             ppo_params,
             model,
+            checkpoint_model if checkpoint_play else model,
+            checkpoint_feat_params if checkpoint_play else feat_params,
             cfg.ppo.rollout_steps,
-            self_play,
+            "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
         )
     )
 
-    def _run_step(jit_fn, ts, opp_p, st, ns, key):
+    def _run_step(jit_fn, ts, opp_p, opp_ns, st, ns, key, ent_scale):
         """JIT 收集 rollout，然后在 Python 层执行 PPO 更新（含 KL 早停）。"""
-        ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, st, ns, key)
-        ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng)
+        ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, opp_ns, st, ns, key)
+        ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng, ent_scale)
         return ts, st, ns, {**ppo_metrics, **ep_metrics}
 
-    for update in range(1, cfg.ppo.total_updates + 1):
+    def _run_named_opponent(opponent_id: str, ts, st, ns, key, ent_scale):
+        if opponent_id == "nearest":
+            return _run_step(_jit_nearest, ts, opponent_params, ns, st, ns, key, ent_scale)
+        if opponent_id == "selfplay-current":
+            return _run_step(_jit_selfplay, ts, opponent_params, ns, st, ns, key, ent_scale)
+        if opponent_id == "selfplay-lag":
+            return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
+        raise ValueError(f"Unknown training opponent: {opponent_id}")
+
+    for update in range(start_update, cfg.ppo.total_updates + 1):
         selected_pool_entry = None
         selected_pool_id = ""
 
         # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
-        if update % opponent_update_freq == 1:
+        if (use_pool and current_pool) or ((not checkpoint_play) and (update - 1) % max(opponent_update_freq, 1) == 0):
             opponent_params = _copy_params(train_state.params)
             if self_play or use_pool:
                 print(f"[pool] update={update} 同步 selfplay-current 对手权重")
 
         start = time.perf_counter()
         rng, step_key = jax.random.split(rng)
+        ent_scale = _entropy_scale(cfg, update)
 
         if use_pool:
-            if pool_mode == "fixed":
-                u = pool_rng.random()
-                if pool_phase == 1 and u < 1 / 3:
-                    selected_pool_id = "nearest"
-                    train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
-                elif pool_phase == 1 and u < 2 / 3:
-                    selected_pool_id = "selfplay-current"
-                    train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
-                elif pool_phase == 1:
-                    selected_pool_id = "selfplay-lag"
-                    train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, lagged_params, state, normalizer_state, step_key)
-                elif u < 0.5:
-                    selected_pool_id = "selfplay-current"
-                    train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+            if current_pool or lag_checkpoint_pool or fixed_pool:
+                if current_pool:
+                    candidates = current_opponents
+                elif lag_checkpoint_pool:
+                    candidates = lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents
                 else:
-                    selected_pool_id = "selfplay-lag"
+                    candidates = fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents
+                selected_pool_id = pool_rng.choice(candidates)
+                train_state, state, normalizer_state, metrics = _run_named_opponent(
+                    selected_pool_id,
+                    train_state,
+                    state,
+                    normalizer_state,
+                    step_key,
+                    ent_scale,
+                )
+            elif snapshot_pool:
+                # 20% 打当前策略，80% 打历史快照；若快照池为空则全打当前
+                if snapshot_pool_entries and pool_rng.random() >= snapshot_current_ratio:
+                    snap = pool_rng.choice(snapshot_pool_entries)
+                    selected_pool_id = snap["id"]
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, lagged_params, state, normalizer_state, step_key)
+                        _jit_selfplay, train_state, snap["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
+                else:
+                    selected_pool_id = "selfplay-current"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
             else:
                 selected_pool_entry = _pfsp_sample(pool_entries)
                 selected_pool_id = str(selected_pool_entry["id"])
                 if selected_pool_entry["type"] == "nearest":
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_nearest, train_state, opponent_params, state, normalizer_state, step_key)
+                        _jit_nearest, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
                 elif selected_pool_entry["type"] == "current":
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, opponent_params, state, normalizer_state, step_key)
+                        _jit_selfplay, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
                 else:
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, selected_pool_entry["params"], state, normalizer_state, step_key)
+                        _jit_selfplay, train_state, selected_pool_entry["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
         else:
             # 兼容旧配置（opponent: nearest / self）
             if self_play and update % opponent_update_freq == 1:
                 pass  # already synced above
+            step_jit = _jit_checkpoint if checkpoint_play else _jit_step
+            step_opp_norm = checkpoint_normalizer_state if checkpoint_play else normalizer_state
             train_state, state, normalizer_state, metrics = _run_step(
-                _jit_step, train_state, opponent_params, state, normalizer_state, step_key)
+                step_jit, train_state, opponent_params, step_opp_norm, state, normalizer_state, step_key, ent_scale)
         metrics = jax.device_get(metrics)
-        if use_pool and pool_mode == "pfsp" and selected_pool_entry is not None and float(metrics["episodes_per_rollout"]) > 0.0:
+        current_lr = _current_lr(cfg, int(jax.device_get(train_state.step)), total_optimizer_steps, warmup_steps)
+        metrics["lr"] = current_lr
+        metrics["ent_scale"] = ent_scale
+        if use_pool and pfsp_pool and selected_pool_entry is not None and float(metrics["episodes_per_rollout"]) > 0.0:
             old_wr = float(selected_pool_entry["winrate"])
             selected_pool_entry["winrate"] = 0.95 * old_wr + 0.05 * float(metrics["win_rate"])
             metrics["pool_selected_winrate"] = selected_pool_entry["winrate"]
@@ -634,21 +791,33 @@ def main() -> None:
             f"ep_reward={metrics['episode_reward']:.3f} winrate={metrics['win_rate']:.3f} "
             f"return={metrics['mean_return']:.3f} eps={metrics['episodes_per_rollout']:.0f} "
             f"ent={metrics['entropy']:.3f} kl={metrics['approx_kl']:.5f} "
-            f"epochs={metrics.get('n_epochs_run', cfg.ppo.epochs):.0f}"
+            f"logr={metrics.get('max_abs_log_ratio', 0.0):.2f} "
+            f"epochs={metrics.get('n_epochs_run', cfg.ppo.epochs):.0f} "
+            f"lr={metrics['lr']:.2e} ent_scale={metrics['ent_scale']:.2f}"
         )
         if use_pool:
-            if pool_mode == "pfsp":
+            if pfsp_pool:
                 selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
                 line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
             else:
                 line += f" opp={selected_pool_id}"
         print(line, flush=True)
 
-        if use_pool and update % pool_lag_interval == 0:
-            if pool_mode == "fixed":
+        # snapshot pool：每 snapshot_interval 步存一个快照
+        if use_pool and snapshot_pool and snapshot_interval > 0 and update % snapshot_interval == 0:
+            snap_id = f"snap-{update:06d}"
+            snapshot_pool_entries.append({"id": snap_id, "params": _copy_params(train_state.params)})
+            print(f"[pool] update={update} 存入快照 {snap_id}，快照池大小={len(snapshot_pool_entries)}")
+
+        if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
+            if fixed_pool:
                 lagged_params = _copy_params(train_state.params)
-                print(f"[pool] update={update} 同步 fixed lagged 对手权重 (lag={pool_lag_interval})")
-            else:
+                print(f"[pool] update={update} 同步 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
+            elif lag_checkpoint_pool:
+                lagged_params = _copy_params(lag_snapshot_params)
+                lag_snapshot_params = _copy_params(train_state.params)
+                print(f"[pool] update={update} 发布 lag_checkpoint 对手权重 (lag={pool_lag_interval})")
+            elif pfsp_pool:
                 _add_lag_to_pool(update, lag_snapshot_params)
                 lag_snapshot_params = _copy_params(train_state.params)
 
@@ -657,41 +826,38 @@ def main() -> None:
             print(f"[eval] update={update} 开始评估 ({eval_games} 局)...")
             rng, eval_rng = jax.random.split(rng)
 
-            # 评估 1：vs nearest（JAX 快速评估）
-            near_res = eval_vs_nearest_jax(
-                train_state, model, bank, env_params, feat_params,
-                normalizer_state, norm_params, eval_games, eval_rng,
+            eval_ctx = EvalContext(
+                train_state=train_state,
+                model=model,
+                bank=bank,
+                env_params=env_params,
+                feat_params=feat_params,
+                normalizer_state=normalizer_state,
+                norm_params=norm_params,
+                num_games=eval_games,
+                base_seed=eval_seed + update,
+                rng=eval_rng,
+                deterministic_policy_actions=deterministic_policy_actions,
+                deterministic_policy_actions_params=deterministic_policy_actions_params,
+                nearest_opponent_actions=nearest_opponent_actions,
+                reset_from_bank=reset_from_bank,
+                flip_state=flip_state,
+                kaggle_obs_to_jax_state=kaggle_obs_to_jax_state,
+                jax_actions_to_kaggle=jax_actions_to_kaggle,
             )
-            print(f"[eval/nearest]   wins={near_res['wins']} losses={near_res['losses']} "
-                  f"draws={near_res['draws']} win_rate={near_res['win_rate']:.3f}")
-            eval_metrics.update({
-                "eval_nearest_win_rate": near_res["win_rate"],
-                "eval_nearest_loss_rate": near_res["loss_rate"],
-                "eval_nearest_wins": near_res["wins"],
-                "eval_nearest_losses": near_res["losses"],
-                "eval_nearest_draws": near_res["draws"],
-            })
-
-            # 评估 2：vs sigmaborov-reinforce（kaggle_environments）
-            sigma_res: dict = {}
-            if sigma_dir.exists():
-                sigma_res = eval_vs_external(
-                    train_state, model, feat_params, normalizer_state, norm_params, env_params,
-                    sigma_dir, eval_games, eval_seed + update + 7919, rng,
-                )
-                print(f"[eval/sigma]     wins={sigma_res.get('wins',0)} "
-                      f"losses={sigma_res.get('losses',0)} "
-                      f"draws={sigma_res.get('draws',0)} win_rate={sigma_res.get('win_rate',0):.3f}")
-                eval_metrics.update({
-                    "eval_sigma_win_rate": sigma_res["win_rate"],
-                    "eval_sigma_loss_rate": sigma_res["loss_rate"],
-                    "eval_sigma_wins": sigma_res["wins"],
-                    "eval_sigma_losses": sigma_res["losses"],
-                    "eval_sigma_draws": sigma_res["draws"],
-                })
+            eval_results: dict[str, dict] = {}
+            for eval_opponent in eval_opponents:
+                if not eval_opponent.exists():
+                    continue
+                result = eval_opponent.evaluate(eval_ctx)
+                if not result:
+                    continue
+                eval_results[eval_opponent.metric_prefix] = result
+                eval_metrics.update(eval_opponent.metric_values(result))
+            near_res = eval_results.get("nearest", {})
 
             # 升阶检测（Pool Phase 1 → Phase 2）：连续 N 次 nearest win_rate >= threshold
-            if use_pool and pool_phase == 1:
+            if use_pool and phased_pool and pool_phase == 1 and near_res:
                 recent_nearest_win_rates.append(float(near_res["win_rate"]))
                 if len(recent_nearest_win_rates) > promote_consecutive_evals:
                     recent_nearest_win_rates.pop(0)
@@ -701,36 +867,23 @@ def main() -> None:
                     print(f"[pool] update={update} ★ 升阶 Phase 2：连续 {promote_consecutive_evals} 次 "
                           f"nearest win_rate >= {promote_nearest_win_rate:.2f}，切换为 selfplay-current/selfplay-lag 训练 + tamrazov-starwars eval")
 
-            # 评估 3：vs tamrazov-starwars（kaggle_environments）
-            tamr_res = {}
-            if tamrazov_dir.exists():
-                tamr_res = eval_vs_external(
-                    train_state, model, feat_params, normalizer_state, norm_params, env_params,
-                    tamrazov_dir, eval_games, eval_seed + update, rng,
-                )
-                print(f"[eval/tamrazov]  wins={tamr_res.get('wins',0)} "
-                      f"losses={tamr_res.get('losses',0)} "
-                      f"win_rate={tamr_res.get('win_rate',0):.3f}")
-                eval_metrics.update({
-                    "eval_tamrazov_win_rate": tamr_res["win_rate"],
-                    "eval_tamrazov_loss_rate": tamr_res["loss_rate"],
-                    "eval_tamrazov_wins": tamr_res["wins"],
-                    "eval_tamrazov_losses": tamr_res["losses"],
-                    "eval_tamrazov_draws": tamr_res["draws"],
-                })
-
             if use_wandb:
-                log_dict: dict = {
-                    "eval/nearest_win_rate": float(near_res["win_rate"]),
-                }
-                if sigma_res:
-                    log_dict["eval/sigma_win_rate"] = float(sigma_res["win_rate"])
-                if tamr_res:
-                    log_dict["eval/tamrazov_win_rate"] = float(tamr_res["win_rate"])
+                log_dict: dict = {}
+                for prefix, result in eval_results.items():
+                    log_dict[f"eval/{prefix}_win_rate"] = float(result["win_rate"])
                 if use_pool:
-                    log_dict["pool/phase"] = float(pool_phase)
-                    log_dict["pool/size"] = float(len(pool_entries))
-                    if recent_nearest_win_rates:
+                    if current_pool:
+                        fixed_size = len(current_opponents)
+                    elif lag_checkpoint_pool:
+                        fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
+                    elif fixed_pool:
+                        fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                    else:
+                        fixed_size = len(pool_entries)
+                    if phased_pool:
+                        log_dict["pool/phase"] = float(pool_phase)
+                    log_dict["pool/size"] = float(len(pool_entries) if pfsp_pool else fixed_size)
+                    if phased_pool and recent_nearest_win_rates:
                         log_dict["pool/recent_nearest_win_rate"] = float(np.mean(recent_nearest_win_rates))
                 _wandb.log(log_dict, step=update)
 
@@ -746,9 +899,15 @@ def main() -> None:
                 f"{metrics['policy_loss']:.8f}",
                 f"{metrics['value_loss']:.8f}",
                 f"{metrics['entropy']:.8f}",
+                f"{metrics.get('entropy_fire', 0.0):.8f}",
+                f"{metrics.get('entropy_target', 0.0):.8f}",
+                f"{metrics.get('entropy_amount', 0.0):.8f}",
                 f"{metrics['approx_kl']:.8f}",
                 f"{metrics['clipfrac']:.8f}",
+                f"{metrics.get('max_abs_log_ratio', 0.0):.8f}",
                 f"{metrics.get('n_epochs_run', cfg.ppo.epochs):.1f}",
+                f"{metrics.get('lr', cfg.ppo.lr):.12f}",
+                f"{metrics.get('ent_scale', 1.0):.8f}",
                 *[eval_metrics[field] for field in eval_metric_fields],
             ])
         if use_wandb:
@@ -761,20 +920,33 @@ def main() -> None:
                 "losses/policy_loss": float(metrics["policy_loss"]),
                 "losses/value_loss": float(metrics["value_loss"]),
                 "losses/entropy": float(metrics["entropy"]),
+                "entropy/fire": float(metrics.get("entropy_fire", 0.0)),
+                "entropy/target": float(metrics.get("entropy_target", 0.0)),
+                "entropy/amount": float(metrics.get("entropy_amount", 0.0)),
+                "entropy/scale": float(metrics.get("ent_scale", 1.0)),
                 "losses/approx_kl": float(metrics["approx_kl"]),
                 "losses/clipfrac": float(metrics["clipfrac"]),
+                "losses/max_abs_log_ratio": float(metrics.get("max_abs_log_ratio", 0.0)),
                 "losses/n_epochs_run": float(metrics.get("n_epochs_run", cfg.ppo.epochs)),
+                "lr/current": float(metrics.get("lr", cfg.ppo.lr)),
             }, step=update)
             if use_pool:
-                pool_log = {"pool/size": float(len(pool_entries) if pool_mode == "pfsp" else 3)}
-                if pool_mode == "pfsp":
+                if current_pool:
+                    fixed_size = len(current_opponents)
+                elif lag_checkpoint_pool:
+                    fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
+                elif fixed_pool:
+                    fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                else:
+                    fixed_size = len(pool_entries)
+                pool_log = {"pool/size": float(len(pool_entries) if pfsp_pool else fixed_size)}
+                if pfsp_pool:
                     selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
                     pool_log["pool/selected_win_rate"] = selected_wr
                 _wandb.log(pool_log, step=update)
 
         # ── 定期保存 checkpoint ───────────────────────────────────
         if update % checkpoint_every == 0:
-            import pickle
             ckpt_path = run_dir / f"ckpt_{update:06d}.pkl"
             with open(ckpt_path, "wb") as f:
                 pickle.dump({
@@ -793,7 +965,25 @@ def reset_from_bank(bank: EnvState, rng, num_envs: int) -> EnvState:
     return select_from_bank(bank, idx)
 
 
-def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, bank, env_params, feat_params, norm_params, reward_params, ppo_params, model, rollout_steps: int, self_play: bool = False):
+def collect_rollout(
+    train_state,
+    opponent_params,
+    opponent_normalizer_state,
+    state,
+    normalizer_state,
+    rng,
+    bank,
+    env_params,
+    feat_params,
+    norm_params,
+    reward_params,
+    ppo_params,
+    model,
+    opponent_model,
+    opponent_feat_params,
+    rollout_steps: int,
+    opponent_kind: str = "nearest",
+):
     """收集 rollout，计算 GAE 和 episode 统计（JIT 安全，不含 PPO 更新）。
 
     1. lax.scan 循环 rollout_steps 步：特征展开 + 采样 + step 环境 + 奖励 + done 处理。
@@ -802,13 +992,23 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
     注：PPO 更新由调用方单独执行；ppo_update 自身是 JIT 编译的，
     KL 早停在 JIT 内用 while_loop 完成。
 
-    opponent_params: 冻结的对手权重 pytree（self_play=True 时使用）。
+    opponent_params: 冻结的对手权重 pytree（opponent_kind 为 selfplay/checkpoint 时使用）。
     """
     rng, rollout_key = jax.random.split(rng)
 
+    num_envs = state.planets.shape[0]
+    max_planets = feat_params.max_planets
+    window = reward_params.failed_capture_window  # 通常 50
+    use_failed_capture = reward_params.failed_capture_penalty != 0.0
+
+    # 环形历史缓冲区：记录过去 window 步内每个 (env, slot) 的发射动作和目标
+    fire_hist   = jnp.zeros((window, num_envs, max_planets), dtype=bool)
+    target_hist = jnp.zeros((window, num_envs, max_planets), dtype=jnp.int32)
+    step_cnt    = jnp.array(0, dtype=jnp.int32)
+
     def body(carry, _):
         """lax.scan 循环体：处理单步。"""
-        ts, st, ns, key = carry
+        ts, st, ns, key, fire_hist, target_hist, step_cnt = carry
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
@@ -821,18 +1021,59 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             amount_2d,
             feat_params,
         )
-        # 对手动作：自博弈时用冻结 opponent_params 跑翻转局面；否则用最近敌方启发式
-        if self_play:
-            flipped = flip_state(st)
-            raw_enc_opp = encode_batch(flipped, feat_params)
-            enc_opp = normalize_encoded(raw_enc_opp, ns, norm_params)  # 只读，不更新归一化器
-            f_opp, t_opp, a_opp, _, _ = policy_sample_params(opponent_params, model, enc_opp, opp_key)
-            opponent_actions = actions_from_decisions(flipped, enc_opp, f_opp, t_opp, a_opp, feat_params)
+        # 对手动作：训练对手必须是 JAX-native，保证 rollout 仍可 JIT。
+        if opponent_kind == "selfplay" or opponent_kind == "checkpoint":
+            opp_norm_state = opponent_normalizer_state if opponent_kind == "checkpoint" else ns
+            opp_model = opponent_model if opponent_kind == "checkpoint" else model
+            opp_feat_params = opponent_feat_params if opponent_kind == "checkpoint" else feat_params
+            opponent_actions = selfplay_policy_actions(
+                st,
+                opponent_params,
+                opp_model,
+                opp_norm_state,
+                opp_feat_params,
+                norm_params,
+                opp_key,
+                flip_state_fn=flip_state,
+                policy_sample_params_fn=policy_sample_params,
+                actions_from_decisions_fn=actions_from_decisions,
+            )
         else:
-            opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)  # 对手：最近敌方简单基线
+            opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
         joint = jnp.stack([learner_actions, opponent_actions], axis=1)  # 双方动作合并
         next_state = step_batch(st, joint, env_params)
         reward_env, reward_parts = reward_from_transition(st, next_state, learner_actions, reward_params)
+
+        # ── failed-capture 惩罚 ─────────────────────────────────────────────────
+        # 读出 window 步前在同一环形 slot 的发射记录
+        hist_slot = step_cnt % window
+        old_fire   = jax.lax.dynamic_index_in_dim(fire_hist,   hist_slot, axis=0, keepdims=False)  # [B, P]
+        old_target = jax.lax.dynamic_index_in_dim(target_hist, hist_slot, axis=0, keepdims=False)  # [B, P]
+        # 查当前目标星球 owner：planets [B, P_all, 7]，第 1 列 owner（0=player0, 1=player1）
+        # learner 是 player 0
+        cur_owner = st.planets[:, :, 1].astype(jnp.int32)   # [B, P_all]
+        # 把 old_target（候选 index，范围 0..max_planets）映射到 owner，slot 0（noop）对应 owner=-1
+        safe_target = jnp.clip(old_target, 0, max_planets - 1)
+        target_owner = jnp.take_along_axis(cur_owner, safe_target, axis=-1)  # [B, P]
+        is_noop_target = (old_target == 0)
+        # 判断失败：window 步前有发射 & 目标不是 noop & 目标现在不属于 player0
+        failed = old_fire & (~is_noop_target) & (target_owner != 0)   # [B, P]
+        source_mask_1d = encoded.source_mask   # [B, P] bool
+        failed = failed & source_mask_1d
+        failed_penalty = jnp.where(
+            use_failed_capture,
+            failed.astype(jnp.float32).sum(axis=-1) * reward_params.failed_capture_penalty,
+            0.0,
+        )  # [B]
+        reward_env = reward_env - failed_penalty
+
+        # 更新环形缓冲区（done 时清掉该 env 行，防止跨局污染）
+        done_env = next_state.done  # [B]
+        fire_hist_new   = fire_hist.at[hist_slot].set(jnp.where(done_env[:, None], False,  fire_2d))
+        target_hist_new = target_hist.at[hist_slot].set(jnp.where(done_env[:, None], 0,    target_2d))
+        step_cnt_new = step_cnt + 1
+        # ───────────────────────────────────────────────────────────────────────
+
         reward = jnp.repeat(reward_env[:, None], feat_params.max_planets, axis=1)  # 扩展到 P 维
         done = jnp.repeat(next_state.done[:, None], feat_params.max_planets, axis=1)
         reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
@@ -856,9 +1097,14 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             reward,
             done,
         )
-        return (ts, next_state, ns, key), row
+        return (ts, next_state, ns, key, fire_hist_new, target_hist_new, step_cnt_new), row
 
-    (train_state, state, normalizer_state, rng), rollout = jax.lax.scan(body, (train_state, state, normalizer_state, rollout_key), None, length=rollout_steps)
+    (train_state, state, normalizer_state, rng, _fh, _th, _sc), rollout = jax.lax.scan(
+        body,
+        (train_state, state, normalizer_state, rollout_key, fire_hist, target_hist, step_cnt),
+        None,
+        length=rollout_steps,
+    )
     last_raw_encoded = encode_batch(state, feat_params)
     last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
     last_out = train_state.apply_fn(
@@ -940,7 +1186,14 @@ def policy_sample(train_state, model, encoded, rng):
     amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
     amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
     amount = jax.random.categorical(rng_amount, amount_logits, axis=-1)
-    logp, _entropy = log_prob_entropy(out2, fire, target, amount, encoded.candidate_mask, encoded.amount_mask)
+    logp, _entropy, _entropy_fire, _entropy_target, _entropy_amount = log_prob_entropy(
+        out2,
+        fire,
+        target,
+        amount,
+        encoded.candidate_mask,
+        encoded.amount_mask,
+    )
     return fire, target, amount, logp, out1.value
 
 
@@ -1304,31 +1557,6 @@ def fleet_speed_local(ships):
     """根据舰数计算舰队速度：与 orbit_wars.py fleet_speed 完全一致。"""
     ratio = jnp.clip(jnp.log(jnp.maximum(ships, 1.0)) / jnp.log(1000.0), 0.0, 1.0)
     return jnp.minimum(1.0 + 5.0 * (ratio**1.5), 6.0)
-
-
-def nearest_opponent_actions(state, player: int, params: FeatureParams):
-    """生成对手简单基线动作：每颗 player 星球攻击最近敌方。"""
-    return jax.vmap(lambda planets, alive: _nearest_opponent_single(planets, alive, player, params))(state.planets, state.planet_alive)
-
-
-def _nearest_opponent_single(planets, alive, player: int, params: FeatureParams):
-    owner = planets[:, 1].astype(jnp.int32)
-    sources = alive & (owner == player)
-    targets = alive & (owner != player)
-    dx = planets[None, :, 2] - planets[:, None, 2]
-    dy = planets[None, :, 3] - planets[:, None, 3]
-    dist = jnp.sqrt(dx * dx + dy * dy)
-    masked_dist = jnp.where(targets[None, :] & (~jnp.eye(params.max_planets, dtype=bool)), dist, 1e9)
-    tgt_idx = jnp.argmin(masked_dist, axis=1)
-    tgt = planets[tgt_idx]
-    src = planets
-    ships = jnp.minimum(src[:, 5], jnp.maximum(tgt[:, 5] + 1.0, jnp.floor(src[:, 5] * 0.5)))
-    valid = sources & (src[:, 5] >= MIN_LAUNCH_LOCAL) & (masked_dist.min(axis=1) < 1e8)
-    angle = jnp.arctan2(tgt[:, 3] - src[:, 3], tgt[:, 2] - src[:, 2])
-    return jnp.stack([jnp.where(valid, src[:, 0], 0.0), jnp.where(valid, angle, 0.0), jnp.where(valid, ships, 0.0)], axis=-1)
-
-
-MIN_LAUNCH_LOCAL = 10.0
 
 
 def replace_done(state: EnvState, reset: EnvState) -> EnvState:

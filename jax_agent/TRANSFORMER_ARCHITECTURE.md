@@ -12,7 +12,7 @@ EnvState
   v
 encode_batch
   |
-  +-- self_features -------------------> self MLP --------+
+  +-- planet_features -------------------> self MLP --------+
   |                                                       |
   +-- global_features -----------------> global MLP ------+--> concat -> context
   |                                                       |              |
@@ -70,7 +70,7 @@ context ----------------------------------------------------------------+
 ```python
 def forward(encoded, selected_targets):
     # 1. 拆特征
-    self_f = encoded.self_features
+    self_f = encoded.planet_features
     global_f = encoded.global_features
     cand_f = encoded.candidate_features
     fleet_f = encoded.fleet_features
@@ -136,8 +136,8 @@ keys = Dense(planet_out)  ← 全局关系
 
 ### 路径分发
 ```
-self_features.ndim == 3  →  _forward_transformer_grouped  ← 训练主路径
-self_features.ndim == 2  →  _forward_transformer           ← 旧 per-source 路径（慢）
+planet_features.ndim == 3  →  _forward_transformer_grouped  ← 训练主路径
+planet_features.ndim == 2  →  _forward_transformer           ← 旧 per-source 路径（慢）
 use_transformer = False  →  _forward_legacy                ← 旧 MLP + pool + cross-attn
 ```
 
@@ -147,7 +147,7 @@ use_transformer = False  →  _forward_legacy                ← 旧 MLP + pool 
 
 | 字段 | 形状 | 说明 |
 |---|---|---|
-| `self_features` | `[B, P, 18]` | 源星球自身状态 + inbound 信息 |
+| `planet_features` | `[B, P, 18]` | 源星球自身状态 + inbound 信息 |
 | `candidate_features` | `[B, P, P+1, 26]` | 所有候选目标，slot 0 为 no-op |
 | `global_features` | `[B, P, 11]` | 全局态势，每 source 重复 |
 | `fleet_features` | `[B, P, K, 18]` | 舰队 token，per-state 共享（P 行相同） |
@@ -160,7 +160,7 @@ use_transformer = False  →  _forward_legacy                ← 旧 MLP + pool 
 
 ## 各特征含义
 
-### `self_features`：源星球自身特征
+### `planet_features`：源星球自身特征
 
 每个 source 星球一行，描述“我是谁、我现在强不强、我正承受什么压力”。
 

@@ -118,7 +118,7 @@ use_cnn: false
 每个我方星球作为一个 source，独立输出一行动作决策：
 
 ```text
-self_features      -> MLP -> self_h
+planet_features      -> MLP -> self_h
 candidate_features -> MLP -> cand_h
 global_features    -> MLP -> global_h
 

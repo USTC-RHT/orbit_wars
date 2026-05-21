@@ -15,7 +15,7 @@
 ### 1.1 想达成什么
 
 - **关系建模**：让每颗星球在编码阶段就能看到所有其他星球与所有相关舰队（self-attention）。
-- **舰队作为 first-class entity**：舰队作为独立 token 进入网络，而非被聚合成 `self_features` 中的若干标量。
+- **舰队作为 first-class entity**：舰队作为独立 token 进入网络，而非被聚合成 `planet_features` 中的若干标量。
 - **全局 critic**：用一个 CLS token 通过 attention 自适应聚合全局状态价值，替换当前的 `max+mean pool → value_head`。
 - **Pointer 选目标**：保留 cross-attention pointer，但 q/K 输入升级为 Transformer 输出后的 contextual embedding。
 
@@ -26,7 +26,7 @@
 1. **`PolicyOutput` 字段**：`fire_logits / target_logits / amount_logits / value` 名称、形状、语义不变。
 2. **`ActorCritic.__call__` 签名**：参数列表与现在完全一致：
    ```python
-   def __call__(self, self_features, candidate_features, global_features,
+   def __call__(self, planet_features, candidate_features, global_features,
                 candidate_mask, map_features=None, selected_targets=None)
    ```
    这样 `train_jax.policy_sample`、`policy_sample_params`、`ppo_jax.ppo_update_step` 都不需要改调用方。
@@ -138,7 +138,7 @@ MAX_FLEET_TOKENS = 32     # 进入网络的舰队 token 数（top-K by relevance
 
 ```python
 class EncodedBatch(NamedTuple):
-    self_features: jnp.ndarray
+    planet_features: jnp.ndarray
     candidate_features: jnp.ndarray
     global_features: jnp.ndarray
     map_features: jnp.ndarray
@@ -217,7 +217,7 @@ return features, sel_alive
 ```python
 def build_source_decision(state, src_idx, global_f, inbound, params):
     src = state.planets[src_idx]
-    self_f = build_self_features(state, src_idx, inbound, params)
+    self_f = build_planet_features(state, src_idx, inbound, params)
     cand_f, cand_mask, amount_mask, candidate_ids, ship_buckets = \
         build_candidate_features(state, src_idx, inbound, params)
     map_f = build_map_features(state, src_idx, params)
@@ -281,7 +281,7 @@ class TransformerEncoderLayer(nn.Module):
 
 ```python
 class ActorCritic(nn.Module):
-    self_dim: int
+    planet_dim: int
     candidate_dim: int
     global_dim: int
     candidate_count: int
@@ -304,12 +304,12 @@ class ActorCritic(nn.Module):
 
 ```python
 @nn.compact
-def __call__(self, self_features, candidate_features, global_features,
+def __call__(self, planet_features, candidate_features, global_features,
              candidate_mask, map_features=None, selected_targets=None,
              fleet_features=None, fleet_mask=None):
     if self.use_transformer:
         return self._forward_transformer(
-            self_features, candidate_features, global_features,
+            planet_features, candidate_features, global_features,
             candidate_mask, fleet_features, fleet_mask,
             map_features, selected_targets,
         )
@@ -320,10 +320,10 @@ def __call__(self, self_features, candidate_features, global_features,
 `_forward_transformer` 核心逻辑：
 
 ```python
-def _forward_transformer(self, self_features, cand_features, global_features,
+def _forward_transformer(self, planet_features, cand_features, global_features,
                           cand_mask, fleet_features, fleet_mask,
                           map_features, selected_targets):
-    B = self_features.shape[0]
+    B = planet_features.shape[0]
     H = self.hidden_size
     P = self.candidate_count                  # max_planets + 1（含 noop slot 0）
     K = self.max_fleet_tokens
@@ -366,11 +366,11 @@ def _forward_transformer(self, self_features, cand_features, global_features,
     # fleet_out = x[:, 1+P:, :]               # 不使用
 
     # 6) Context for per-source decision heads
-    self_h   = MLP(H)(self_features)          # [B, H]
+    self_h   = MLP(H)(planet_features)          # [B, H]
     global_h = MLP(H)(global_features)        # [B, H]
     # 当前 source planet 的 contextual embedding（src 在 batch 维已 vmap，slot 0 之后是 planet_idx+1）
     # 注意：现在的 vmap 把 source planet 摊平到 batch 维，每行对应一颗 source。
-    # 我们没法直接知道 src_idx → 用 self_features 的"is source"信号已编码在 self_h 里。
+    # 我们没法直接知道 src_idx → 用 planet_features 的"is source"信号已编码在 self_h 里。
     # 取 cls_out 作为全局 context 即可（足够）。
     context_h = jnp.concatenate([self_h, global_h, cls_out], axis=-1)  # [B, 3H]
 
@@ -429,7 +429,7 @@ def _forward_transformer(self, self_features, cand_features, global_features,
 ```python
 out1 = model.apply(
     {"params": params},
-    flat.self_features, flat.candidate_features, flat.global_features,
+    flat.planet_features, flat.candidate_features, flat.global_features,
     flat.candidate_mask, flat.map_features, zeros,
     fleet_features=flat.fleet_features,   # 新增
     fleet_mask=flat.fleet_mask,           # 新增
@@ -442,7 +442,7 @@ out1 = model.apply(
 
 ```python
 model = ActorCritic(
-    self_dim=SELF_DIM,
+    planet_dim=PLANET_DIM,
     candidate_dim=CANDIDATE_DIM,
     global_dim=GLOBAL_DIM,
     candidate_count=feat_params.max_planets + 1,
@@ -501,7 +501,7 @@ data = {
 ```python
 action_outputs = train_state.apply_fn(
     {"params": params},
-    batch["self_features"],
+    batch["planet_features"],
     batch["candidate_features"],
     batch["global_features"],
     batch["candidate_mask"],
@@ -603,7 +603,7 @@ model:
 
 ## 11. 后续可选优化（不在本次范围）
 
-- **Per-source planet token 替换**：当前 src 信息走 `self_features → MLP`。可改为直接取 `planet_out[src_idx]` 作为 src embedding（需要 features 层把 src_idx 传到模型，或在 vmap 外做）。
+- **Per-source planet token 替换**：当前 src 信息走 `planet_features → MLP`。可改为直接取 `planet_out[src_idx]` 作为 src embedding（需要 features 层把 src_idx 传到模型，或在 vmap 外做）。
 - **Fleet-as-target**：游戏不允许直接打舰队，但可以加一个辅助 head 预测"哪支敌方舰队最威胁"，作为 auxiliary loss 帮助 representation 学习。
 - **Centralized critic**：critic 改为看双方完整状态（去对称、看 enemy planet 详情），actor 仍只看己方。
 - **RoPE / 相对位置**：把星球间相对距离作为 attention bias，进一步增强空间感知。

@@ -62,6 +62,9 @@ class ModelConfig:
     hidden_size: int = 128
     use_cnn: bool = False
     use_transformer: bool = False
+    actor_type: str = "per_source"
+    max_action_tokens: int = 16
+    end_bias_init: float = -2.0
     num_transformer_layers: int = 2
     num_heads: int = 4
     max_fleet_tokens: int = 32
@@ -82,6 +85,8 @@ class EvalConfig:
 
     enabled: bool = True
     every: int = 100
+    nearest_every: int = 0    # nearest 专属间隔（0 = 跟随 every）
+    slow_every: int = 0       # 外部脚本对手间隔（0 = 跟随 every）
     games: int = 20
     seed: int = 100000
     opponents: list[str] = field(default_factory=lambda: ["nearest", "sigma", "tamrazov"])

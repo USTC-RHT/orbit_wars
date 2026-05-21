@@ -1,104 +1,258 @@
-# RL Feature Definitions
+# RL 特征定义
 
-`src/features.py` exposes three fixed input sizes:
+`jax_agent/features_jax.py` 当前训练使用的特征维度：
 
 ```python
-SELF_DIM = 18
-CANDIDATE_DIM = 25
+PLANET_DIM = 26
+RELATIVE_DIM = 8
 GLOBAL_DIM = 11
+FLEET_DIM = 28
+MAP_CHANNELS = 6
+MAP_GRID_SIZE = 8
 ```
 
-## self_features
-
-One row per owned source planet.
+`encode_batch(state, params)` 返回一个 `EncodedBatch`：
 
 ```python
-# 0  bias: 固定 1.0，给 MLP 一个常量偏置输入。
-# 1  src_x: 来源星球 x 坐标 / board_size。
-# 2  src_y: 来源星球 y 坐标 / board_size。
-# 3  src_radius: 来源星球半径 / 5.0。
-# 4  src_ships: 来源星球当前船数 / max_ships。
-# 5  src_production: 来源星球产量 / max_production。
-# 6  src_is_rotating: 来源星球是否在内圈旋转轨道。
-# 7  src_dist_to_sun: 来源星球到太阳中心距离 / board_size。
-# 8  my_planet_count: 我方星球数量 / max_planets。
-# 9  enemy_planet_count: 敌方星球数量 / max_planets。
-# 10 my_total_ships_on_planets: 我方星球上总船数归一化。
-# 11 fleet_pressure: 敌方飞行中船数 - 我方飞行中船数，归一化。
-# ---- inbound 特征（预测未来 60 步击中 source 星球的舰队）----
-# 12 my_inbound_ships: 我方增援舰队总船数 / max_ships。
-# 13 enemy_inbound_ships: 敌方来袭舰队总船数 / max_ships。
-# 14 my_inbound_eta_min: 我方最早到达 ETA / horizon，无则为 1。
-# 15 my_inbound_eta_mean: 我方到达 ETA 平均 / horizon，无则为 1。
-# 16 enemy_inbound_eta_min: 敌方最早到达 ETA / horizon，无则为 1。
-# 17 enemy_inbound_eta_mean: 敌方到达 ETA 平均 / horizon，无则为 1。
+planet_features    # [B, P, 26]
+relative_features  # [B, P, P + 1, 8]
+global_features    # [B, P, 11]
+map_features       # [B, P, 6, 8, 8]
+candidate_mask     # [B, P, P + 1]
+amount_mask        # [B, P, P + 1, ship_bucket_count]
+source_ids         # [B, P]
+source_ships       # [B, P]
+candidate_ids      # [B, P, P + 1]
+ship_buckets       # [B, P, ship_bucket_count]
+source_mask        # [B, P]
+fleet_features     # [B, P, max_fleet_tokens, 28]
+fleet_mask         # [B, P, max_fleet_tokens]
 ```
 
-## candidate_features
-
-`slot 0` is no-op; `slot 1..max_planets` are current planets sorted by id. Empty slots are zero padding.
+基础约定：
 
 ```python
-# 0  is_noop: 这个槽位是否是不发兵动作。
-# 1  is_planet: 这个槽位是否是真实星球；padding 槽位为 0。
-# 2  is_source: 这个槽位是否就是当前来源星球自己。
-# 3  is_neutral: 目标是否中立。
-# 4  is_friend: 目标是否我方其它星球，不包括 source 自己。
-# 5  is_enemy: 目标是否敌方星球。
-# 6  tgt_x: 目标 x 坐标 / board_size。
-# 7  tgt_y: 目标 y 坐标 / board_size。
-# 8  dx_to_src: 目标 x - 来源 x，再除以 board_size。
-# 9  dy_to_src: 目标 y - 来源 y，再除以 board_size。
-# 10 dist_to_src: 来源到目标距离 / board_size。
-# 11 tgt_radius: 目标半径 / 5.0。
-# 12 tgt_ships: 目标当前船数 / max_ships。
-# 13 tgt_production: 目标产量 / max_production。
-# 14 tgt_is_rotating: 目标是否是普通旋转星球。
-# 15 tgt_is_comet: 目标是否是彗星。
-# 16 target_ship_ratio: (目标船数 + 1) / 来源船数，用于估算攻占压力。
-# 17 src_ships_again: 来源船数 / max_ships，让目标编码也知道本次发兵能力。
-# ---- inbound 特征（预测未来 60 步到达该目标的舰队）----
-# 18 my_inbound_ships: 我方舰队总船数 / max_ships。
-# 19 enemy_inbound_ships: 敌方舰队总船数 / max_ships。
-# 20 my_inbound_eta_min: 我方最早到达 ETA / horizon，无则为 1。
-# 21 my_inbound_eta_mean: 我方到达 ETA 平均 / horizon，无则为 1。
-# 22 enemy_inbound_eta_min: 敌方最早到达 ETA / horizon，无则为 1。
-# 23 enemy_inbound_eta_mean: 敌方到达 ETA 平均 / horizon，无则为 1。
-# 24 proto_score: Proto-V15 公式得分 / 100，给网络一个手工设计的目标价值参考信号。
+# 训练和模型内部统一从 learner 视角看局面，learner 永远是 owner == 0。
+# source_mask 是唯一可靠的 source 合法性 mask：
+#   source_mask = planet_alive & (owner == 0)
+#
+# candidate slot 0 是 no-op。
+# candidate slot i + 1 对应 planet slot i。
+#
+# relative_features 只保存 source-target 相对关系；target 的绝对属性在 planet_features 里。
 ```
 
-`proto_score` uses:
+## planet_features
 
-```text
-score = (100 - dist) + (15 * production) + (10 * enemy_bonus) - (0.7 * total_ships) - (2 * eta)
+`planet_features` 是每个 planet slot 的统一星球特征，会为所有星球槽位构建，
+包括我方、中立、敌方和 padding/dead 星球。当前 autoregressive Transformer 的星球
+token 直接来自这组特征；`relative_features` 只用于 target/amount 的 source-target 相对关系。
+
+```python
+# 0  is_planet: 固定为 1.0，占位标记。
+# 1  is_alive: 星球是否存活。
+# 2  is_neutral: 星球是否为中立。
+# 3  is_mine: 星球是否属于我方 learner。
+# 4  is_enemy: 星球是否属于敌方。
+# 5  x: 星球 x 坐标 / BOARD_SIZE。
+# 6  y: 星球 y 坐标 / BOARD_SIZE。
+# 7  radius: 星球半径 / 5.0。
+# 8  ships: clip01(星球当前船数 / max_ships)。
+# 9  production: 星球生产力 / max_production。
+# 10 is_static_planet: 静止星球。
+# 11 is_rotating_planet: 普通旋转星球，不含彗星。
+# 12 is_comet_planet: 彗星星球。
+# 13 dist_to_sun: 星球到太阳中心距离 / BOARD_SIZE。
+#
+# 局部拓扑特征，所有星球都会计算，包括我方/敌方/中立星球：
+# 14 nearest_my_planet_dist: 最近我方星球距离 / BOARD_SIZE；没有则为 1。
+# 15 nearest_enemy_planet_dist: 最近敌方星球距离 / BOARD_SIZE；没有则为 1。
+# 16 nearest_neutral_planet_dist: 最近中立星球距离 / BOARD_SIZE；没有则为 1。
+# 17 near_my_planet_count_r25: R=25 内我方星球数量 / max_planets。
+# 18 near_enemy_planet_count_r25: R=25 内敌方星球数量 / max_planets。
+# 19 near_neutral_planet_count_r25: R=25 内中立星球数量 / max_planets。
+#
+# 飞向该星球的 inbound 特征：
+# 20 inbound_my_ships: 预计飞向该星球的我方船数 / max_ships。
+# 21 inbound_enemy_ships: 预计飞向该星球的敌方船数 / max_ships。
+# 22 inbound_my_eta_min: 我方 inbound 最短 ETA / INBOUND_HORIZON；没有则为 1。
+# 23 inbound_my_eta_mean: 我方 inbound 平均 ETA / INBOUND_HORIZON；没有则为 1。
+# 24 inbound_enemy_eta_min: 敌方 inbound 最短 ETA / INBOUND_HORIZON；没有则为 1。
+# 25 inbound_enemy_eta_mean: 敌方 inbound 平均 ETA / INBOUND_HORIZON；没有则为 1。
 ```
 
-The model still only chooses target and ship bucket. `src/opponents.py` calls `src/physics.py` to compute the actual angle, ETA, and collision-valid route.
+## relative_features
+
+`relative_features[b, src, tgt, :]` 描述“从某个 source 看某个 target”的关系。
+`tgt=0` 是 no-op，`tgt=i+1` 对应 planet slot `i`。
+
+```python
+# 0  is_source: target 是否就是当前 source 自己。
+# 1  dx: (target.x - source.x) / BOARD_SIZE。
+# 2  dy: (target.y - source.y) / BOARD_SIZE。
+# 3  dist: source 到 target 的距离 / BOARD_SIZE。
+# 4  target_ship_ratio: clip01((target 船数 + 1) / max(source 船数, 1))。
+# 5  source_ships: clip01(source 船数 / max_ships)，复制到每个 target 行。
+# 6  proto_score: Proto-style 目标评分 / 100.0。
+# 7  eta_max_bucket: 使用最大派兵档速度估算的 ETA / INBOUND_HORIZON。
+```
+
+`proto_score` 只是软提示，不是硬规则。actor 最终仍然通过 policy logits 选择 source、target 和 amount。
 
 ## global_features
 
-Repeated for each source planet in the same turn.
+同一个 state 下，`global_features` 会复制到每个 source 行。
 
 ```python
 # 0  game_progress: 当前 step / episode_steps。
-# 1  angular_velocity: 旋转星球角速度 / 0.05。角速度决定未来位置。
-# 2  my_planet_count: 我方星球数量 / max_planets。
-# 3  enemy_planet_count: 敌方星球数量 / max_planets。
-# 4  neutral_planet_count: 中立星球数量 / max_planets。
-# 5  my_ships_on_planets: 我方星球上总船数归一化。
-# 6  enemy_ships_on_planets: 敌方星球上总船数归一化。
-# 7  my_ships_in_fleets: 我方飞行中舰队总船数归一化。
-# 8  enemy_ships_in_fleets: 敌方飞行中舰队总船数归一化。
-# 9  my_total_production: 我方总产量归一化。
-# 10 enemy_total_production: 敌方总产量归一化。
+# 1  angular_velocity: 星球角速度 / 0.05。
+# 2  my_planet_count: 我方存活星球数 / max_planets。
+# 3  enemy_planet_count: 敌方存活星球数 / max_planets。
+# 4  neutral_planet_count: 中立存活星球数 / max_planets。
+# 5  my_ships_on_planets: 我方星球总船数，归一化。
+# 6  enemy_ships_on_planets: 敌方星球总船数，归一化。
+# 7  my_ships_in_fleets: 我方飞行舰队总船数，归一化。
+# 8  enemy_ships_in_fleets: 敌方飞行舰队总船数，归一化。
+# 9  my_total_production: 我方总生产力 / (max_planets * max_production)。
+# 10 enemy_total_production: 敌方总生产力 / (max_planets * max_production)。
 ```
+
+## fleet_features
+
+`fleet_features` 保留 top-K 飞行舰队作为 Transformer token。
+当前实现是 per-state top-K，然后复制到 source 维；不是每个 source 单独筛一遍。
+
+舰队排序规则：
+
+```text
+sort_key = -ships + 0.01 * dist_to_center
+```
+
+也就是优先保留大舰队。
+
+```python
+# 0  is_my_fleet: 舰队是否属于我方。
+# 1  fleet_x: 舰队 x 坐标 / BOARD_SIZE。
+# 2  fleet_y: 舰队 y 坐标 / BOARD_SIZE。
+# 3  cos_angle: 舰队飞行角度的 cos。
+# 4  sin_angle: 舰队飞行角度的 sin。
+# 5  fleet_ships: clip01(舰队船数 / max_ships)。
+# 6  fleet_speed: 舰队速度 / 6.0。
+# 7  launch_age: 估算已飞行时间 / episode_steps。
+# 8  from_x: 来源星球 x 坐标 / BOARD_SIZE。
+# 9  from_y: 来源星球 y 坐标 / BOARD_SIZE。
+# 10 from_is_mine: 来源星球当前是否属于我方。
+# 11 from_ships: clip01(来源星球当前船数 / max_ships)。
+# 12 dist_from_origin: 舰队离来源星球的距离 / BOARD_SIZE。
+# 13 nearest_enemy_planet_dist: 到最近敌方星球距离 / BOARD_SIZE。
+# 14 nearest_neutral_planet_dist: 到最近中立星球距离 / BOARD_SIZE。
+# 15 nearest_my_planet_dist: 到最近我方星球距离 / BOARD_SIZE。
+# 16 target_valid: 未来 INBOUND_HORIZON 步内是否预测会命中某个存活星球。
+# 17 target_is_mine: 预测目标当前是否属于我方；target_valid=0 时为 0。
+# 18 target_is_enemy: 预测目标当前是否属于敌方；target_valid=0 时为 0。
+# 19 target_is_neutral: 预测目标当前是否为中立；target_valid=0 时为 0。
+# 20 target_x: 预测目标当前 x 坐标 / BOARD_SIZE；target_valid=0 时为 0。
+# 21 target_y: 预测目标当前 y 坐标 / BOARD_SIZE；target_valid=0 时为 0。
+# 22 target_ships: clip01(预测目标当前船数 / max_ships)；target_valid=0 时为 0。
+# 23 target_production: 预测目标生产力 / max_production；target_valid=0 时为 0。
+# 24 target_dx: (target.x - fleet.x) / BOARD_SIZE；target_valid=0 时为 0。
+# 25 target_dy: (target.y - fleet.y) / BOARD_SIZE；target_valid=0 时为 0。
+# 26 target_dist: 舰队到预测目标当前距离 / BOARD_SIZE；target_valid=0 时为 0。
+# 27 target_eta: 预测命中时间 / INBOUND_HORIZON；target_valid=0 时为 0。
+```
+
+`fleet_mask` 标记哪些 fleet token 有效。无效 token 的特征全为 0。
+
+`target_valid` 使用与 inbound 统计相同的轨迹预测：沿舰队当前方向向前模拟
+`INBOUND_HORIZON=60` 步，取最先碰撞的存活星球。若 60 步内没有有效命中，
+目标相关维度全部置 0。
+
+## map_features
+
+`map_features[b, src]` 是 8x8 的 source 视角小地图，当前主要给 autoregressive actor
+的 source 选择 CNN 分支使用。
+
+```python
+# channel 0 source_planet: 当前 source 星球所在格子。
+# channel 1 my_planets: 我方非 source 星球。
+# channel 2 enemy_planets: 敌方星球。
+# channel 3 neutral_planets: 中立星球。
+# channel 4 my_ships: 我方飞行舰队船数强度，累加 clip01(ships / max_ships)。
+# channel 5 enemy_ships: 敌方飞行舰队船数强度，累加 clip01(ships / max_ships)。
+```
+
+星球通道写入 `1.0`。飞船强度通道按格子累加归一化船数，并 clip 到 `[0, 1]`。
+
+## Masks
+
+```python
+# source_mask[src]:
+#   planet slot src 存活，且 owner == 0 时为 True。
+#
+# candidate_mask[src, tgt]:
+#   slot 0 no-op 永远为 True。
+#   真实 target 必须存活。
+#   target 不能是 source 自己。
+#   source 船数必须至少达到 MIN_LAUNCH。
+#   至少有一个 amount bucket 合法。
+#   如果开启 target_filter，则只保留 top attack 和 top defense candidates。
+#
+# amount_mask[src, tgt, bucket]:
+#   no-op 允许所有 bucket。
+#   友方 target 允许所有正数 bucket。
+#   中立/敌方 target 要求 bucket ships > target ships。
+#   如果 candidate_mask 为 False，所有 bucket 都为 False。
+```
+
+autoregressive 解码时，还会根据当前环境 step 内该 source 的剩余可用船数，对 amount 做动态 mask。
+
+## ship_buckets
+
+默认派兵比例档位：
+
+```python
+SHIP_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+```
+
+低于 `MIN_LAUNCH = 10` 的 bucket 会被视为 0/非法。实际 bucket 数量由 `ship_bucket_count` 控制。
 
 ## inbound collision features
 
-`precompute_inbound()` uses `INBOUND_HORIZON = 60` and assigns each fleet only to its first collision target.
+`precompute_inbound()` 使用 `INBOUND_HORIZON = 60`，并把每支舰队分配给预测中第一个会碰撞的目标。
 
 ```python
-# 1. 舰队移动阶段：fleet[t-1] -> fleet[t] 线段撞 planet[t-1]。
-# 2. 星球 sweep 阶段：planet[t-1] -> planet[t] 线段扫过 fleet[t]。
-# 3. 同一 tick 内，舰队移动碰撞早于星球 sweep 碰撞。
+# 1. 舰队移动碰撞：
+#    fleet[t-1] -> fleet[t] 线段检测 planet[t-1]。
+#
+# 2. 星球 sweep 碰撞：
+#    planet[t-1] -> planet[t] 线段检测 fleet[t]。
+#
+# 3. 同一个 tick 内，先检查舰队移动碰撞，再检查星球 sweep 碰撞。
+```
+
+## 模型使用方式
+
+当前 autoregressive actor 大致这样使用特征：
+
+```python
+# State encoder:
+#   planet tokens = planet_features，前面补一个 no-op token 后进入 Transformer
+#   fleet tokens  = fleet_features[:, 0]
+#   global ctx    = MLP(global_features[:, 0])
+#
+# Source selection:
+#   使用 Transformer planet keys + source CNN map_features + source_mask。
+#
+# Target selection:
+#   使用已选 source、planet tokens、relative_features、candidate_mask。
+#
+# Amount selection:
+#   使用已选 source、已选 target、amount_mask，以及动态剩余船数 mask。
+```
+
+重要易错点：
+
+```python
+# source 合法性永远使用 source_mask。
+# target 绝对属性永远看 planet_features / planet_out，不再从 relative_features 里取。
 ```

@@ -39,13 +39,20 @@ def load_checkpoint_opponent(path: str | Path) -> CheckpointOpponent:
         ckpt = pickle.load(f)
 
     cfg = ckpt["cfg"]
+    normalizer_state = ckpt["normalizer_state"]
     feat_params = FeatureParams.from_train_config(cfg)
     model_cfg = cfg.model
+    # Infer feature widths from the checkpoint normalizer so checkpoints from
+    # older and current feature layouts instantiate matching model shapes.
+    norm_width = int(normalizer_state.planet_mean.shape[0])
+    planet_dim = {16: 18, 12: 14, 18: 26}.get(norm_width, norm_width)
+    relative_width = int(normalizer_state.relative_mean.shape[0])
+    relative_dim = {18: 26, 7: 8}.get(relative_width, relative_width)
     model = ActorCritic(
-        self_dim=18,
-        candidate_dim=26,
+        planet_dim=planet_dim,
+        relative_dim=relative_dim,
         global_dim=11,
-        candidate_count=cfg.env.max_planets + 1,
+        relative_count=cfg.env.max_planets + 1,
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=model_cfg.hidden_size,
         use_cnn=getattr(model_cfg, "use_cnn", False),
@@ -59,7 +66,7 @@ def load_checkpoint_opponent(path: str | Path) -> CheckpointOpponent:
         path=ckpt_path,
         update=ckpt.get("update"),
         params=ckpt["params"],
-        normalizer_state=ckpt["normalizer_state"],
+        normalizer_state=normalizer_state,
         cfg=cfg,
         feat_params=feat_params,
         model=model,

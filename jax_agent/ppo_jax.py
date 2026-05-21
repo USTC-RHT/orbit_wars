@@ -55,8 +55,8 @@ class PPOParams:
 
 class Rollout(NamedTuple):
     """单步 rollout 数据，層叠后形状为 [T, B, P, ...]。"""
-    self_features: jnp.ndarray      # [T, B, P, SELF_DIM]
-    candidate_features: jnp.ndarray # [T, B, P, P+1, CAND_DIM]
+    planet_features: jnp.ndarray      # [T, B, P, PLANET_DIM]
+    relative_features: jnp.ndarray # [T, B, P, P+1, CAND_DIM]
     global_features: jnp.ndarray    # [T, B, P, GLOBAL_DIM]
     map_features: jnp.ndarray       # [T, B, P, C, H, W]
     fleet_features: jnp.ndarray     # [T, B, P, K, FLEET_DIM]
@@ -72,6 +72,34 @@ class Rollout(NamedTuple):
     old_value: jnp.ndarray          # [T, B, P] 采样时记录的价值估计
     reward: jnp.ndarray             # [T, B, P] 每步奖励
     done: jnp.ndarray               # [T, B, P] 是否终局
+
+
+class AutoRollout(NamedTuple):
+    """Autoregressive rollout data, stacked as [T, B, ...]."""
+    planet_features: jnp.ndarray
+    relative_features: jnp.ndarray
+    global_features: jnp.ndarray
+    map_features: jnp.ndarray
+    fleet_features: jnp.ndarray
+    fleet_mask: jnp.ndarray
+    candidate_mask: jnp.ndarray
+    amount_mask: jnp.ndarray
+    source_mask: jnp.ndarray
+    initial_ships: jnp.ndarray
+    end_action: jnp.ndarray
+    src_action: jnp.ndarray
+    tgt_action: jnp.ndarray
+    amt_action: jnp.ndarray
+    executed: jnp.ndarray
+    invalid: jnp.ndarray
+    old_logp_end: jnp.ndarray
+    old_logp_src: jnp.ndarray
+    old_logp_tgt: jnp.ndarray
+    old_logp_amt: jnp.ndarray
+    token_valid: jnp.ndarray
+    old_value: jnp.ndarray
+    reward: jnp.ndarray
+    done: jnp.ndarray
 
 
 def make_lr_schedule(
@@ -121,12 +149,49 @@ def make_train_state(
 ) -> TrainState:
     variables = model.init(
         rng,
-        sample_batch.self_features,
-        sample_batch.candidate_features,
+        sample_batch.planet_features,
+        sample_batch.relative_features,
         sample_batch.global_features,
         sample_batch.candidate_mask,
         sample_batch.map_features,
-        jnp.zeros(sample_batch.self_features.shape[:-1], dtype=jnp.int32),
+        jnp.zeros(sample_batch.planet_features.shape[:-1], dtype=jnp.int32),
+        fleet_features=sample_batch.fleet_features,
+        fleet_mask=sample_batch.fleet_mask,
+    )
+    lr_schedule = make_lr_schedule(lr, total_steps, lr_schedule, warmup_steps, min_lr_ratio)
+    tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.adam(lr_schedule))
+    return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
+
+
+def make_auto_train_state(
+    rng,
+    model,
+    sample_batch,
+    lr: float,
+    max_grad_norm: float,
+    max_action_tokens: int,
+    lr_schedule: str = "constant",
+    total_steps: int = 0,
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.0,
+) -> TrainState:
+    b = sample_batch.planet_features.shape[0]
+    k = max_action_tokens
+    variables = model.init(
+        rng,
+        sample_batch.planet_features,
+        sample_batch.relative_features,
+        sample_batch.global_features,
+        sample_batch.candidate_mask,
+        sample_batch.amount_mask,
+        sample_batch.source_mask,
+        jnp.zeros((b, k), dtype=bool),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=bool),
+        jnp.concatenate([jnp.zeros((b, 1), dtype=sample_batch.source_ships.dtype), sample_batch.source_ships], axis=1),
+        map_features=sample_batch.map_features,
         fleet_features=sample_batch.fleet_features,
         fleet_mask=sample_batch.fleet_mask,
     )
@@ -191,6 +256,11 @@ def compute_gae(rewards, dones, values, last_values, params: PPOParams):
     advantages = adv_rev[::-1]
     returns = advantages + values
     return returns, advantages
+
+
+def compute_gae_state(rewards, dones, values, last_values, params: PPOParams):
+    """State-level GAE for autoregressive actor: tensors are [T, B]."""
+    return compute_gae(rewards, dones, values, last_values, params)
 
 
 @partial(jax.jit, static_argnames=("params",))
@@ -258,14 +328,83 @@ def ppo_update(train_state: TrainState, rollout: Rollout, returns, advantages, p
     return train_state, metrics
 
 
+@partial(jax.jit, static_argnames=("params", "max_action_tokens"))
+def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, advantages, params: PPOParams, rng, max_action_tokens: int, ent_scale=1.0):
+    """PPO update for autoregressive state-level rollouts."""
+    flat = flatten_auto_rollout(rollout, returns, advantages)
+    size = flat["source_mask"].shape[0]
+    states_per_minibatch = min(max(params.minibatch_size, 1), size)
+    num_minibatches = max(size // states_per_minibatch, 1)
+    keys = [
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "entropy_end",
+        "entropy_src",
+        "entropy_tgt",
+        "entropy_amt",
+        "approx_kl",
+        "clipfrac",
+        "max_abs_log_ratio",
+        "max_abs_log_ratio_end",
+        "max_abs_log_ratio_src",
+        "max_abs_log_ratio_tgt",
+        "max_abs_log_ratio_amt",
+        "invalid_action_rate",
+        "executed_action_rate",
+        "seq_len_mean",
+    ]
+
+    def run_epoch(ts, rng_in):
+        rng_in, rng_perm = jax.random.split(rng_in)
+        order = jax.random.permutation(rng_perm, size)
+
+        def mb_body(i, mb_carry):
+            ts2, acc = mb_carry
+            idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
+            batch = {k: v[idx] for k, v in flat.items()}
+            ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
+            return ts2, {k: acc[k] + metrics[k] for k in acc}
+
+        init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
+        ts, sums = jax.lax.fori_loop(0, num_minibatches, mb_body, (ts, init_acc))
+        means = {k: sums[k] / num_minibatches for k in sums}
+        return ts, rng_in, means
+
+    def cond_fn(carry):
+        completed, _ts, _rng, _acc, last_kl = carry
+        under_epoch_limit = completed < params.epochs
+        kl_ok = (params.target_kl <= 0.0) | (completed == 0) | (last_kl <= 1.5 * params.target_kl)
+        return under_epoch_limit & kl_ok
+
+    def body_fn(carry):
+        completed, ts, rng_in, acc, _last_kl = carry
+        ts, rng_in, epoch_metrics = run_epoch(ts, rng_in)
+        acc = {k: acc[k] + epoch_metrics[k] for k in keys}
+        completed = completed + 1
+        return completed, ts, rng_in, acc, epoch_metrics["approx_kl"]
+
+    init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
+    completed, train_state, rng, metrics_acc, _ = jax.lax.while_loop(
+        cond_fn,
+        body_fn,
+        (jnp.array(0, dtype=jnp.int32), train_state, rng, init_acc, jnp.array(0.0, dtype=jnp.float32)),
+    )
+    denom = jnp.maximum(completed.astype(jnp.float32), 1.0)
+    metrics = {k: metrics_acc[k] / denom for k in metrics_acc}
+    metrics["n_epochs_run"] = completed.astype(jnp.float32)
+    return train_state, metrics
+
+
 def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams, ent_scale=1.0):
     """单个 minibatch 梯度更新。"""
     def loss_fn(model_params):
         zero_target = jnp.zeros_like(batch["target"])
         value_outputs = train_state.apply_fn(
             {"params": model_params},
-            batch["self_features"],
-            batch["candidate_features"],
+            batch["planet_features"],
+            batch["relative_features"],
             batch["global_features"],
             batch["candidate_mask"],
             batch["map_features"],
@@ -275,8 +414,8 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
         )
         action_outputs = train_state.apply_fn(
             {"params": model_params},
-            batch["self_features"],
-            batch["candidate_features"],
+            batch["planet_features"],
+            batch["relative_features"],
             batch["global_features"],
             batch["candidate_mask"],
             batch["map_features"],
@@ -355,6 +494,122 @@ def update_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], par
     return train_state.apply_gradients(grads=grads), metrics
 
 
+def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams, ent_scale=1.0):
+    """Single minibatch PPO update for autoregressive actor."""
+
+    def loss_fn(model_params):
+        outputs = train_state.apply_fn(
+            {"params": model_params},
+            batch["planet_features"],
+            batch["relative_features"],
+            batch["global_features"],
+            batch["candidate_mask"],
+            batch["amount_mask"],
+            batch["source_mask"],
+            batch["end_action"],
+            batch["src_action"],
+            batch["tgt_action"],
+            batch["amt_action"],
+            batch["executed"],
+            batch["initial_ships"],
+            map_features=batch["map_features"],
+            fleet_features=batch["fleet_features"],
+            fleet_mask=batch["fleet_mask"],
+        )
+        end_logp = bernoulli_log_prob(outputs.end_logits, batch["end_action"])
+        src_logits = safe_logits(outputs.src_logits)
+        tgt_logits = safe_logits(outputs.tgt_logits)
+        amt_logits = safe_logits(outputs.amount_logits)
+        src_logp = categorical_log_prob(src_logits, batch["src_action"])
+        tgt_logp = categorical_log_prob(tgt_logits, batch["tgt_action"])
+        amt_logp = categorical_log_prob(amt_logits, batch["amt_action"])
+
+        token_valid = batch["token_valid"].astype(jnp.float32)
+        end_mask = token_valid
+        arg_mask = batch["executed"].astype(jnp.float32)
+        adv = batch["advantages"]
+        if params.norm_adv:
+            adv_mean = adv.mean()
+            adv = (adv - adv_mean) / (adv.std() + 1e-8)
+        adv_k = adv[:, None]
+
+        def token_loss(new_logp, old_logp, mask):
+            raw_lr = jnp.where(mask > 0.0, new_logp - old_logp, 0.0)
+            lr = jnp.clip(raw_lr, -5.0, jnp.log(jnp.array(10.0, dtype=jnp.float32)))
+            ratio = jnp.exp(lr)
+            pg1 = adv_k * ratio
+            pg2 = adv_k * jnp.clip(ratio, 1.0 - params.clip_coef, 1.0 + params.clip_coef)
+            denom = jnp.maximum(mask.sum(), 1.0)
+            loss = -(jnp.minimum(pg1, pg2) * mask).sum() / denom
+            kl = (((ratio - 1.0) - lr) * mask).sum() / denom
+            clipfrac = (((jnp.abs(ratio - 1.0) > params.clip_coef).astype(jnp.float32)) * mask).sum() / denom
+            max_abs = (jnp.abs(raw_lr) * mask).max()
+            return loss, kl, clipfrac, max_abs
+
+        l_end, kl_end, cf_end, mr_end = token_loss(end_logp, batch["old_logp_end"], end_mask)
+        l_src, kl_src, cf_src, mr_src = token_loss(src_logp, batch["old_logp_src"], arg_mask)
+        l_tgt, kl_tgt, cf_tgt, mr_tgt = token_loss(tgt_logp, batch["old_logp_tgt"], arg_mask)
+        l_amt, kl_amt, cf_amt, mr_amt = token_loss(amt_logp, batch["old_logp_amt"], arg_mask)
+        policy_loss = (l_end + l_src + l_tgt + l_amt) / 4.0
+
+        value = _assert_all_finite("ppo_auto/value", outputs.value)
+        value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
+        value_loss = jnp.square(batch["returns"] - value_pred).mean()
+
+        ent_end = _fire_entropy(outputs.end_logits)
+        ent_src = categorical_entropy(src_logits)
+        ent_tgt = categorical_entropy(tgt_logits)
+        ent_amt = categorical_entropy(amt_logits)
+        end_denom = jnp.maximum(end_mask.sum(), 1.0)
+        arg_denom = jnp.maximum(arg_mask.sum(), 1.0)
+        entropy_end = (ent_end * end_mask).sum() / end_denom
+        entropy_src = (ent_src * arg_mask).sum() / arg_denom
+        entropy_tgt = (ent_tgt * arg_mask).sum() / arg_denom
+        entropy_amt = (ent_amt * arg_mask).sum() / arg_denom
+        entropy = entropy_end + entropy_src + entropy_tgt + entropy_amt
+        entropy_bonus = ent_scale * (
+            params.ent_coef_fire * entropy_end
+            + params.ent_coef_target * entropy_tgt
+            + params.ent_coef_amount * entropy_amt
+            + params.ent_coef * entropy_src
+        )
+        loss = policy_loss + params.vf_coef * value_loss - entropy_bonus
+        loss = _assert_all_finite("ppo_auto/loss", loss)
+        approx_kl = (kl_end + kl_src + kl_tgt + kl_amt) / 4.0
+        clipfrac = (cf_end + cf_src + cf_tgt + cf_amt) / 4.0
+        max_abs_log_ratio = jnp.maximum(jnp.maximum(mr_end, mr_src), jnp.maximum(mr_tgt, mr_amt))
+        non_end = (batch["token_valid"] & (~batch["end_action"])).astype(jnp.float32)
+        non_end_denom = jnp.maximum(non_end.sum(), 1.0)
+        invalid_action_rate = (batch["invalid"].astype(jnp.float32) * non_end).sum() / non_end_denom
+        executed_action_rate = arg_mask.sum() / non_end_denom
+        seq_len_mean = non_end.sum(axis=-1).mean()
+        return loss, {
+            "loss": loss,
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy": entropy,
+            "entropy_end": entropy_end,
+            "entropy_src": entropy_src,
+            "entropy_tgt": entropy_tgt,
+            "entropy_amt": entropy_amt,
+            "approx_kl": approx_kl,
+            "clipfrac": clipfrac,
+            "max_abs_log_ratio": max_abs_log_ratio,
+            "max_abs_log_ratio_end": mr_end,
+            "max_abs_log_ratio_src": mr_src,
+            "max_abs_log_ratio_tgt": mr_tgt,
+            "max_abs_log_ratio_amt": mr_amt,
+            "invalid_action_rate": invalid_action_rate,
+            "executed_action_rate": executed_action_rate,
+            "seq_len_mean": seq_len_mean,
+        }
+
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
+    del loss
+    grads = jax.tree_util.tree_map(lambda g: _assert_all_finite("ppo_auto/grads", g), grads)
+    return train_state.apply_gradients(grads=grads), metrics
+
+
 def log_prob_entropy(outputs, fire, target, amount, candidate_mask, amount_mask):
     """计算联合对数概率和熵。
 
@@ -386,8 +641,8 @@ def flatten_rollout(rollout: Rollout, returns, advantages):
         return x.reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
 
     data = {
-        "self_features": flat(rollout.self_features),
-        "candidate_features": flat(rollout.candidate_features),
+        "planet_features": flat(rollout.planet_features),
+        "relative_features": flat(rollout.relative_features),
         "global_features": flat(rollout.global_features),
         "map_features": flat(rollout.map_features),
         "fleet_features": flat(rollout.fleet_features),
@@ -405,3 +660,35 @@ def flatten_rollout(rollout: Rollout, returns, advantages):
         "advantages": flat(advantages),
     }
     return data
+
+
+def flatten_auto_rollout(rollout: AutoRollout, returns, advantages):
+    def flat(x):
+        return x.reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
+
+    return {
+        "planet_features": flat(rollout.planet_features),
+        "relative_features": flat(rollout.relative_features),
+        "global_features": flat(rollout.global_features),
+        "map_features": flat(rollout.map_features),
+        "fleet_features": flat(rollout.fleet_features),
+        "fleet_mask": flat(rollout.fleet_mask),
+        "candidate_mask": flat(rollout.candidate_mask),
+        "amount_mask": flat(rollout.amount_mask),
+        "source_mask": flat(rollout.source_mask),
+        "initial_ships": flat(rollout.initial_ships),
+        "end_action": flat(rollout.end_action),
+        "src_action": flat(rollout.src_action),
+        "tgt_action": flat(rollout.tgt_action),
+        "amt_action": flat(rollout.amt_action),
+        "executed": flat(rollout.executed),
+        "invalid": flat(rollout.invalid),
+        "old_logp_end": flat(rollout.old_logp_end),
+        "old_logp_src": flat(rollout.old_logp_src),
+        "old_logp_tgt": flat(rollout.old_logp_tgt),
+        "old_logp_amt": flat(rollout.old_logp_amt),
+        "token_valid": flat(rollout.token_valid),
+        "old_value": flat(rollout.old_value),
+        "returns": flat(returns),
+        "advantages": flat(advantages),
+    }

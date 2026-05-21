@@ -55,9 +55,21 @@ from .fast_env import (  # noqa: E402
     step_batch,
 )
 from .features_jax import FLEET_DIM, FeatureParams, encode_batch, flatten_sources  # noqa: E402
-from .model_jax import ActorCritic  # noqa: E402
+from .model_jax import ActorCritic, AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
-from .ppo_jax import PPOParams, Rollout, compute_gae, log_prob_entropy, make_train_state, ppo_update, safe_logits  # noqa: E402
+from .ppo_jax import (
+    AutoRollout,
+    PPOParams,
+    Rollout,
+    compute_gae,
+    compute_gae_state,
+    log_prob_entropy,
+    make_auto_train_state,
+    make_train_state,
+    ppo_update,
+    ppo_update_auto,
+    safe_logits,
+)  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
 
@@ -128,10 +140,10 @@ def flip_state(state: EnvState) -> EnvState:
 
 def policy_sample_params(params, model, encoded, rng):
     """与 policy_sample 相同，但直接接受 params pytree（用于冻结对手）。"""
-    zeros = jnp.zeros(encoded.self_features.shape[:-1], dtype=jnp.int32)
+    zeros = jnp.zeros(encoded.planet_features.shape[:-1], dtype=jnp.int32)
     out1 = model.apply(
         {"params": params},
-        encoded.self_features, encoded.candidate_features, encoded.global_features,
+        encoded.planet_features, encoded.relative_features, encoded.global_features,
         encoded.candidate_mask, encoded.map_features, zeros,
         fleet_features=encoded.fleet_features,
         fleet_mask=encoded.fleet_mask,
@@ -146,7 +158,7 @@ def policy_sample_params(params, model, encoded, rng):
     target = jax.random.categorical(rng_target, target_logits, axis=-1)
     out2 = model.apply(
         {"params": params},
-        encoded.self_features, encoded.candidate_features, encoded.global_features,
+        encoded.planet_features, encoded.relative_features, encoded.global_features,
         encoded.candidate_mask, encoded.map_features, target,
         fleet_features=encoded.fleet_features,
         fleet_mask=encoded.fleet_mask,
@@ -235,11 +247,11 @@ def deterministic_policy_actions_params(params, apply_fn, state, feat_params, no
     """argmax 推理路径，直接接受 params/apply_fn，用于固定 checkpoint 对手。"""
     raw_enc = encode_batch(state, feat_params)
     enc = normalize_encoded(raw_enc, norm_state, norm_params)
-    zeros = jnp.zeros(enc.self_features.shape[:-1], dtype=jnp.int32)
+    zeros = jnp.zeros(enc.planet_features.shape[:-1], dtype=jnp.int32)
     out1 = apply_fn(
         {"params": params},
-        enc.self_features,
-        enc.candidate_features,
+        enc.planet_features,
+        enc.relative_features,
         enc.global_features,
         enc.candidate_mask,
         enc.map_features,
@@ -256,8 +268,8 @@ def deterministic_policy_actions_params(params, apply_fn, state, feat_params, no
     target = jnp.argmax(safe_logits(target_logits), axis=-1)
     out2 = apply_fn(
         {"params": params},
-        enc.self_features,
-        enc.candidate_features,
+        enc.planet_features,
+        enc.relative_features,
         enc.global_features,
         enc.candidate_mask,
         enc.map_features,
@@ -277,6 +289,211 @@ def deterministic_policy_actions_params(params, apply_fn, state, feat_params, no
         amount,
         feat_params,
     )
+
+
+def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
+    """Deterministic (argmax) autoregressive policy rollout for eval.
+
+    Mirrors auto_policy_sample but uses argmax instead of sampling.
+    Returns actions shaped [B, max_planets, 3].
+    """
+    raw_enc = encode_batch(state, feat_params)
+    encoded = normalize_encoded(raw_enc, norm_state, norm_params)
+    b = encoded.planet_features.shape[0]
+    k = model.max_action_tokens
+    initial_ships = jnp.concatenate(
+        [jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships], axis=1
+    )
+    actions = jnp.zeros((b, feat_params.max_planets, 3), dtype=jnp.float32)
+    ended = jnp.zeros((b,), dtype=bool)
+
+    state_emb, h, prev_tok, remaining, planet_out, relative_h, key_proj, src_key_proj, _value = train_state.apply_fn(
+        {"params": train_state.params},
+        encoded.planet_features,
+        encoded.relative_features,
+        encoded.global_features,
+        encoded.candidate_mask,
+        initial_ships,
+        map_features=encoded.map_features,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
+        method=model.auto_start,
+    )
+    batch_idx = jnp.arange(b)
+
+    for t in range(k):
+        h_new, end_logits_t, src_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            state_emb, h, prev_tok, remaining,
+            encoded.relative_features, encoded.source_mask, src_key_proj,
+            method=model.auto_step_base,
+        )
+        tv = ~ended
+        end_t = tv & (jax.nn.sigmoid(end_logits_t) > 0.5)
+        src_t = jnp.argmax(safe_logits(src_logits_t), axis=-1)
+
+        src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
+        tgt_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            h_new, src_for_heads, planet_out, relative_h, key_proj,
+            encoded.candidate_mask,
+            method=model.auto_tgt_logits,
+        )
+        tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
+
+        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
+        amt_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            h_new, src_for_heads, tgt_for_heads, planet_out,
+            relative_h, remaining, encoded.amount_mask,
+            method=model.auto_amt_logits,
+        )
+        amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
+
+        src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
+        tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
+        source_buckets = dynamic_ship_buckets(
+            remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)],
+            feat_params.ship_bucket_count,
+        )
+        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        src_planets = state.planets[batch_idx, src_slot]
+        tgt_planets = state.planets[batch_idx, tgt_slot]
+        angle, aim_hit = aim_with_prediction_jax(
+            src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], state, ships[:, None]
+        )
+        angle = angle[:, 0]
+        aim_hit = aim_hit[:, 0]
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
+        tgt_valid = tgt_t > 0
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+
+        source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
+        action_t = jnp.stack(
+            [
+                jnp.where(exec_t, source_ids, 0.0),
+                jnp.where(exec_t, angle, 0.0),
+                jnp.where(exec_t, ships, 0.0),
+            ],
+            axis=-1,
+        )
+        actions = actions.at[:, t, :].set(action_t)
+        remaining = remaining.at[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)].add(
+            jnp.where(exec_t, -ships, 0.0)
+        )
+
+        prev_tok = train_state.apply_fn(
+            {"params": train_state.params},
+            src_for_heads, tgt_for_heads,
+            jnp.where(tv & (~end_t), amt_t, 0),
+            end_t, exec_t, t, planet_out,
+            method=model.auto_token_embed,
+        )
+        ended = ended | end_t
+        h = h_new
+
+    return actions
+
+
+def auto_opponent_policy_actions(
+    state,
+    opponent_params,
+    model,
+    opp_fp,
+    opp_ns,
+    norm_params,
+    max_action_tokens: int,
+    *,
+    flip_state_fn,
+):
+    """Autoregressive opponent (frozen params, greedy) for self-play training rollout.
+
+    Mirrors auto_deterministic_policy_actions but calls model.apply with
+    opponent_params directly so it works inside jax.lax.scan.
+    """
+    flipped = flip_state_fn(state)
+    raw_enc = encode_batch(flipped, opp_fp)
+    encoded = normalize_encoded(raw_enc, opp_ns, norm_params)
+    b = encoded.planet_features.shape[0]
+    k = max_action_tokens
+    initial_ships = jnp.concatenate(
+        [jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships], axis=1
+    )
+    actions = jnp.zeros((b, opp_fp.max_planets, 3), dtype=jnp.float32)
+    ended = jnp.zeros((b,), dtype=bool)
+
+    state_emb, h, prev_tok, remaining, planet_out, relative_h, key_proj, src_key_proj, _value = model.apply(
+        {"params": opponent_params},
+        encoded.planet_features, encoded.relative_features, encoded.global_features,
+        encoded.candidate_mask, initial_ships,
+        map_features=encoded.map_features, fleet_features=encoded.fleet_features, fleet_mask=encoded.fleet_mask,
+        method=model.auto_start,
+    )
+    batch_idx = jnp.arange(b)
+
+    for t in range(k):
+        h_new, end_logits_t, src_logits_t = model.apply(
+            {"params": opponent_params},
+            state_emb, h, prev_tok, remaining, encoded.relative_features, encoded.source_mask, src_key_proj,
+            method=model.auto_step_base,
+        )
+        tv = ~ended
+        end_t = tv & (jax.nn.sigmoid(end_logits_t) > 0.5)
+        src_t = jnp.argmax(safe_logits(src_logits_t), axis=-1)
+        src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
+
+        tgt_logits_t = model.apply(
+            {"params": opponent_params},
+            h_new, src_for_heads, planet_out, relative_h, key_proj, encoded.candidate_mask,
+            method=model.auto_tgt_logits,
+        )
+        tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
+        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
+
+        amt_logits_t = model.apply(
+            {"params": opponent_params},
+            h_new, src_for_heads, tgt_for_heads, planet_out,
+            relative_h, remaining, encoded.amount_mask,
+            method=model.auto_amt_logits,
+        )
+        amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
+
+        src_slot = jnp.clip(src_t - 1, 0, opp_fp.max_planets - 1)
+        tgt_slot = jnp.clip(tgt_t - 1, 0, opp_fp.max_planets - 1)
+        source_buckets = dynamic_ship_buckets(
+            remaining[batch_idx, jnp.clip(src_t, 0, opp_fp.max_planets)], opp_fp.ship_bucket_count
+        )
+        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        src_planets = flipped.planets[batch_idx, src_slot]
+        tgt_planets = flipped.planets[batch_idx, tgt_slot]
+        angle, aim_hit = aim_with_prediction_jax(
+            src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], flipped, ships[:, None]
+        )
+        angle = angle[:, 0]
+        aim_hit = aim_hit[:, 0]
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
+        tgt_valid = tgt_t > 0
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
+        action_t = jnp.stack(
+            [jnp.where(exec_t, source_ids, 0.0), jnp.where(exec_t, angle, 0.0), jnp.where(exec_t, ships, 0.0)],
+            axis=-1,
+        )
+        actions = actions.at[:, t, :].set(action_t)
+        remaining = remaining.at[batch_idx, jnp.clip(src_t, 0, opp_fp.max_planets)].add(
+            jnp.where(exec_t, -ships, 0.0)
+        )
+        prev_tok = model.apply(
+            {"params": opponent_params},
+            src_for_heads, tgt_for_heads,
+            jnp.where(tv & (~end_t), amt_t, 0),
+            end_t, exec_t, t, planet_out,
+            method=model.auto_token_embed,
+        )
+        ended = ended | end_t
+        h = h_new
+
+    return actions
 
 
 def main() -> None:
@@ -335,37 +552,74 @@ def main() -> None:
     state = reset_from_bank(bank, rng_reset, cfg.ppo.num_envs)
     raw_sample = encode_batch(state, feat_params)
     sample = raw_sample if getattr(cfg.model, "use_transformer", False) else flatten_sources(raw_sample)
+    actor_type = str(getattr(cfg.model, "actor_type", "per_source") or "per_source").lower()
+    use_autoregressive = actor_type in {"autoregressive", "auto", "ar"}
+    if use_autoregressive:
+        sample = raw_sample
     rollout_state_count = cfg.ppo.num_envs * cfg.ppo.rollout_steps
-    ppo_source_count = cfg.env.max_planets
+    ppo_source_count = 1 if use_autoregressive else cfg.env.max_planets
     ppo_states_per_minibatch = min(max(cfg.ppo.minibatch_size // ppo_source_count, 1), rollout_state_count)
     ppo_num_minibatches = max(rollout_state_count // ppo_states_per_minibatch, 1)
     optimizer_steps_per_update = cfg.ppo.epochs * ppo_num_minibatches
     total_optimizer_steps = cfg.ppo.total_updates * optimizer_steps_per_update
     warmup_steps = int(getattr(cfg.ppo, "warmup_updates", 0)) * optimizer_steps_per_update
     lr_schedule_name = _resolve_lr_schedule(cfg)
-    model = ActorCritic(
-        self_dim=sample.self_features.shape[-1],
-        candidate_dim=sample.candidate_features.shape[-1],
-        global_dim=sample.global_features.shape[-1],
-        candidate_count=cfg.env.max_planets + 1,
-        ship_bucket_count=cfg.env.ship_bucket_count,
-        hidden_size=cfg.model.hidden_size,
-        use_cnn=cfg.model.use_cnn,
-        use_transformer=getattr(cfg.model, "use_transformer", False),
-        fleet_dim=FLEET_DIM,
-        max_fleet_tokens=feat_params.max_fleet_tokens,
-        num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
-        num_heads=getattr(cfg.model, "num_heads", 4),
-        value_use_context=getattr(cfg.model, "value_use_context", False),
-    )
-    train_state = make_train_state(
-        rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
-        total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
-        lr_schedule=lr_schedule_name,
-        warmup_steps=warmup_steps,
-        min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
-    )
+    if use_autoregressive:
+        model = AutoregressiveActorCritic(
+            planet_dim=sample.planet_features.shape[-1],
+            relative_dim=sample.relative_features.shape[-1],
+            global_dim=sample.global_features.shape[-1],
+            relative_count=cfg.env.max_planets + 1,
+            ship_bucket_count=cfg.env.ship_bucket_count,
+            hidden_size=cfg.model.hidden_size,
+            use_cnn=cfg.model.use_cnn,
+            fleet_dim=FLEET_DIM,
+            max_fleet_tokens=feat_params.max_fleet_tokens,
+            num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
+            num_heads=getattr(cfg.model, "num_heads", 4),
+            max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
+            end_bias_init=float(getattr(cfg.model, "end_bias_init", -2.0)),
+        )
+        train_state = make_auto_train_state(
+            rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
+            max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
+            total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
+            lr_schedule=lr_schedule_name,
+            warmup_steps=warmup_steps,
+            min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
+        )
+    else:
+        model = ActorCritic(
+            planet_dim=sample.planet_features.shape[-1],
+            relative_dim=sample.relative_features.shape[-1],
+            global_dim=sample.global_features.shape[-1],
+            relative_count=cfg.env.max_planets + 1,
+            ship_bucket_count=cfg.env.ship_bucket_count,
+            hidden_size=cfg.model.hidden_size,
+            use_cnn=cfg.model.use_cnn,
+            use_transformer=getattr(cfg.model, "use_transformer", False),
+            fleet_dim=FLEET_DIM,
+            max_fleet_tokens=feat_params.max_fleet_tokens,
+            num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
+            num_heads=getattr(cfg.model, "num_heads", 4),
+            value_use_context=getattr(cfg.model, "value_use_context", False),
+        )
+        train_state = make_train_state(
+            rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
+            total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
+            lr_schedule=lr_schedule_name,
+            warmup_steps=warmup_steps,
+            min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
+        )
     normalizer_state = init_normalizer()
+
+    # 自回归模型的 eval 推理路径：覆盖模块级函数，注入 model 闭包
+    if use_autoregressive:
+        _model_for_eval = model
+
+        def deterministic_policy_actions(ts, st, fp, ns, np):  # noqa: E501
+            return auto_deterministic_policy_actions(ts, _model_for_eval, st, fp, ns, np)
+
     start_update = 1
     init_checkpoint_params = None
     init_checkpoint_normalizer_state = None
@@ -570,8 +824,13 @@ def main() -> None:
     opponent_update_freq = cfg.self_play_update_interval  # 默认 25
     eval_enabled = getattr(cfg.eval, "enabled", True)
     eval_interval = cfg.eval.every            # 每多少 update 评估一次
+    _nearest_every = int(getattr(cfg.eval, "nearest_every", 0))
+    _slow_every    = int(getattr(cfg.eval, "slow_every",    0))
+    eval_nearest_interval = _nearest_every if _nearest_every > 0 else eval_interval   # nearest 专属间隔
+    eval_slow_interval    = _slow_every    if _slow_every    > 0 else eval_interval    # 外部脚本对手间隔
     eval_games = cfg.eval.games               # 每次评估局数
     eval_seed = cfg.eval.seed
+    log_every = int(getattr(cfg, "log_every", 1))
     checkpoint_every = getattr(cfg, "checkpoint_every", 100)
     checkpoint_model = opponent_checkpoint.model if opponent_checkpoint is not None else model
     checkpoint_feat_params = opponent_checkpoint.feat_params if opponent_checkpoint is not None else feat_params
@@ -657,51 +916,98 @@ def main() -> None:
 
     # JIT 编译的训练步（JAX-native 对手），供 pool 模式按需调用。
     # rollout 收集 + GAE 和 PPO 更新分别 JIT；PPO 的 KL 早停在 JIT 内完成。
-    _jit_nearest = jax.jit(
-        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-            reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
+    if use_autoregressive:
+        max_action_tokens = int(getattr(cfg.model, "max_action_tokens", 16))
+        _jit_nearest = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
+                max_action_tokens=max_action_tokens,
+            )
         )
-    )
-    _jit_selfplay = jax.jit(
-        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-            reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
+        _jit_selfplay = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
+                max_action_tokens=max_action_tokens,
+            )
         )
-    )
-    _jit_checkpoint = jax.jit(
-        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-            reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
+        _jit_checkpoint = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
+                max_action_tokens=max_action_tokens,
+            )
         )
-    )
-    # 兼容旧配置（opponent: nearest / self）
-    _jit_step = jax.jit(
-        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-            ts,
-            opp_p,
-            opp_ns,
-            st,
-            ns,
-            key,
-            bank,
-            env_params,
-            feat_params,
-            norm_params,
-            reward_params,
-            ppo_params,
-            model,
-            checkpoint_model if checkpoint_play else model,
-            checkpoint_feat_params if checkpoint_play else feat_params,
-            cfg.ppo.rollout_steps,
-            "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
+        _jit_step = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model,
+                checkpoint_model if checkpoint_play else model,
+                checkpoint_feat_params if checkpoint_play else feat_params,
+                cfg.ppo.rollout_steps,
+                "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
+                max_action_tokens=max_action_tokens,
+            )
         )
-    )
+    else:
+        _jit_nearest = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
+            )
+        )
+        _jit_selfplay = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
+            )
+        )
+        _jit_checkpoint = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+                reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
+            )
+        )
+        # 兼容旧配置（opponent: nearest / self）
+        _jit_step = jax.jit(
+            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
+                ts,
+                opp_p,
+                opp_ns,
+                st,
+                ns,
+                key,
+                bank,
+                env_params,
+                feat_params,
+                norm_params,
+                reward_params,
+                ppo_params,
+                model,
+                checkpoint_model if checkpoint_play else model,
+                checkpoint_feat_params if checkpoint_play else feat_params,
+                cfg.ppo.rollout_steps,
+                "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
+            )
+        )
 
     def _run_step(jit_fn, ts, opp_p, opp_ns, st, ns, key, ent_scale):
         """JIT 收集 rollout，然后在 Python 层执行 PPO 更新（含 KL 早停）。"""
         ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, opp_ns, st, ns, key)
-        ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng, ent_scale)
+        if use_autoregressive:
+            ts, ppo_metrics = ppo_update_auto(
+                ts,
+                rollout,
+                returns,
+                advantages,
+                ppo_params,
+                ppo_rng,
+                int(getattr(cfg.model, "max_action_tokens", 16)),
+                ent_scale,
+            )
+        else:
+            ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng, ent_scale)
         return ts, st, ns, {**ppo_metrics, **ep_metrics}
 
     def _run_named_opponent(opponent_id: str, ts, st, ns, key, ent_scale):
@@ -801,7 +1107,19 @@ def main() -> None:
                 line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
             else:
                 line += f" opp={selected_pool_id}"
-        print(line, flush=True)
+        if use_autoregressive:
+            line += (
+                f" invalid={metrics.get('invalid_action_rate', 0.0):.3f}"
+                f" exec={metrics.get('executed_action_rate', 0.0):.3f}"
+                f" seq={metrics.get('seq_len_mean', 0.0):.2f}"
+                f" logr_heads="
+                f"{metrics.get('max_abs_log_ratio_end', 0.0):.1f}/"
+                f"{metrics.get('max_abs_log_ratio_src', 0.0):.1f}/"
+                f"{metrics.get('max_abs_log_ratio_tgt', 0.0):.1f}/"
+                f"{metrics.get('max_abs_log_ratio_amt', 0.0):.1f}"
+            )
+        if update % log_every == 0:
+            print(line, flush=True)
 
         # snapshot pool：每 snapshot_interval 步存一个快照
         if use_pool and snapshot_pool and snapshot_interval > 0 and update % snapshot_interval == 0:
@@ -822,7 +1140,9 @@ def main() -> None:
                 lag_snapshot_params = _copy_params(train_state.params)
 
         eval_metrics = {field: "" for field in eval_metric_fields}
-        if eval_enabled and eval_interval > 0 and update % eval_interval == 0:
+        _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
+        _do_slow   = eval_enabled and eval_slow_interval   > 0 and update % eval_slow_interval   == 0
+        if _do_nearest or _do_slow:
             print(f"[eval] update={update} 开始评估 ({eval_games} 局)...")
             rng, eval_rng = jax.random.split(rng)
 
@@ -848,6 +1168,11 @@ def main() -> None:
             eval_results: dict[str, dict] = {}
             for eval_opponent in eval_opponents:
                 if not eval_opponent.exists():
+                    continue
+                _is_nearest = eval_opponent.metric_prefix == "nearest"
+                if _is_nearest and not _do_nearest:
+                    continue
+                if not _is_nearest and not _do_slow:
                     continue
                 result = eval_opponent.evaluate(eval_ctx)
                 if not result:
@@ -929,6 +1254,22 @@ def main() -> None:
                 "losses/max_abs_log_ratio": float(metrics.get("max_abs_log_ratio", 0.0)),
                 "losses/n_epochs_run": float(metrics.get("n_epochs_run", cfg.ppo.epochs)),
                 "lr/current": float(metrics.get("lr", cfg.ppo.lr)),
+                "charts/sps": float(sps),
+                "charts/seq_len_mean": float(metrics.get("seq_len_mean", 0.0)),
+                # autoregressive-specific metrics
+                **({
+                    "entropy/end": float(metrics.get("entropy_end", 0.0)),
+                    "entropy/src": float(metrics.get("entropy_src", 0.0)),
+                    "entropy/tgt": float(metrics.get("entropy_tgt", 0.0)),
+                    "entropy/amt": float(metrics.get("entropy_amt", 0.0)),
+                    "losses/max_abs_log_ratio_end": float(metrics.get("max_abs_log_ratio_end", 0.0)),
+                    "losses/max_abs_log_ratio_src": float(metrics.get("max_abs_log_ratio_src", 0.0)),
+                    "losses/max_abs_log_ratio_tgt": float(metrics.get("max_abs_log_ratio_tgt", 0.0)),
+                    "losses/max_abs_log_ratio_amt": float(metrics.get("max_abs_log_ratio_amt", 0.0)),
+                    "autoregressive/invalid_action_rate": float(metrics.get("invalid_action_rate", 0.0)),
+                    "autoregressive/executed_action_rate": float(metrics.get("executed_action_rate", 0.0)),
+                    "autoregressive/seq_len_mean": float(metrics.get("seq_len_mean", 0.0)),
+                } if use_autoregressive else {}),
             }, step=update)
             if use_pool:
                 if current_pool:
@@ -1052,8 +1393,9 @@ def collect_rollout(
         # 查当前目标星球 owner：planets [B, P_all, 7]，第 1 列 owner（0=player0, 1=player1）
         # learner 是 player 0
         cur_owner = st.planets[:, :, 1].astype(jnp.int32)   # [B, P_all]
-        # 把 old_target（候选 index，范围 0..max_planets）映射到 owner，slot 0（noop）对应 owner=-1
-        safe_target = jnp.clip(old_target, 0, max_planets - 1)
+        # old_target 是 candidate index：0=no-op, 1=planet slot 0, ...
+        # 映射到 planets owner 时需要减 1。
+        safe_target = jnp.clip(old_target - 1, 0, max_planets - 1)
         target_owner = jnp.take_along_axis(cur_owner, safe_target, axis=-1)  # [B, P]
         is_noop_target = (old_target == 0)
         # 判断失败：window 步前有发射 & 目标不是 noop & 目标现在不属于 player0
@@ -1079,8 +1421,8 @@ def collect_rollout(
         reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
         next_state = replace_done(next_state, reset_state)  # 局结环境自动重置
         row = Rollout(
-            encoded.self_features,
-            encoded.candidate_features,
+            encoded.planet_features,
+            encoded.relative_features,
             encoded.global_features,
             encoded.map_features,
             encoded.fleet_features,
@@ -1109,12 +1451,12 @@ def collect_rollout(
     last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
     last_out = train_state.apply_fn(
         {"params": train_state.params},
-        last_encoded.self_features,
-        last_encoded.candidate_features,
+        last_encoded.planet_features,
+        last_encoded.relative_features,
         last_encoded.global_features,
         last_encoded.candidate_mask,
         last_encoded.map_features,
-        jnp.zeros(last_encoded.self_features.shape[:-1], dtype=jnp.int32),
+        jnp.zeros(last_encoded.planet_features.shape[:-1], dtype=jnp.int32),
         fleet_features=last_encoded.fleet_features,
         fleet_mask=last_encoded.fleet_mask,
     )
@@ -1143,6 +1485,136 @@ def collect_rollout(
     return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
 
 
+def collect_rollout_auto(
+    train_state,
+    opponent_params,
+    opponent_normalizer_state,
+    state,
+    normalizer_state,
+    rng,
+    bank,
+    env_params,
+    feat_params,
+    norm_params,
+    reward_params,
+    ppo_params,
+    model,
+    opponent_model,
+    opponent_feat_params,
+    rollout_steps: int,
+    opponent_kind: str = "nearest",
+    max_action_tokens: int = 16,
+):
+    """Collect state-level autoregressive rollout.
+
+    V1 supports the nearest JAX opponent for training. Legacy/checkpoint
+    opponents remain available through the per-source actor path.
+    """
+    rng, rollout_key = jax.random.split(rng)
+
+    def body(carry, _):
+        ts, st, ns, key = carry
+        key, action_key, opp_key, reset_key = jax.random.split(key, 4)
+        raw_encoded = encode_batch(st, feat_params)
+        encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
+        sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
+        learner_actions = sample["actions"]
+        if opponent_kind == "selfplay" or opponent_kind == "checkpoint":
+            opp_ns = opponent_normalizer_state if opponent_kind == "checkpoint" else ns
+            opp_m = opponent_model if opponent_kind == "checkpoint" else model
+            opp_fp = opponent_feat_params if opponent_kind == "checkpoint" else feat_params
+            opponent_actions = auto_opponent_policy_actions(
+                st,
+                opponent_params,
+                opp_m,
+                opp_fp,
+                opp_ns,
+                norm_params,
+                max_action_tokens,
+                flip_state_fn=flip_state,
+            )
+        else:
+            opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
+        joint = jnp.stack([learner_actions, opponent_actions], axis=1)
+        next_state = step_batch(st, joint, env_params)
+        reward_env, _reward_parts = reward_from_transition(st, next_state, learner_actions, reward_params)
+        done = next_state.done
+        reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
+        next_state = replace_done(next_state, reset_state)
+        row = AutoRollout(
+            encoded.planet_features,
+            encoded.relative_features,
+            encoded.global_features,
+            encoded.map_features,
+            encoded.fleet_features,
+            encoded.fleet_mask,
+            encoded.candidate_mask,
+            encoded.amount_mask,
+            encoded.source_mask,
+            sample["initial_ships"],
+            sample["end_action"],
+            sample["src_action"],
+            sample["tgt_action"],
+            sample["amt_action"],
+            sample["executed"],
+            sample["invalid"],
+            sample["old_logp_end"],
+            sample["old_logp_src"],
+            sample["old_logp_tgt"],
+            sample["old_logp_amt"],
+            sample["token_valid"],
+            sample["value"],
+            reward_env,
+            done,
+        )
+        return (ts, next_state, ns, key), row
+
+    (train_state, state, normalizer_state, rng), rollout = jax.lax.scan(
+        body,
+        (train_state, state, normalizer_state, rollout_key),
+        None,
+        length=rollout_steps,
+    )
+    last_raw_encoded = encode_batch(state, feat_params)
+    last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
+    b = last_encoded.planet_features.shape[0]
+    k = max_action_tokens
+    last_initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=last_encoded.source_ships.dtype), last_encoded.source_ships], axis=1)
+    last_out = train_state.apply_fn(
+        {"params": train_state.params},
+        last_encoded.planet_features,
+        last_encoded.relative_features,
+        last_encoded.global_features,
+        last_encoded.candidate_mask,
+        last_encoded.amount_mask,
+        last_encoded.source_mask,
+        jnp.zeros((b, k), dtype=bool),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=jnp.int32),
+        jnp.zeros((b, k), dtype=bool),
+        last_initial_ships,
+        map_features=last_encoded.map_features,
+        fleet_features=last_encoded.fleet_features,
+        fleet_mask=last_encoded.fleet_mask,
+    )
+    returns, advantages = compute_gae_state(rollout.reward, rollout.done, rollout.old_value, last_out.value, ppo_params)
+    finished = rollout.done
+    ep_reward = rollout.reward
+    ep_reward_sum = jnp.where(finished, ep_reward, 0.0).sum()
+    episodes = jnp.maximum(finished.sum(), 1)
+    episode_reward = ep_reward_sum / episodes
+    wins = ((ep_reward > 0.0) & finished).sum()
+    win_rate = wins / episodes
+    ep_metrics = {
+        "episode_reward": episode_reward,
+        "win_rate": win_rate,
+        "mean_return": returns.mean(),
+        "episodes_per_rollout": finished.sum().astype(jnp.float32),
+    }
+    return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
+
+
 def policy_sample(train_state, model, encoded, rng):
     """两阶段采样策略。
 
@@ -1150,11 +1622,11 @@ def policy_sample(train_state, model, encoded, rng):
     第二步：传入真实 target 前向 -> 采 amount，并计算联合 logp。
     与 log_prob_entropy 训练路径完全一致。
     """
-    zeros = jnp.zeros(encoded.self_features.shape[:-1], dtype=jnp.int32)
+    zeros = jnp.zeros(encoded.planet_features.shape[:-1], dtype=jnp.int32)
     out1 = train_state.apply_fn(
         {"params": train_state.params},
-        encoded.self_features,
-        encoded.candidate_features,
+        encoded.planet_features,
+        encoded.relative_features,
         encoded.global_features,
         encoded.candidate_mask,
         encoded.map_features,
@@ -1173,8 +1645,8 @@ def policy_sample(train_state, model, encoded, rng):
     target = jax.random.categorical(rng_target, target_logits, axis=-1)
     out2 = train_state.apply_fn(
         {"params": train_state.params},
-        encoded.self_features,
-        encoded.candidate_features,
+        encoded.planet_features,
+        encoded.relative_features,
         encoded.global_features,
         encoded.candidate_mask,
         encoded.map_features,
@@ -1195,6 +1667,176 @@ def policy_sample(train_state, model, encoded, rng):
         encoded.amount_mask,
     )
     return fire, target, amount, logp, out1.value
+
+
+def _bernoulli_log_prob_local(logits, action_bool):
+    action = action_bool.astype(jnp.float32)
+    return -jax.nn.softplus(jnp.where(action_bool, -logits, logits))
+
+
+def _categorical_log_prob_local(logits, action):
+    return jnp.take_along_axis(jax.nn.log_softmax(logits), action[..., None], axis=-1).squeeze(-1)
+
+
+def dynamic_ship_buckets(ships, bucket_count: int):
+    ratios = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)[:bucket_count]
+    s = jnp.floor(ships)
+    raw = jnp.clip(jnp.round(s[:, None] * ratios[None, :]), 10.0, s[:, None])
+    return jnp.where(s[:, None] >= 10.0, raw, jnp.zeros_like(raw))
+
+
+def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: FeatureParams, max_action_tokens: int):
+    """Autoregressive rollout sampling with post-sample physics validation."""
+    b = encoded.planet_features.shape[0]
+    k = max_action_tokens
+    initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships], axis=1)
+    end_action = jnp.zeros((b, k), dtype=bool)
+    src_action = jnp.zeros((b, k), dtype=jnp.int32)
+    tgt_action = jnp.zeros((b, k), dtype=jnp.int32)
+    amt_action = jnp.zeros((b, k), dtype=jnp.int32)
+    executed = jnp.zeros((b, k), dtype=bool)
+    invalid = jnp.zeros((b, k), dtype=bool)
+    token_valid = jnp.zeros((b, k), dtype=bool)
+    old_logp_end = jnp.zeros((b, k), dtype=jnp.float32)
+    old_logp_src = jnp.zeros((b, k), dtype=jnp.float32)
+    old_logp_tgt = jnp.zeros((b, k), dtype=jnp.float32)
+    old_logp_amt = jnp.zeros((b, k), dtype=jnp.float32)
+    actions = jnp.zeros((b, feat_params.max_planets, 3), dtype=jnp.float32)
+    ended = jnp.zeros((b,), dtype=bool)
+    state_emb, h, prev_tok, remaining, planet_out, relative_h, key_proj, src_key_proj, value = train_state.apply_fn(
+        {"params": train_state.params},
+        encoded.planet_features,
+        encoded.relative_features,
+        encoded.global_features,
+        encoded.candidate_mask,
+        initial_ships,
+        map_features=encoded.map_features,
+        fleet_features=encoded.fleet_features,
+        fleet_mask=encoded.fleet_mask,
+        method=model.auto_start,
+    )
+    batch_idx = jnp.arange(b)
+
+    def body(t, carry):
+        (key, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+         token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = carry
+        key, key_end, key_src, key_tgt, key_amt = jax.random.split(key, 5)
+        h_new, end_logits_t, src_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            state_emb,
+            h,
+            prev_tok,
+            remaining,
+            encoded.relative_features,
+            encoded.source_mask,
+            src_key_proj,
+            method=model.auto_step_base,
+        )
+        tv = ~ended
+        sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
+        end_t = tv & sampled_end
+        src_logits_t = safe_logits(src_logits_t)
+        src_t = jax.random.categorical(key_src, src_logits_t, axis=-1)
+
+        src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
+        tgt_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            h_new,
+            src_for_heads,
+            planet_out,
+            relative_h,
+            key_proj,
+            encoded.candidate_mask,
+            method=model.auto_tgt_logits,
+        )
+        tgt_logits_t = safe_logits(tgt_logits_t)
+        tgt_t = jax.random.categorical(key_tgt, tgt_logits_t, axis=-1)
+
+        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
+        amt_logits_t = train_state.apply_fn(
+            {"params": train_state.params},
+            h_new,
+            src_for_heads,
+            tgt_for_heads,
+            planet_out,
+            relative_h,
+            remaining,
+            encoded.amount_mask,
+            method=model.auto_amt_logits,
+        )
+        amt_logits_t = safe_logits(amt_logits_t)
+        amt_t = jax.random.categorical(key_amt, amt_logits_t, axis=-1)
+
+        src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
+        tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
+        source_buckets = dynamic_ship_buckets(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)], feat_params.ship_bucket_count)
+        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        src_planets = state.planets[batch_idx, src_slot]
+        tgt_planets = state.planets[batch_idx, tgt_slot]
+        angle, aim_hit = aim_with_prediction_jax(src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], state, ships[:, None])
+        angle = angle[:, 0]
+        aim_hit = aim_hit[:, 0]
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
+        tgt_valid = tgt_t > 0
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        invalid_t = tv & (~end_t) & (~exec_t)
+        source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
+        action_t = jnp.stack(
+            [
+                jnp.where(exec_t, source_ids, 0.0),
+                jnp.where(exec_t, angle, 0.0),
+                jnp.where(exec_t, ships, 0.0),
+            ],
+            axis=-1,
+        )
+        actions = actions.at[:, t, :].set(action_t)
+        remaining = remaining.at[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)].add(jnp.where(exec_t, -ships, 0.0))
+        prev_tok = train_state.apply_fn(
+            {"params": train_state.params},
+            src_for_heads,
+            tgt_for_heads,
+            jnp.where(tv & (~end_t), amt_t, 0),
+            end_t,
+            exec_t,
+            t,
+            planet_out,
+            method=model.auto_token_embed,
+        )
+        end_action = end_action.at[:, t].set(end_t)
+        src_action = src_action.at[:, t].set(src_for_heads)
+        tgt_action = tgt_action.at[:, t].set(tgt_for_heads)
+        amt_action = amt_action.at[:, t].set(jnp.where(tv & (~end_t), amt_t, 0))
+        executed = executed.at[:, t].set(exec_t)
+        invalid = invalid.at[:, t].set(invalid_t)
+        token_valid = token_valid.at[:, t].set(tv)
+        old_logp_end = old_logp_end.at[:, t].set(jnp.where(tv, _bernoulli_log_prob_local(end_logits_t, end_t), 0.0))
+        old_logp_src = old_logp_src.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(src_logits_t, src_t), 0.0))
+        old_logp_tgt = old_logp_tgt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(tgt_logits_t, tgt_t), 0.0))
+        old_logp_amt = old_logp_amt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(amt_logits_t, amt_t), 0.0))
+        ended = ended | end_t
+        return (key, ended, h_new, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+                token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
+
+    init = (rng, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+            token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
+    (_, _ended, _h, _prev_tok, _remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+     token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = jax.lax.fori_loop(0, k, body, init)
+    return {
+        "actions": actions,
+        "initial_ships": initial_ships,
+        "end_action": end_action,
+        "src_action": src_action,
+        "tgt_action": tgt_action,
+        "amt_action": amt_action,
+        "executed": executed,
+        "invalid": invalid,
+        "token_valid": token_valid,
+        "old_logp_end": old_logp_end,
+        "old_logp_src": old_logp_src,
+        "old_logp_tgt": old_logp_tgt,
+        "old_logp_amt": old_logp_amt,
+        "value": value,
+    }
 
 
 def actions_from_decisions(state, encoded, fire, target, amount, params: FeatureParams):

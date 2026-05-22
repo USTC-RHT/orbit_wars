@@ -1,8 +1,4 @@
-"""配置定义和 YAML 加载工具。
-
-这里把训练配置拆成 EnvConfig、RewardConfig、ModelConfig、PPOConfig。
-`load_config` 会读取 default_cfg.yaml，并把命令行覆盖后的值交给训练循环。
-"""
+"""Configuration dataclasses and YAML loading for JAX autoregressive training."""
 
 from __future__ import annotations
 
@@ -53,6 +49,8 @@ class RewardConfig:
     lose_planet_penalty: float = 0.0
     wasted_attack_penalty: float = 0.0
     step_clip: float = 0.20
+    failed_capture_penalty: float = 0.0   # 发射后 N 步内目标未变我方的惩罚（0=关闭）
+    failed_capture_window: int = 50       # 检测窗口步数
 
 
 @dataclass(slots=True)
@@ -60,6 +58,9 @@ class ModelConfig:
     hidden_size: int = 128
     use_cnn: bool = False
     use_transformer: bool = False
+    actor_type: str = "autoregressive"
+    max_action_tokens: int = 16
+    end_bias_init: float = -2.0
     num_transformer_layers: int = 2
     num_heads: int = 4
     max_fleet_tokens: int = 32
@@ -80,6 +81,8 @@ class EvalConfig:
 
     enabled: bool = True
     every: int = 100
+    nearest_every: int = 0    # nearest 专属间隔（0 = 跟随 every）
+    slow_every: int = 0       # 外部脚本对手间隔（0 = 跟随 every）
     games: int = 20
     seed: int = 100000
     opponents: list[str] = field(default_factory=lambda: ["nearest", "sigma", "tamrazov"])
@@ -141,7 +144,7 @@ class TrainConfig:
     seed: int = 42
     run_name: str = "orbit_wars_clean_ppo"
     device: str = "auto"
-    save_dir: str = "RL/artifacts"
+    save_dir: str = "outputs"
     checkpoint_every: int = 10
     log_every: int = 1
     opponent: str = "nearest"
@@ -149,16 +152,19 @@ class TrainConfig:
     opponent_pool_weights: list[float] = field(default_factory=lambda: [1.0])
     init_from_checkpoint: str | None = None
     start_update_from_checkpoint: bool = True
-    opponent_checkpoint: str | None = None
-    eval_checkpoint: str | None = None
     self_play_update_interval: int = 25
     pool_mode: str = "pfsp"
     pool_start_phase: int = 1
     pool_include_nearest: bool = True
+    pool_lag_checkpoint_phase1_opponents: list[str] = field(default_factory=lambda: ["selfplay-lag"])
+    pool_lag_checkpoint_phase2_opponents: list[str] = field(default_factory=lambda: ["selfplay-current", "selfplay-lag"])
     pool_lag_interval: int = 50
     pool_max_size: int = 4
     promote_nearest_win_rate: float = 0.8
     promote_consecutive_evals: int = 3
+    # snapshot pool: 每 snapshot_interval 存一个快照，按 snapshot_current_ratio 概率选当前策略
+    snapshot_interval: int = 200
+    snapshot_current_ratio: float = 0.2
     # self-play 对手本质上是在"推理"旧策略，默认用 argmax 保持行为稳定。
     self_play_deterministic: bool = True
     alternate_player_sides: bool = True

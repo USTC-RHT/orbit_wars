@@ -2,7 +2,6 @@
 
 from .opponents import (
     EvalContext,
-    CheckpointPolicyJaxEvalOpponent,
     ExternalScriptJaxEvalOpponent,
     JaxEvalOpponent,
     NearestJaxEvalOpponent,
@@ -12,7 +11,6 @@ from .opponents import (
 
 __all__ = [
     "EvalContext",
-    "CheckpointPolicyJaxEvalOpponent",
     "ExternalScriptJaxEvalOpponent",
     "JaxEvalOpponent",
     "NearestJaxEvalOpponent",

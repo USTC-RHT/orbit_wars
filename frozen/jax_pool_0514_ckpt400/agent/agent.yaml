@@ -1,3 +1,0 @@
-name: jax-pool-0514-ckpt400
-description: "JAX PPO pool agent - jax_pool_0514 ckpt_000400."
-main: main.py

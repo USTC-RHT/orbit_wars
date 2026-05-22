@@ -1,9 +1,9 @@
 # orbit-wars-lab 识别这个 agent 时使用的元信息。
-# 旧 Torch PPO 入口已归档到 torch_agent/main.py；根目录当前不再作为可运行 agent。
+# 当前仓库根目录是训练源码，不直接作为网页对战 agent 运行。
 
-name: "Legacy Torch PPO"
-description: "Archived PyTorch PPO implementation. Current training/inference uses the JAX autoregressive agent."
+name: "JAX Autoregressive PPO Source"
+description: "Training source for the current JAX autoregressive PPO agent."
 author: "local"
 license: "Apache 2.0"
-tags: [legacy, torch, reinforcement-learning, ppo, neural-network]
+tags: [jax, autoregressive, reinforcement-learning, ppo, training-source]
 disabled: true

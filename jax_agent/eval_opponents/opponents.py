@@ -1,12 +1,11 @@
-"""Evaluation opponents for JAX agents.
-
-This module keeps evaluation opponents out of the training loop.  Each opponent
-object evaluates the current JAX learner against one benchmark and returns the
-same win/loss/draw metric shape used by train_jax.py.
-"""
+"""Evaluation opponents for the JAX autoregressive agent."""
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
+import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -14,8 +13,6 @@ from typing import Any, Callable, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-from src.opponents import ExternalScriptOpponent
 
 from ..fast_env import EnvParams, EnvState, step_batch
 
@@ -38,7 +35,6 @@ class EvalContext:
     base_seed: int
     rng: Any
     deterministic_policy_actions: Callable
-    deterministic_policy_actions_params: Callable
     nearest_opponent_actions: Callable
     reset_from_bank: Callable
     flip_state: Callable
@@ -77,6 +73,58 @@ class JaxEvalOpponent(Protocol):
         }
 
 
+class ExternalScriptOpponent:
+    """Load an Orbit Wars lab agent directory with isolated module state."""
+
+    def __init__(self, agent_dir: Path) -> None:
+        self.agent_dir = agent_dir.resolve()
+        self.main_py = self.agent_dir / "main.py"
+        if not self.main_py.exists():
+            raise FileNotFoundError(f"External opponent entry not found: {self.main_py}")
+        self.modules: dict[int, Any] = {}
+        self.call_with_config: dict[int, bool] = {}
+        self.load_counter = 0
+
+    def reset_env(self, env_index: int, seed: int) -> None:
+        self.modules[env_index], self.call_with_config[env_index] = self._load_module(env_index, seed)
+
+    def act_for_env(self, env_index: int, observation: Any) -> list[list[float | int]]:
+        if env_index not in self.modules:
+            self.reset_env(env_index, seed=0)
+        return self._call_agent(env_index, observation)
+
+    def _load_module(self, env_index: int, seed: int) -> tuple[Any, bool]:
+        self.load_counter += 1
+        module_name = f"_orbit_external_{self.agent_dir.name.replace('-', '_')}_{id(self)}_{env_index}_{self.load_counter}"
+        spec = importlib.util.spec_from_file_location(module_name, self.main_py)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load external opponent: {self.main_py}")
+        module = importlib.util.module_from_spec(spec)
+        old_path = list(sys.path)
+        try:
+            sys.path.insert(0, str(self.agent_dir))
+            spec.loader.exec_module(module)
+        finally:
+            sys.path = old_path
+        agent = getattr(module, "agent", None)
+        if agent is None or not callable(agent):
+            raise AttributeError(f"External opponent has no callable agent(obs): {self.main_py}")
+        random.seed(int(seed))
+        try:
+            call_with_config = len(inspect.signature(agent).parameters) >= 2
+        except (TypeError, ValueError):
+            call_with_config = False
+        return module, call_with_config
+
+    def _call_agent(self, env_index: int, observation: Any) -> list[list[float | int]]:
+        module = self.modules[env_index]
+        if self.call_with_config.get(env_index, False):
+            moves = module.agent(observation, {"__raw_path__": str(self.main_py)})
+        else:
+            moves = module.agent(observation)
+        return list(moves or [])
+
+
 @dataclass(frozen=True)
 class NearestJaxEvalOpponent:
     """Nearest-rule opponent evaluated entirely inside JAX fast_env."""
@@ -88,25 +136,13 @@ class NearestJaxEvalOpponent:
         return True
 
     def metric_fields(self) -> list[str]:
-        return [
-            f"eval_{self.metric_prefix}_win_rate",
-            f"eval_{self.metric_prefix}_loss_rate",
-            f"eval_{self.metric_prefix}_wins",
-            f"eval_{self.metric_prefix}_losses",
-            f"eval_{self.metric_prefix}_draws",
-        ]
+        return JaxEvalOpponent.metric_fields(self)
 
     def metric_values(self, result: EvalResult) -> dict[str, float | int]:
-        return {
-            f"eval_{self.metric_prefix}_win_rate": result["win_rate"],
-            f"eval_{self.metric_prefix}_loss_rate": result["loss_rate"],
-            f"eval_{self.metric_prefix}_wins": result["wins"],
-            f"eval_{self.metric_prefix}_losses": result["losses"],
-            f"eval_{self.metric_prefix}_draws": result["draws"],
-        }
+        return JaxEvalOpponent.metric_values(self, result)
 
     def evaluate(self, ctx: EvalContext) -> EvalResult:
-        rng, reset_key = jax.random.split(ctx.rng)
+        _rng, reset_key = jax.random.split(ctx.rng)
         state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
 
         def step_fn(st, _):
@@ -145,22 +181,10 @@ class ExternalScriptJaxEvalOpponent:
         return (self.agent_dir / "main.py").exists()
 
     def metric_fields(self) -> list[str]:
-        return [
-            f"eval_{self.metric_prefix}_win_rate",
-            f"eval_{self.metric_prefix}_loss_rate",
-            f"eval_{self.metric_prefix}_wins",
-            f"eval_{self.metric_prefix}_losses",
-            f"eval_{self.metric_prefix}_draws",
-        ]
+        return JaxEvalOpponent.metric_fields(self)
 
     def metric_values(self, result: EvalResult) -> dict[str, float | int]:
-        return {
-            f"eval_{self.metric_prefix}_win_rate": result["win_rate"],
-            f"eval_{self.metric_prefix}_loss_rate": result["loss_rate"],
-            f"eval_{self.metric_prefix}_wins": result["wins"],
-            f"eval_{self.metric_prefix}_losses": result["losses"],
-            f"eval_{self.metric_prefix}_draws": result["draws"],
-        }
+        return JaxEvalOpponent.metric_values(self, result)
 
     def evaluate(self, ctx: EvalContext) -> EvalResult:
         try:
@@ -195,9 +219,6 @@ class ExternalScriptJaxEvalOpponent:
                 jax_state = ctx.kaggle_obs_to_jax_state(obs, ctx.env_params)
                 learner_action = ctx.jax_actions_to_kaggle(infer(jax_state))
                 opp_action = opponent.act_for_env(0, opp_obs)
-                load_error = getattr(opponent.modules.get(0), "_LOAD_ERROR", None)
-                if load_error is not None:
-                    raise RuntimeError(f"External eval opponent {self.name} failed to load: {load_error}") from load_error
                 states = env.step([learner_action, opp_action])
                 obs = states[0]["observation"]
                 opp_obs = states[1]["observation"]
@@ -221,74 +242,7 @@ class ExternalScriptJaxEvalOpponent:
         return result
 
 
-@dataclass(frozen=True)
-class CheckpointPolicyJaxEvalOpponent:
-    """Fixed JAX checkpoint policy as an eval opponent in fast_env."""
-
-    name: str
-    metric_prefix: str
-    params: Any
-    normalizer_state: Any
-    model: Any
-    feat_params: Any
-
-    def exists(self) -> bool:
-        return self.params is not None
-
-    def metric_fields(self) -> list[str]:
-        return [
-            f"eval_{self.metric_prefix}_win_rate",
-            f"eval_{self.metric_prefix}_loss_rate",
-            f"eval_{self.metric_prefix}_wins",
-            f"eval_{self.metric_prefix}_losses",
-            f"eval_{self.metric_prefix}_draws",
-        ]
-
-    def metric_values(self, result: EvalResult) -> dict[str, float | int]:
-        return {
-            f"eval_{self.metric_prefix}_win_rate": result["win_rate"],
-            f"eval_{self.metric_prefix}_loss_rate": result["loss_rate"],
-            f"eval_{self.metric_prefix}_wins": result["wins"],
-            f"eval_{self.metric_prefix}_losses": result["losses"],
-            f"eval_{self.metric_prefix}_draws": result["draws"],
-        }
-
-    def evaluate(self, ctx: EvalContext) -> EvalResult:
-        rng, reset_key = jax.random.split(ctx.rng)
-        state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
-
-        def step_fn(st, _):
-            learner_acts = ctx.deterministic_policy_actions(
-                ctx.train_state,
-                st,
-                ctx.feat_params,
-                ctx.normalizer_state,
-                ctx.norm_params,
-            )
-            flipped = ctx.flip_state(st)
-            opp_acts = ctx.deterministic_policy_actions_params(
-                self.params,
-                self.model.apply,
-                flipped,
-                self.feat_params,
-                self.normalizer_state,
-                ctx.norm_params,
-            )
-            joint = jnp.stack([learner_acts, opp_acts], axis=1)
-            return step_batch(st, joint, ctx.env_params), None
-
-        final_state, _ = jax.lax.scan(step_fn, state, None, length=ctx.env_params.episode_steps)
-        winners = np.array(final_state.winner)
-        wins = int((winners == 0).sum())
-        losses = int((winners == 1).sum())
-        draws = int((winners == 2).sum())
-        total = max(ctx.num_games, 1)
-        result = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total, "loss_rate": losses / total}
-        print(f"[eval/{self.name}]   wins={wins} losses={losses} draws={draws} win_rate={result['win_rate']:.3f}")
-        return result
-
-
-def default_eval_opponents(root: Path, *, checkpoint_opponent=None, enabled_names=None) -> list[JaxEvalOpponent]:
+def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpponent]:
     """Default benchmark set for JAX training."""
 
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
@@ -317,17 +271,6 @@ def default_eval_opponents(root: Path, *, checkpoint_opponent=None, enabled_name
             agent_dir=root / "orbit-wars-lab" / "agents" / "mine" / "jax-pool-0514-resume-ckpt900",
             seed_offset=31337,
         ))
-    if checkpoint_opponent is not None and ("checkpoint400" in enabled or "checkpoint" in enabled):
-        opponents.append(
-            CheckpointPolicyJaxEvalOpponent(
-                name="checkpoint400",
-                metric_prefix="checkpoint400",
-                params=checkpoint_opponent.params,
-                normalizer_state=checkpoint_opponent.normalizer_state,
-                model=checkpoint_opponent.model,
-                feat_params=checkpoint_opponent.feat_params,
-            )
-        )
     return opponents
 
 

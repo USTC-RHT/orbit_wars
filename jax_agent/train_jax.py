@@ -1,12 +1,9 @@
 """Orbit Wars JAX PPO 训练入口。
 
 核心设计：
-- collect_and_update: jax.lax.scan 单一 jit 内完成整段 rollout + GAE + PPO 更新。
-- policy_sample: 两次前向传播（第一次采 fire/target，第二次带 target 采 amount）。
-- actions_from_decisions: 将网络决策转换为游戏动作格式 [from, angle, ships]。
+- autoregressive actor 逐 token 生成多条 [source, angle, ships] 动作。
+- rollout 收集与 PPO 更新走 state-level AutoRollout。
 - aim_with_prediction_jax: 60 步轨迹预测锁定目标（旋转星球/彗星均支持）。
-- target_is_first_collision_jax: 验证目标星球是否为舰队路径上第一个碰撜体。
-- 环境并行度 B = num_envs，星球并行度 P = max_planets。
 """
 
 from __future__ import annotations
@@ -24,12 +21,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from src.config import load_config  # noqa: E402
-from src.state import parse_observation  # noqa: E402
+from .config import load_config  # noqa: E402
+from .state import parse_observation  # noqa: E402
 
 try:
     import wandb as _wandb
@@ -38,7 +36,6 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 from .build_initial_state_bank import build_bank  # noqa: E402
-from .checkpoint_opponents import load_checkpoint_opponent  # noqa: E402
 from .eval_opponents import EvalContext, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
 from .fast_env import (  # noqa: E402
     COMETS_PER_SPAWN,
@@ -54,19 +51,15 @@ from .fast_env import (  # noqa: E402
     select_from_bank,
     step_batch,
 )
-from .features_jax import FLEET_DIM, FeatureParams, encode_batch, flatten_sources  # noqa: E402
-from .model_jax import ActorCritic, AutoregressiveActorCritic  # noqa: E402
+from .features_jax import FLEET_DIM, FeatureParams, encode_batch  # noqa: E402
+from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
 from .ppo_jax import (
     AutoRollout,
     PPOParams,
-    Rollout,
     compute_gae,
     compute_gae_state,
-    log_prob_entropy,
     make_auto_train_state,
-    make_train_state,
-    ppo_update,
     ppo_update_auto,
     safe_logits,
 )  # noqa: E402
@@ -138,38 +131,6 @@ def flip_state(state: EnvState) -> EnvState:
     return state._replace(planets=new_planets, fleets=new_fleets)
 
 
-def policy_sample_params(params, model, encoded, rng):
-    """与 policy_sample 相同，但直接接受 params pytree（用于冻结对手）。"""
-    zeros = jnp.zeros(encoded.planet_features.shape[:-1], dtype=jnp.int32)
-    out1 = model.apply(
-        {"params": params},
-        encoded.planet_features, encoded.relative_features, encoded.global_features,
-        encoded.candidate_mask, encoded.map_features, zeros,
-        fleet_features=encoded.fleet_features,
-        fleet_mask=encoded.fleet_mask,
-    )
-    rng_fire, rng_target, rng_amount = jax.random.split(rng, 3)
-    has_target = encoded.candidate_mask.at[..., 0].set(False).any(axis=-1) & encoded.source_mask
-    fire_logits = jnp.where(has_target, out1.fire_logits, -1.0e8)
-    fire = jax.random.uniform(rng_fire, fire_logits.shape) < jax.nn.sigmoid(fire_logits)
-    target_logits = jnp.where(encoded.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(jnp.where(fire, target_logits[..., 0], 0.0))
-    target_logits = safe_logits(target_logits)
-    target = jax.random.categorical(rng_target, target_logits, axis=-1)
-    out2 = model.apply(
-        {"params": params},
-        encoded.planet_features, encoded.relative_features, encoded.global_features,
-        encoded.candidate_mask, encoded.map_features, target,
-        fleet_features=encoded.fleet_features,
-        fleet_mask=encoded.fleet_mask,
-    )
-    selected_amount_mask = jnp.take_along_axis(encoded.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
-    amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
-    amount = jax.random.categorical(rng_amount, amount_logits, axis=-1)
-    return fire, target, amount, None, out1.value
-
-
 def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
     """将 kaggle_environments 单步 observation 转换为 batch=1 的 EnvState。
 
@@ -236,59 +197,6 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     """将 JAX actions_from_decisions 输出 [1, P, 3] 转为 kaggle 格式 [[from, angle, ships], ...]。"""
     arr = np.array(actions_arr[0])  # [P, 3]
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
-
-
-def deterministic_policy_actions(train_state, state, feat_params, norm_state, norm_params):
-    """argmax 推理路径，用于网页/外部评估/JAX 内部 eval 保持一致。"""
-    return deterministic_policy_actions_params(train_state.params, train_state.apply_fn, state, feat_params, norm_state, norm_params)
-
-
-def deterministic_policy_actions_params(params, apply_fn, state, feat_params, norm_state, norm_params):
-    """argmax 推理路径，直接接受 params/apply_fn，用于固定 checkpoint 对手。"""
-    raw_enc = encode_batch(state, feat_params)
-    enc = normalize_encoded(raw_enc, norm_state, norm_params)
-    zeros = jnp.zeros(enc.planet_features.shape[:-1], dtype=jnp.int32)
-    out1 = apply_fn(
-        {"params": params},
-        enc.planet_features,
-        enc.relative_features,
-        enc.global_features,
-        enc.candidate_mask,
-        enc.map_features,
-        zeros,
-        fleet_features=enc.fleet_features,
-        fleet_mask=enc.fleet_mask,
-    )
-    has_target = enc.candidate_mask.at[..., 0].set(False).any(axis=-1) & enc.source_mask
-    fire = (jax.nn.sigmoid(out1.fire_logits) > 0.5) & has_target
-    target_logits = jnp.where(enc.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(
-        jnp.where(fire, target_logits[..., 0], 0.0)
-    )
-    target = jnp.argmax(safe_logits(target_logits), axis=-1)
-    out2 = apply_fn(
-        {"params": params},
-        enc.planet_features,
-        enc.relative_features,
-        enc.global_features,
-        enc.candidate_mask,
-        enc.map_features,
-        target,
-        fleet_features=enc.fleet_features,
-        fleet_mask=enc.fleet_mask,
-    )
-    selected_amount_mask = jnp.take_along_axis(enc.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
-    amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
-    amount = jnp.argmax(amount_logits, axis=-1)
-    return actions_from_decisions(
-        state,
-        enc,
-        fire,
-        target,
-        amount,
-        feat_params,
-    )
 
 
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
@@ -550,79 +458,44 @@ def main() -> None:
     rng = jax.random.PRNGKey(cfg.seed)
     rng, rng_reset, rng_model = jax.random.split(rng, 3)
     state = reset_from_bank(bank, rng_reset, cfg.ppo.num_envs)
-    raw_sample = encode_batch(state, feat_params)
-    sample = raw_sample if getattr(cfg.model, "use_transformer", False) else flatten_sources(raw_sample)
-    actor_type = str(getattr(cfg.model, "actor_type", "per_source") or "per_source").lower()
-    use_autoregressive = actor_type in {"autoregressive", "auto", "ar"}
-    if use_autoregressive:
-        sample = raw_sample
+    sample = encode_batch(state, feat_params)
     rollout_state_count = cfg.ppo.num_envs * cfg.ppo.rollout_steps
-    ppo_source_count = 1 if use_autoregressive else cfg.env.max_planets
+    ppo_source_count = 1
     ppo_states_per_minibatch = min(max(cfg.ppo.minibatch_size // ppo_source_count, 1), rollout_state_count)
     ppo_num_minibatches = max(rollout_state_count // ppo_states_per_minibatch, 1)
     optimizer_steps_per_update = cfg.ppo.epochs * ppo_num_minibatches
     total_optimizer_steps = cfg.ppo.total_updates * optimizer_steps_per_update
     warmup_steps = int(getattr(cfg.ppo, "warmup_updates", 0)) * optimizer_steps_per_update
     lr_schedule_name = _resolve_lr_schedule(cfg)
-    if use_autoregressive:
-        model = AutoregressiveActorCritic(
-            planet_dim=sample.planet_features.shape[-1],
-            relative_dim=sample.relative_features.shape[-1],
-            global_dim=sample.global_features.shape[-1],
-            relative_count=cfg.env.max_planets + 1,
-            ship_bucket_count=cfg.env.ship_bucket_count,
-            hidden_size=cfg.model.hidden_size,
-            use_cnn=cfg.model.use_cnn,
-            fleet_dim=FLEET_DIM,
-            max_fleet_tokens=feat_params.max_fleet_tokens,
-            num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
-            num_heads=getattr(cfg.model, "num_heads", 4),
-            max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
-            end_bias_init=float(getattr(cfg.model, "end_bias_init", -2.0)),
-        )
-        train_state = make_auto_train_state(
-            rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
-            max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
-            total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
-            lr_schedule=lr_schedule_name,
-            warmup_steps=warmup_steps,
-            min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
-        )
-    else:
-        model = ActorCritic(
-            planet_dim=sample.planet_features.shape[-1],
-            relative_dim=sample.relative_features.shape[-1],
-            global_dim=sample.global_features.shape[-1],
-            relative_count=cfg.env.max_planets + 1,
-            ship_bucket_count=cfg.env.ship_bucket_count,
-            hidden_size=cfg.model.hidden_size,
-            use_cnn=cfg.model.use_cnn,
-            use_transformer=getattr(cfg.model, "use_transformer", False),
-            fleet_dim=FLEET_DIM,
-            max_fleet_tokens=feat_params.max_fleet_tokens,
-            num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
-            num_heads=getattr(cfg.model, "num_heads", 4),
-            value_use_context=getattr(cfg.model, "value_use_context", False),
-        )
-        train_state = make_train_state(
-            rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
-            total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
-            lr_schedule=lr_schedule_name,
-            warmup_steps=warmup_steps,
-            min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
-        )
+    model = AutoregressiveActorCritic(
+        planet_dim=sample.planet_features.shape[-1],
+        relative_dim=sample.relative_features.shape[-1],
+        global_dim=sample.global_features.shape[-1],
+        relative_count=cfg.env.max_planets + 1,
+        ship_bucket_count=cfg.env.ship_bucket_count,
+        hidden_size=cfg.model.hidden_size,
+        use_cnn=cfg.model.use_cnn,
+        fleet_dim=FLEET_DIM,
+        max_fleet_tokens=feat_params.max_fleet_tokens,
+        num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
+        num_heads=getattr(cfg.model, "num_heads", 4),
+        max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
+        end_bias_init=float(getattr(cfg.model, "end_bias_init", -2.0)),
+    )
+    train_state = make_auto_train_state(
+        rng_model, model, sample, cfg.ppo.lr, cfg.ppo.max_grad_norm,
+        max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
+        total_steps=total_optimizer_steps if lr_schedule_name != "constant" else 0,
+        lr_schedule=lr_schedule_name,
+        warmup_steps=warmup_steps,
+        min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
+    )
     normalizer_state = init_normalizer()
 
-    # 自回归模型的 eval 推理路径：覆盖模块级函数，注入 model 闭包
-    if use_autoregressive:
-        _model_for_eval = model
-
-        def deterministic_policy_actions(ts, st, fp, ns, np):  # noqa: E501
-            return auto_deterministic_policy_actions(ts, _model_for_eval, st, fp, ns, np)
+    def deterministic_policy_actions(ts, st, fp, ns, np):  # noqa: E501
+        return auto_deterministic_policy_actions(ts, model, st, fp, ns, np)
 
     start_update = 1
-    init_checkpoint_params = None
-    init_checkpoint_normalizer_state = None
 
     def _resolve_config_path(path_value: str) -> Path:
         path = Path(path_value)
@@ -657,8 +530,6 @@ def main() -> None:
         train_state = train_state.replace(params=ckpt_params)
         if "normalizer_state" in ckpt:
             normalizer_state = ckpt["normalizer_state"]
-        init_checkpoint_params = ckpt_params
-        init_checkpoint_normalizer_state = ckpt.get("normalizer_state", normalizer_state)
         if getattr(cfg, "start_update_from_checkpoint", True):
             start_update = int(ckpt.get("update", 0)) + 1
         print(
@@ -666,32 +537,12 @@ def main() -> None:
             f"(ckpt_update={ckpt.get('update', 'unknown')}, start_update={start_update}); "
             "optimizer state is freshly initialized"
         )
-    opponent_checkpoint = None
-    opponent_ckpt = getattr(cfg, "opponent_checkpoint", None)
-    if opponent_ckpt:
-        opponent_checkpoint = load_checkpoint_opponent(_resolve_config_path(opponent_ckpt))
-        print(
-            f"[opponent] loaded checkpoint opponent {opponent_checkpoint.path} "
-            f"(ckpt_update={opponent_checkpoint.update if opponent_checkpoint.update is not None else 'unknown'})"
-        )
-    elif init_ckpt and init_checkpoint_params is not None:
-        opponent_checkpoint = load_checkpoint_opponent(_resolve_config_path(init_ckpt))
-
-    eval_checkpoint = opponent_checkpoint
-    eval_ckpt = getattr(cfg, "eval_checkpoint", None)
-    if eval_ckpt:
-        eval_checkpoint = load_checkpoint_opponent(_resolve_config_path(eval_ckpt))
-        print(
-            f"[eval] loaded checkpoint eval opponent {eval_checkpoint.path} "
-            f"(ckpt_update={eval_checkpoint.update if eval_checkpoint.update is not None else 'unknown'})"
-        )
 
     run_dir = Path(cfg.save_dir) / f"{cfg.run_name}_jax"
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.csv"
     eval_opponents = default_eval_opponents(
-        ROOT,
-        checkpoint_opponent=eval_checkpoint,
+        WORKSPACE_ROOT,
         enabled_names=getattr(cfg.eval, "opponents", None),
     )
     eval_metric_fields = build_eval_metric_fields(eval_opponents)
@@ -767,7 +618,8 @@ def main() -> None:
 
     opponent_name = getattr(cfg, "opponent", "nearest")
     self_play = opponent_name == "self"
-    checkpoint_play = opponent_name == "checkpoint"
+    if opponent_name == "checkpoint":
+        raise ValueError("opponent='checkpoint' was removed; use self-play/pool or external eval opponents")
     use_pool = opponent_name == "pool"
     # 对手池模式：
     # - current: 全程对当前策略自博弈，每个 update 前同步 opponent_params。
@@ -820,7 +672,7 @@ def main() -> None:
             print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size}, "
                   f"include_nearest={pool_include_nearest})")
     else:
-        print(f"opponent={'checkpoint' if checkpoint_play else ('self_play' if self_play else 'nearest')}")
+        print(f"opponent={'self_play' if self_play else 'nearest'}")
     opponent_update_freq = cfg.self_play_update_interval  # 默认 25
     eval_enabled = getattr(cfg.eval, "enabled", True)
     eval_interval = cfg.eval.every            # 每多少 update 评估一次
@@ -832,18 +684,9 @@ def main() -> None:
     eval_seed = cfg.eval.seed
     log_every = int(getattr(cfg, "log_every", 1))
     checkpoint_every = getattr(cfg, "checkpoint_every", 100)
-    checkpoint_model = opponent_checkpoint.model if opponent_checkpoint is not None else model
-    checkpoint_feat_params = opponent_checkpoint.feat_params if opponent_checkpoint is not None else feat_params
-    checkpoint_normalizer_state = opponent_checkpoint.normalizer_state if opponent_checkpoint is not None else normalizer_state
 
     # 冻结对手权重（初始与学习器相同，每 opponent_update_freq 步同步一次）
-    opponent_params = (
-        jax.tree_util.tree_map(lambda x: x, opponent_checkpoint.params)
-        if checkpoint_play and opponent_checkpoint is not None
-        else jax.tree_util.tree_map(lambda x: x, train_state.params)
-    )
-    if checkpoint_play and opponent_checkpoint is None:
-        raise ValueError("opponent='checkpoint' requires opponent_checkpoint or init_from_checkpoint")
+    opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     # lag_snapshot 保存“上一个 interval 起点的策略”；新 lag_checkpoint/PFSP 接口到下一个
     # interval 时才发布，因此 lag 对手是真正间隔 pool_lag_interval 的 checkpoint。
     lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
@@ -914,100 +757,44 @@ def main() -> None:
             if invalid:
                 raise ValueError(f"{phase_name} contains unknown opponents: {invalid}")
 
-    # JIT 编译的训练步（JAX-native 对手），供 pool 模式按需调用。
-    # rollout 收集 + GAE 和 PPO 更新分别 JIT；PPO 的 KL 早停在 JIT 内完成。
-    if use_autoregressive:
-        max_action_tokens = int(getattr(cfg.model, "max_action_tokens", 16))
-        _jit_nearest = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
-                max_action_tokens=max_action_tokens,
-            )
+    # JIT 编译的 autoregressive 训练步（JAX-native 对手），供 pool 模式按需调用。
+    max_action_tokens = int(getattr(cfg.model, "max_action_tokens", 16))
+    _jit_nearest = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, cfg.ppo.rollout_steps, "nearest",
+            max_action_tokens=max_action_tokens,
         )
-        _jit_selfplay = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
-                max_action_tokens=max_action_tokens,
-            )
+    )
+    _jit_selfplay = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
+            max_action_tokens=max_action_tokens,
         )
-        _jit_checkpoint = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
-                max_action_tokens=max_action_tokens,
-            )
+    )
+    _jit_step = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, cfg.ppo.rollout_steps,
+            "selfplay" if self_play else "nearest",
+            max_action_tokens=max_action_tokens,
         )
-        _jit_step = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model,
-                checkpoint_model if checkpoint_play else model,
-                checkpoint_feat_params if checkpoint_play else feat_params,
-                cfg.ppo.rollout_steps,
-                "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
-                max_action_tokens=max_action_tokens,
-            )
-        )
-    else:
-        _jit_nearest = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "nearest",
-            )
-        )
-        _jit_selfplay = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, model, feat_params, cfg.ppo.rollout_steps, "selfplay",
-            )
-        )
-        _jit_checkpoint = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-                ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
-                reward_params, ppo_params, model, checkpoint_model, checkpoint_feat_params, cfg.ppo.rollout_steps, "checkpoint",
-            )
-        )
-        # 兼容旧配置（opponent: nearest / self）
-        _jit_step = jax.jit(
-            lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout(
-                ts,
-                opp_p,
-                opp_ns,
-                st,
-                ns,
-                key,
-                bank,
-                env_params,
-                feat_params,
-                norm_params,
-                reward_params,
-                ppo_params,
-                model,
-                checkpoint_model if checkpoint_play else model,
-                checkpoint_feat_params if checkpoint_play else feat_params,
-                cfg.ppo.rollout_steps,
-                "checkpoint" if checkpoint_play else ("selfplay" if self_play else "nearest"),
-            )
-        )
+    )
 
     def _run_step(jit_fn, ts, opp_p, opp_ns, st, ns, key, ent_scale):
         """JIT 收集 rollout，然后在 Python 层执行 PPO 更新（含 KL 早停）。"""
         ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, opp_ns, st, ns, key)
-        if use_autoregressive:
-            ts, ppo_metrics = ppo_update_auto(
-                ts,
-                rollout,
-                returns,
-                advantages,
-                ppo_params,
-                ppo_rng,
-                int(getattr(cfg.model, "max_action_tokens", 16)),
-                ent_scale,
-            )
-        else:
-            ts, ppo_metrics = ppo_update(ts, rollout, returns, advantages, ppo_params, ppo_rng, ent_scale)
+        ts, ppo_metrics = ppo_update_auto(
+            ts,
+            rollout,
+            returns,
+            advantages,
+            ppo_params,
+            ppo_rng,
+            max_action_tokens,
+            ent_scale,
+        )
         return ts, st, ns, {**ppo_metrics, **ep_metrics}
 
     def _run_named_opponent(opponent_id: str, ts, st, ns, key, ent_scale):
@@ -1024,7 +811,7 @@ def main() -> None:
         selected_pool_id = ""
 
         # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
-        if (use_pool and current_pool) or ((not checkpoint_play) and (update - 1) % max(opponent_update_freq, 1) == 0):
+        if (use_pool and current_pool) or ((update - 1) % max(opponent_update_freq, 1) == 0):
             opponent_params = _copy_params(train_state.params)
             if self_play or use_pool:
                 print(f"[pool] update={update} 同步 selfplay-current 对手权重")
@@ -1074,13 +861,10 @@ def main() -> None:
                     train_state, state, normalizer_state, metrics = _run_step(
                         _jit_selfplay, train_state, selected_pool_entry["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
         else:
-            # 兼容旧配置（opponent: nearest / self）
             if self_play and update % opponent_update_freq == 1:
                 pass  # already synced above
-            step_jit = _jit_checkpoint if checkpoint_play else _jit_step
-            step_opp_norm = checkpoint_normalizer_state if checkpoint_play else normalizer_state
             train_state, state, normalizer_state, metrics = _run_step(
-                step_jit, train_state, opponent_params, step_opp_norm, state, normalizer_state, step_key, ent_scale)
+                _jit_step, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
         metrics = jax.device_get(metrics)
         current_lr = _current_lr(cfg, int(jax.device_get(train_state.step)), total_optimizer_steps, warmup_steps)
         metrics["lr"] = current_lr
@@ -1107,17 +891,16 @@ def main() -> None:
                 line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
             else:
                 line += f" opp={selected_pool_id}"
-        if use_autoregressive:
-            line += (
-                f" invalid={metrics.get('invalid_action_rate', 0.0):.3f}"
-                f" exec={metrics.get('executed_action_rate', 0.0):.3f}"
-                f" seq={metrics.get('seq_len_mean', 0.0):.2f}"
-                f" logr_heads="
-                f"{metrics.get('max_abs_log_ratio_end', 0.0):.1f}/"
-                f"{metrics.get('max_abs_log_ratio_src', 0.0):.1f}/"
-                f"{metrics.get('max_abs_log_ratio_tgt', 0.0):.1f}/"
-                f"{metrics.get('max_abs_log_ratio_amt', 0.0):.1f}"
-            )
+        line += (
+            f" invalid={metrics.get('invalid_action_rate', 0.0):.3f}"
+            f" exec={metrics.get('executed_action_rate', 0.0):.3f}"
+            f" seq={metrics.get('seq_len_mean', 0.0):.2f}"
+            f" logr_heads="
+            f"{metrics.get('max_abs_log_ratio_end', 0.0):.1f}/"
+            f"{metrics.get('max_abs_log_ratio_src', 0.0):.1f}/"
+            f"{metrics.get('max_abs_log_ratio_tgt', 0.0):.1f}/"
+            f"{metrics.get('max_abs_log_ratio_amt', 0.0):.1f}"
+        )
         if update % log_every == 0:
             print(line, flush=True)
 
@@ -1158,7 +941,6 @@ def main() -> None:
                 base_seed=eval_seed + update,
                 rng=eval_rng,
                 deterministic_policy_actions=deterministic_policy_actions,
-                deterministic_policy_actions_params=deterministic_policy_actions_params,
                 nearest_opponent_actions=nearest_opponent_actions,
                 reset_from_bank=reset_from_bank,
                 flip_state=flip_state,
@@ -1269,7 +1051,7 @@ def main() -> None:
                     "autoregressive/invalid_action_rate": float(metrics.get("invalid_action_rate", 0.0)),
                     "autoregressive/executed_action_rate": float(metrics.get("executed_action_rate", 0.0)),
                     "autoregressive/seq_len_mean": float(metrics.get("seq_len_mean", 0.0)),
-                } if use_autoregressive else {}),
+                }),
             }, step=update)
             if use_pool:
                 if current_pool:
@@ -1306,185 +1088,6 @@ def reset_from_bank(bank: EnvState, rng, num_envs: int) -> EnvState:
     return select_from_bank(bank, idx)
 
 
-def collect_rollout(
-    train_state,
-    opponent_params,
-    opponent_normalizer_state,
-    state,
-    normalizer_state,
-    rng,
-    bank,
-    env_params,
-    feat_params,
-    norm_params,
-    reward_params,
-    ppo_params,
-    model,
-    opponent_model,
-    opponent_feat_params,
-    rollout_steps: int,
-    opponent_kind: str = "nearest",
-):
-    """收集 rollout，计算 GAE 和 episode 统计（JIT 安全，不含 PPO 更新）。
-
-    1. lax.scan 循环 rollout_steps 步：特征展开 + 采样 + step 环境 + 奖励 + done 处理。
-    2. 计算最后状态价值 + GAE 估计。
-    3. 计算 episode 统计（win_rate, episode_reward 等）。
-    注：PPO 更新由调用方单独执行；ppo_update 自身是 JIT 编译的，
-    KL 早停在 JIT 内用 while_loop 完成。
-
-    opponent_params: 冻结的对手权重 pytree（opponent_kind 为 selfplay/checkpoint 时使用）。
-    """
-    rng, rollout_key = jax.random.split(rng)
-
-    num_envs = state.planets.shape[0]
-    max_planets = feat_params.max_planets
-    window = reward_params.failed_capture_window  # 通常 50
-    use_failed_capture = reward_params.failed_capture_penalty != 0.0
-
-    # 环形历史缓冲区：记录过去 window 步内每个 (env, slot) 的发射动作和目标
-    fire_hist   = jnp.zeros((window, num_envs, max_planets), dtype=bool)
-    target_hist = jnp.zeros((window, num_envs, max_planets), dtype=jnp.int32)
-    step_cnt    = jnp.array(0, dtype=jnp.int32)
-
-    def body(carry, _):
-        """lax.scan 循环体：处理单步。"""
-        ts, st, ns, key, fire_hist, target_hist, step_cnt = carry
-        key, action_key, opp_key, reset_key = jax.random.split(key, 4)
-        raw_encoded = encode_batch(st, feat_params)
-        encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        fire_2d, target_2d, amount_2d, logp, value = policy_sample(ts, model, encoded, action_key)
-        learner_actions, learner_policy_mask = actions_from_decisions_with_policy_mask(
-            st,
-            encoded,
-            fire_2d,
-            target_2d,
-            amount_2d,
-            feat_params,
-        )
-        # 对手动作：训练对手必须是 JAX-native，保证 rollout 仍可 JIT。
-        if opponent_kind == "selfplay" or opponent_kind == "checkpoint":
-            opp_norm_state = opponent_normalizer_state if opponent_kind == "checkpoint" else ns
-            opp_model = opponent_model if opponent_kind == "checkpoint" else model
-            opp_feat_params = opponent_feat_params if opponent_kind == "checkpoint" else feat_params
-            opponent_actions = selfplay_policy_actions(
-                st,
-                opponent_params,
-                opp_model,
-                opp_norm_state,
-                opp_feat_params,
-                norm_params,
-                opp_key,
-                flip_state_fn=flip_state,
-                policy_sample_params_fn=policy_sample_params,
-                actions_from_decisions_fn=actions_from_decisions,
-            )
-        else:
-            opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
-        joint = jnp.stack([learner_actions, opponent_actions], axis=1)  # 双方动作合并
-        next_state = step_batch(st, joint, env_params)
-        reward_env, reward_parts = reward_from_transition(st, next_state, learner_actions, reward_params)
-
-        # ── failed-capture 惩罚 ─────────────────────────────────────────────────
-        # 读出 window 步前在同一环形 slot 的发射记录
-        hist_slot = step_cnt % window
-        old_fire   = jax.lax.dynamic_index_in_dim(fire_hist,   hist_slot, axis=0, keepdims=False)  # [B, P]
-        old_target = jax.lax.dynamic_index_in_dim(target_hist, hist_slot, axis=0, keepdims=False)  # [B, P]
-        # 查当前目标星球 owner：planets [B, P_all, 7]，第 1 列 owner（0=player0, 1=player1）
-        # learner 是 player 0
-        cur_owner = st.planets[:, :, 1].astype(jnp.int32)   # [B, P_all]
-        # old_target 是 candidate index：0=no-op, 1=planet slot 0, ...
-        # 映射到 planets owner 时需要减 1。
-        safe_target = jnp.clip(old_target - 1, 0, max_planets - 1)
-        target_owner = jnp.take_along_axis(cur_owner, safe_target, axis=-1)  # [B, P]
-        is_noop_target = (old_target == 0)
-        # 判断失败：window 步前有发射 & 目标不是 noop & 目标现在不属于 player0
-        failed = old_fire & (~is_noop_target) & (target_owner != 0)   # [B, P]
-        source_mask_1d = encoded.source_mask   # [B, P] bool
-        failed = failed & source_mask_1d
-        failed_penalty = jnp.where(
-            use_failed_capture,
-            failed.astype(jnp.float32).sum(axis=-1) * reward_params.failed_capture_penalty,
-            0.0,
-        )  # [B]
-        reward_env = reward_env - failed_penalty
-
-        # 更新环形缓冲区（done 时清掉该 env 行，防止跨局污染）
-        done_env = next_state.done  # [B]
-        fire_hist_new   = fire_hist.at[hist_slot].set(jnp.where(done_env[:, None], False,  fire_2d))
-        target_hist_new = target_hist.at[hist_slot].set(jnp.where(done_env[:, None], 0,    target_2d))
-        step_cnt_new = step_cnt + 1
-        # ───────────────────────────────────────────────────────────────────────
-
-        reward = jnp.repeat(reward_env[:, None], feat_params.max_planets, axis=1)  # 扩展到 P 维
-        done = jnp.repeat(next_state.done[:, None], feat_params.max_planets, axis=1)
-        reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
-        next_state = replace_done(next_state, reset_state)  # 局结环境自动重置
-        row = Rollout(
-            encoded.planet_features,
-            encoded.relative_features,
-            encoded.global_features,
-            encoded.map_features,
-            encoded.fleet_features,
-            encoded.fleet_mask,
-            encoded.candidate_mask,
-            encoded.amount_mask,
-            encoded.source_mask,
-            learner_policy_mask,
-            fire_2d,
-            target_2d,
-            amount_2d,
-            logp,
-            value,
-            reward,
-            done,
-        )
-        return (ts, next_state, ns, key, fire_hist_new, target_hist_new, step_cnt_new), row
-
-    (train_state, state, normalizer_state, rng, _fh, _th, _sc), rollout = jax.lax.scan(
-        body,
-        (train_state, state, normalizer_state, rollout_key, fire_hist, target_hist, step_cnt),
-        None,
-        length=rollout_steps,
-    )
-    last_raw_encoded = encode_batch(state, feat_params)
-    last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
-    last_out = train_state.apply_fn(
-        {"params": train_state.params},
-        last_encoded.planet_features,
-        last_encoded.relative_features,
-        last_encoded.global_features,
-        last_encoded.candidate_mask,
-        last_encoded.map_features,
-        jnp.zeros(last_encoded.planet_features.shape[:-1], dtype=jnp.int32),
-        fleet_features=last_encoded.fleet_features,
-        fleet_mask=last_encoded.fleet_mask,
-    )
-    last_values = last_out.value
-    returns, advantages = compute_gae(rollout.reward, rollout.done, rollout.old_value, last_values, ppo_params)
-    # rollout.done: [T, B, P]，每步每 env 的结束标志（P 维相同）
-    # rollout.reward: [T, B, P]，只有 done=True 那步有 ±1，其余为 0
-    finished = rollout.done.any(axis=-1)          # [T, B] 该步是否有局结束
-    ep_reward = rollout.reward.mean(axis=-1)       # [T, B] 对 P 维平均（P 维全同）
-    # episode_reward：只统计已结束局的终局奖励均值（非零步），反映真实胜负
-    ep_reward_sum = jnp.where(finished, ep_reward, 0.0).sum()
-    episodes = jnp.maximum(finished.sum(), 1)
-    episode_reward = ep_reward_sum / episodes
-    # win_rate：结束局中学习方获胜（reward > 0）的比率
-    wins = ((ep_reward > 0.0) & finished).sum()
-    win_rate = wins / episodes
-    # mean_return：rollout 内所有样本 return（GAE 回报）的均值，反映 value 估计水平
-    mean_return = returns.mean()
-    ep_metrics = {
-        "episode_reward": episode_reward,   # 已结束局的终局奖励均值（接近 ±1）
-        "win_rate": win_rate,               # 已结束局中的胜率
-        "mean_return": mean_return,         # GAE 回报均值
-        "episodes_per_rollout": finished.sum().astype(jnp.float32),  # 每次 rollout 完成的局数
-    }
-    # 返回 rollout 数据供 Python 层调用 ppo_update（rng 供 ppo_update 中 minibatch shuffle）
-    return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
-
-
 def collect_rollout_auto(
     train_state,
     opponent_params,
@@ -1499,16 +1102,13 @@ def collect_rollout_auto(
     reward_params,
     ppo_params,
     model,
-    opponent_model,
-    opponent_feat_params,
     rollout_steps: int,
     opponent_kind: str = "nearest",
     max_action_tokens: int = 16,
 ):
     """Collect state-level autoregressive rollout.
 
-    V1 supports the nearest JAX opponent for training. Legacy/checkpoint
-    opponents remain available through the per-source actor path.
+    Supports nearest-rule training and autoregressive self-play/pool opponents.
     """
     rng, rollout_key = jax.random.split(rng)
 
@@ -1519,16 +1119,13 @@ def collect_rollout_auto(
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
-        if opponent_kind == "selfplay" or opponent_kind == "checkpoint":
-            opp_ns = opponent_normalizer_state if opponent_kind == "checkpoint" else ns
-            opp_m = opponent_model if opponent_kind == "checkpoint" else model
-            opp_fp = opponent_feat_params if opponent_kind == "checkpoint" else feat_params
+        if opponent_kind == "selfplay":
             opponent_actions = auto_opponent_policy_actions(
                 st,
                 opponent_params,
-                opp_m,
-                opp_fp,
-                opp_ns,
+                model,
+                feat_params,
+                ns,
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,
@@ -1613,60 +1210,6 @@ def collect_rollout_auto(
         "episodes_per_rollout": finished.sum().astype(jnp.float32),
     }
     return train_state, state, normalizer_state, rollout, returns, advantages, rng, ep_metrics
-
-
-def policy_sample(train_state, model, encoded, rng):
-    """两阶段采样策略。
-
-    第一步：传入 zeros target 前向 -> 采 fire/target。
-    第二步：传入真实 target 前向 -> 采 amount，并计算联合 logp。
-    与 log_prob_entropy 训练路径完全一致。
-    """
-    zeros = jnp.zeros(encoded.planet_features.shape[:-1], dtype=jnp.int32)
-    out1 = train_state.apply_fn(
-        {"params": train_state.params},
-        encoded.planet_features,
-        encoded.relative_features,
-        encoded.global_features,
-        encoded.candidate_mask,
-        encoded.map_features,
-        zeros,
-        fleet_features=encoded.fleet_features,
-        fleet_mask=encoded.fleet_mask,
-    )
-    rng_fire, rng_target, rng_amount = jax.random.split(rng, 3)
-    has_target = encoded.candidate_mask.at[..., 0].set(False).any(axis=-1) & encoded.source_mask
-    fire_logits = jnp.where(has_target, out1.fire_logits, -1.0e8)  # 没有可用目标时强制 fire=0
-    fire = jax.random.uniform(rng_fire, fire_logits.shape) < jax.nn.sigmoid(fire_logits)
-    # 屏蔽 no-op slot，使 target 必须是阵中星球
-    target_logits = jnp.where(encoded.candidate_mask.at[..., 0].set(False), out1.target_logits, NEG_INF)
-    target_logits = jnp.where(fire[..., None], target_logits, NEG_INF).at[..., 0].set(jnp.where(fire, target_logits[..., 0], 0.0))
-    target_logits = safe_logits(target_logits)
-    target = jax.random.categorical(rng_target, target_logits, axis=-1)
-    out2 = train_state.apply_fn(
-        {"params": train_state.params},
-        encoded.planet_features,
-        encoded.relative_features,
-        encoded.global_features,
-        encoded.candidate_mask,
-        encoded.map_features,
-        target,
-        fleet_features=encoded.fleet_features,
-        fleet_mask=encoded.fleet_mask,
-    )
-    selected_amount_mask = jnp.take_along_axis(encoded.amount_mask, target[..., None, None], axis=-2).squeeze(-2)
-    amount_logits = jnp.where(selected_amount_mask, out2.amount_logits, NEG_INF)
-    amount_logits = jnp.where((~selected_amount_mask.any(axis=-1))[..., None], 0.0, amount_logits)
-    amount = jax.random.categorical(rng_amount, amount_logits, axis=-1)
-    logp, _entropy, _entropy_fire, _entropy_target, _entropy_amount = log_prob_entropy(
-        out2,
-        fire,
-        target,
-        amount,
-        encoded.candidate_mask,
-        encoded.amount_mask,
-    )
-    return fire, target, amount, logp, out1.value
 
 
 def _bernoulli_log_prob_local(logits, action_bool):
@@ -1837,50 +1380,6 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         "old_logp_amt": old_logp_amt,
         "value": value,
     }
-
-
-def actions_from_decisions(state, encoded, fire, target, amount, params: FeatureParams):
-    """将网络决策转换为游戏动作 [from_id, angle_rad, ships]。
-
-    fire=False 或 target=0 (属于 no-op) 时输出全 0。
-    """
-    actions, _policy_mask = actions_from_decisions_with_policy_mask(state, encoded, fire, target, amount, params)
-    return actions
-
-
-def actions_from_decisions_with_policy_mask(state, encoded, fire, target, amount, params: FeatureParams):
-    """转换动作，并返回 PPO policy mask。
-
-    fire=True 但物理瞄准不可达的动作会被安全层变成 no-op；这类样本不应
-    用 raw fire/target/amount 的 logp 更新 policy。真实 no-op(fire=False)
-    和真实执行动作继续参与 policy loss。
-    """
-    b, p = fire.shape
-    source_ids = encoded.source_ids.astype(jnp.float32)
-    ships = jnp.take_along_axis(encoded.ship_buckets, amount[..., None], axis=-1).squeeze(-1)
-    target_idx = jnp.clip(target - 1, 0, params.max_planets - 1)
-    batch_idx = jnp.arange(b)[:, None]
-    target_planets = state.planets[batch_idx, target_idx]
-    src_planets = state.planets
-    angle, aim_hit = aim_with_prediction_jax(
-        src_planets,
-        target_planets,
-        target_idx,
-        state,
-        ships,
-    )
-    valid = fire & (target > 0) & encoded.source_mask & aim_hit
-    attempted_invalid = fire & (target > 0) & encoded.source_mask & (~aim_hit)
-    policy_mask = encoded.source_mask & (~attempted_invalid)
-    actions = jnp.stack(
-        [
-            jnp.where(valid, source_ids, 0.0),
-            jnp.where(valid, angle, 0.0),
-            jnp.where(valid, ships, 0.0),
-        ],
-        axis=-1,
-    )
-    return actions, policy_mask
 
 
 def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):

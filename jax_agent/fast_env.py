@@ -67,6 +67,7 @@ class EnvParams:
 
 
 def fleet_speed(ships: jnp.ndarray, max_speed: float = 6.0) -> jnp.ndarray:
+    """根据舰队船数计算移动速度，公式与 Kaggle 环境保持一致。"""
     ships_f = jnp.maximum(ships.astype(jnp.float32), 1.0)
     ratio = jnp.clip(jnp.log(ships_f) / jnp.log(1000.0), 0.0, 1.0)
     speed = 1.0 + (max_speed - 1.0) * (ratio**1.5)
@@ -81,6 +82,7 @@ def point_segment_distance_sq(
     x1: jnp.ndarray,
     y1: jnp.ndarray,
 ) -> jnp.ndarray:
+    """计算点到线段的距离平方，用于连续碰撞检测。"""
     dx = x1 - x0
     dy = y1 - y0
     denom = jnp.maximum(dx * dx + dy * dy, 1e-9)
@@ -93,6 +95,7 @@ def point_segment_distance_sq(
 
 
 def empty_state(params: EnvParams = EnvParams()) -> EnvState:
+    """创建固定形状的空环境状态。"""
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
     fleets = jnp.zeros((params.max_fleets, 7), dtype=jnp.float32)
     return EnvState(
@@ -117,7 +120,7 @@ def empty_state(params: EnvParams = EnvParams()) -> EnvState:
 
 
 def state_from_observation(observation: Any, params: EnvParams = EnvParams()) -> EnvState:
-    """Convert a Kaggle observation object/dict into padded JAX arrays."""
+    """把 Kaggle observation 对象或 dict 转成固定形状 JAX state。"""
 
     def read(obj: Any, key: str, default: Any = None) -> Any:
         if isinstance(obj, dict):
@@ -175,12 +178,11 @@ def comet_arrays_from_observation(
     planet_id_to_slot: dict[int, int],
     planets_np: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Convert live Kaggle comet groups into fixed JAX arrays.
+    """把 Kaggle 当前 observation 里的彗星组转成固定形状数组。
 
-    Kaggle observations keep comets as dynamic groups:
+    Kaggle observation 用动态列表保存彗星：
       {"planet_ids": [...], "paths": [[[x,y], ...], ...], "path_index": k}
-    JAX features/aiming need the same data in fixed slots, keyed by the
-    planet slot currently occupied by each comet.
+    JAX 特征和瞄准逻辑需要固定槽位，因此这里按彗星当前占用的 planet slot 重排。
     """
 
     def read(obj: Any, key: str, default: Any = None) -> Any:
@@ -226,6 +228,7 @@ def comet_arrays_from_observation(
 
 
 def load_state_bank(path: str | Path, params: EnvParams = EnvParams()) -> EnvState:
+    """读取预生成初始状态池，训练 reset 时直接抽样使用。"""
     data = np.load(path)
     n = data["planets"].shape[0]
 
@@ -254,6 +257,7 @@ def load_state_bank(path: str | Path, params: EnvParams = EnvParams()) -> EnvSta
 
 
 def select_from_bank(bank: EnvState, indices: jnp.ndarray) -> EnvState:
+    """从 state bank 中按下标取一批初始状态。"""
     return EnvState(
         planets=bank.planets[indices],
         initial_planets=bank.initial_planets[indices],
@@ -276,16 +280,17 @@ def select_from_bank(bank: EnvState, indices: jnp.ndarray) -> EnvState:
 
 
 def step_batch(state: EnvState, actions: jnp.ndarray, params: EnvParams) -> EnvState:
-    """Batched step.
+    """批量推进环境一步。
 
-    actions shape: [B, 2, max_actions, 3], where each action is
-    [from_planet_id, angle_rad, ships].
+    actions 形状为 [B, 2, max_actions, 3]，每条动作是
+    [from_planet_id, angle_rad, ships]。
     """
 
     return jax.vmap(lambda s, a: step_single(s, a, params))(state, actions)
 
 
 def step_single(state: EnvState, actions: jnp.ndarray, params: EnvParams) -> EnvState:
+    """推进单局一回合；已结束的局面保持不变。"""
     actions = actions.astype(jnp.float32)
     state = jax.lax.cond(state.done, lambda x: x, lambda x: _active_step(x, actions, params), state)
     return state
@@ -381,6 +386,7 @@ def _launch_one(state: EnvState, player: jnp.ndarray, action: jnp.ndarray, param
 
 
 def comet_planet_mask(state: EnvState) -> jnp.ndarray:
+    """返回哪些 planet slot 当前被彗星占用。"""
     valid_slots = state.comet_slots.reshape(-1)
     valid_slots = jnp.where(valid_slots >= 0, valid_slots, 0)
     active = (state.comet_path_index[:, None] >= -1) & (state.comet_slots >= 0)
@@ -389,6 +395,7 @@ def comet_planet_mask(state: EnvState) -> jnp.ndarray:
 
 
 def _expire_comets(state: EnvState) -> EnvState:
+    """清理路径已经走完的彗星，并释放对应 planet slot。"""
     idx = state.comet_path_index
     min_len = jnp.where(state.comet_lengths > 0, state.comet_lengths, MAX_COMET_PATH + 1).min(axis=1)
     expired = (idx >= min_len) & (idx >= -1)
@@ -405,6 +412,7 @@ def _expire_comets(state: EnvState) -> EnvState:
 
 
 def _spawn_comets(state: EnvState) -> EnvState:
+    """在固定回合触发彗星生成；路径来自预计算数据。"""
     spawn_match = COMET_SPAWN_STEPS == (state.step + 1)
     spawn_idx = jnp.argmax(spawn_match)
     should_spawn = spawn_match.any() & state.comet_valid[spawn_idx] & (state.comet_path_index[spawn_idx] == -2)
@@ -412,6 +420,7 @@ def _spawn_comets(state: EnvState) -> EnvState:
 
 
 def _spawn_comet_group(state: EnvState, spawn_idx: jnp.ndarray) -> EnvState:
+    """把一批彗星写入空闲 planet slot。"""
     free_order = jnp.argsort(state.planet_alive.astype(jnp.int32))
     slots = free_order[:COMETS_PER_SPAWN]
     max_id = jnp.where(state.planet_alive, state.planets[:, 0], -1.0).max()
@@ -438,6 +447,7 @@ def _spawn_comet_group(state: EnvState, spawn_idx: jnp.ndarray) -> EnvState:
 
 
 def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+    """移动普通舰队，并收集撞星球产生的战斗贡献。"""
     fleets = state.fleets
     old_x = fleets[:, 2]
     old_y = fleets[:, 3]
@@ -480,6 +490,7 @@ def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndar
 
 
 def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+    """旋转行星，并处理行星扫过舰队时产生的碰撞。"""
     old_x = state.planets[:, 2]
     old_y = state.planets[:, 3]
     init = state.initial_planets
@@ -520,6 +531,7 @@ def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvSt
 
 
 def _move_comets_and_sweep(state: EnvState) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+    """沿预计算路径移动彗星，并处理彗星扫过舰队的碰撞。"""
     active = state.comet_path_index >= -1
 
     def body(i: jnp.ndarray, carry):
@@ -532,6 +544,7 @@ def _move_comets_and_sweep(state: EnvState) -> tuple[EnvState, jnp.ndarray, jnp.
 
 
 def _move_one_comet_group(i: jnp.ndarray, state: EnvState, combat0: jnp.ndarray, combat1: jnp.ndarray):
+    """移动单个彗星组，返回更新后的状态和战斗贡献。"""
     new_index = state.comet_path_index[i] + 1
     slots = state.comet_slots[i]
     safe_slots = jnp.where(slots >= 0, slots, 0)
@@ -626,6 +639,7 @@ def _update_terminal(state: EnvState, params: EnvParams) -> EnvState:
 
 
 def scores(state: EnvState) -> jnp.ndarray:
+    """计算双方当前总分：星球驻军 + 飞行舰队船数。"""
     if state.planets.ndim == 3:
         return jax.vmap(scores)(state)
     owner = state.planets[:, 1].astype(jnp.int32)

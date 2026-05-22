@@ -1,4 +1,4 @@
-"""JAX training/eval opponent adapters."""
+"""JAX 训练与评估对手适配器。"""
 
 from .opponents import (
     EvalContext,

@@ -200,10 +200,10 @@ def jax_actions_to_kaggle(actions_arr) -> list:
 
 
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
-    """Deterministic (argmax) autoregressive policy rollout for eval.
+    """评估用贪心自回归策略。
 
-    Mirrors auto_policy_sample but uses argmax instead of sampling.
-    Returns actions shaped [B, max_planets, 3].
+    逻辑与 auto_policy_sample 对齐，但所有 head 都使用 argmax，不采样。
+    返回动作形状为 [B, max_planets, 3]。
     """
     raw_enc = encode_batch(state, feat_params)
     encoded = normalize_encoded(raw_enc, norm_state, norm_params)
@@ -314,10 +314,10 @@ def auto_opponent_policy_actions(
     *,
     flip_state_fn,
 ):
-    """Autoregressive opponent (frozen params, greedy) for self-play training rollout.
+    """自博弈训练用的冻结参数贪心对手。
 
-    Mirrors auto_deterministic_policy_actions but calls model.apply with
-    opponent_params directly so it works inside jax.lax.scan.
+    它先把棋盘翻转到 player 1 视角，再用冻结的 opponent_params 生成动作。
+    这里直接调用 model.apply，保证能在 jax.lax.scan 里运行。
     """
     flipped = flip_state_fn(state)
     raw_enc = encode_batch(flipped, opp_fp)
@@ -862,7 +862,7 @@ def main() -> None:
                         _jit_selfplay, train_state, selected_pool_entry["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
         else:
             if self_play and update % opponent_update_freq == 1:
-                pass  # already synced above
+                pass  # 上面已经同步过 current 对手。
             train_state, state, normalizer_state, metrics = _run_step(
                 _jit_step, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
         metrics = jax.device_get(metrics)
@@ -1038,7 +1038,7 @@ def main() -> None:
                 "lr/current": float(metrics.get("lr", cfg.ppo.lr)),
                 "charts/sps": float(sps),
                 "charts/seq_len_mean": float(metrics.get("seq_len_mean", 0.0)),
-                # autoregressive-specific metrics
+                # 自回归 actor 专属指标
                 **({
                     "entropy/end": float(metrics.get("entropy_end", 0.0)),
                     "entropy/src": float(metrics.get("entropy_src", 0.0)),
@@ -1106,9 +1106,9 @@ def collect_rollout_auto(
     opponent_kind: str = "nearest",
     max_action_tokens: int = 16,
 ):
-    """Collect state-level autoregressive rollout.
+    """收集状态级自回归 rollout。
 
-    Supports nearest-rule training and autoregressive self-play/pool opponents.
+    支持 nearest 规则对手，以及自回归 self-play / pool 对手。
     """
     rng, rollout_key = jax.random.split(rng)
 
@@ -1213,15 +1213,18 @@ def collect_rollout_auto(
 
 
 def _bernoulli_log_prob_local(logits, action_bool):
+    """rollout 采样阶段使用的 Bernoulli log-prob。"""
     action = action_bool.astype(jnp.float32)
     return -jax.nn.softplus(jnp.where(action_bool, -logits, logits))
 
 
 def _categorical_log_prob_local(logits, action):
+    """rollout 采样阶段使用的离散动作 log-prob。"""
     return jnp.take_along_axis(jax.nn.log_softmax(logits), action[..., None], axis=-1).squeeze(-1)
 
 
 def dynamic_ship_buckets(ships, bucket_count: int):
+    """根据当前剩余兵力动态生成派兵档位。"""
     ratios = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)[:bucket_count]
     s = jnp.floor(ships)
     raw = jnp.clip(jnp.round(s[:, None] * ratios[None, :]), 10.0, s[:, None])
@@ -1229,7 +1232,7 @@ def dynamic_ship_buckets(ships, bucket_count: int):
 
 
 def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: FeatureParams, max_action_tokens: int):
-    """Autoregressive rollout sampling with post-sample physics validation."""
+    """自回归 rollout 采样，并在采样后做物理层校验。"""
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
     initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships], axis=1)
@@ -1701,7 +1704,7 @@ def fleet_speed_local(ships):
 
 
 def replace_done(state: EnvState, reset: EnvState) -> EnvState:
-    """局结环境用 reset 收筞替换。"""
+    """局面结束时，用 reset 状态替换已结束的环境。"""
     mask = state.done
 
     def choose(a, b):

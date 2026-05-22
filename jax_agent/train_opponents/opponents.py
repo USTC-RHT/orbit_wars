@@ -1,8 +1,7 @@
-"""JAX-native training opponents.
+"""JAX 原生训练对手。
 
-These functions are called from the JIT-compiled rollout path.  Do not call
-Python/kaggle external agents here; training opponents must be expressible as
-JAX array programs so rollout stays fast.
+这些函数会在 JIT 编译的 rollout 路径里调用，因此不能依赖 Python/Kaggle 外部 agent。
+训练对手必须能表示成 JAX 数组程序，rollout 才能保持高吞吐。
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ MIN_LAUNCH_LOCAL = 10.0
 
 
 def nearest_opponent_actions(state, player: int, params: FeatureParams):
-    """Nearest-target baseline as a JAX-native training opponent."""
+    """最近目标规则基线：每个来源星球向最近非己方目标发射。"""
 
     return jax.vmap(lambda planets, alive: _nearest_opponent_single(planets, alive, player, params))(
         state.planets,
@@ -64,7 +63,7 @@ def selfplay_policy_actions(
     policy_sample_params_fn: Callable,
     actions_from_decisions_fn: Callable,
 ):
-    """Frozen-policy self-play opponent as a JAX-native training opponent."""
+    """冻结策略自博弈对手；当前自回归主线已使用 train_jax.py 内的新版实现。"""
 
     flipped = flip_state_fn(state)
     raw_encoded = encode_batch(flipped, feat_params)

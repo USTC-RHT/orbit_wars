@@ -1,4 +1,4 @@
-"""Configuration dataclasses and YAML loading for JAX autoregressive training."""
+"""JAX 自回归训练的配置 dataclass 和 YAML 加载工具。"""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ class EvalConfig:
 class PPOConfig:
     """PPO 超参数，命名尽量贴近 CleanRL。
 
-    anneal_lr/target_kl/norm_adv/clip_vloss 是 CleanRL 常见工程开关。
+    anneal_lr / target_kl / norm_adv / clip_vloss 是 CleanRL 常见工程开关。
     """
 
     rollout_steps: int = 32
@@ -123,10 +123,10 @@ class PPOConfig:
 
 @dataclass(slots=True)
 class WandbConfig:
-    """Weights & Biases 实验记录配置。
+    """wandb 实验记录配置。
 
     enabled 控制是否启用 wandb；mode 可设为 online/offline/disabled。
-    没登录 wandb 时可以先用 offline，本地会生成 wandb run，之后再 sync。
+    没登录 wandb 时可以先用 offline，本地会生成 wandb run，之后再同步。
     """
 
     enabled: bool = False
@@ -162,10 +162,10 @@ class TrainConfig:
     pool_max_size: int = 4
     promote_nearest_win_rate: float = 0.8
     promote_consecutive_evals: int = 3
-    # snapshot pool: 每 snapshot_interval 存一个快照，按 snapshot_current_ratio 概率选当前策略
+    # 快照池：每 snapshot_interval 存一个快照，按 snapshot_current_ratio 概率选当前策略
     snapshot_interval: int = 200
     snapshot_current_ratio: float = 0.2
-    # self-play 对手本质上是在"推理"旧策略，默认用 argmax 保持行为稳定。
+    # self-play 对手本质上是在“推理”旧策略，默认用 argmax 保持行为稳定。
     self_play_deterministic: bool = True
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)

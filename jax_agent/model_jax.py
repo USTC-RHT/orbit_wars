@@ -1,4 +1,10 @@
-"""Orbit Wars autoregressive policy network implemented with Flax."""
+"""Orbit Wars 自回归策略网络（Flax 实现）。
+
+整体结构：
+1. Encoder：把星球、舰队和全局信息编码成 Transformer token。
+2. Decoder：GRU 按 token 逐步生成 end/src/tgt/amount。
+3. Critic：从全局状态表示输出状态价值，用于 PPO 的 value loss。
+"""
 
 from __future__ import annotations
 
@@ -17,20 +23,23 @@ BIAS_ZERO = nn.initializers.zeros
 
 
 def hidden_dense(features: int, name: str | None = None) -> nn.Dense:
+    """隐藏层 Dense：使用 orthogonal 初始化，适合 PPO 稳定训练。"""
     return nn.Dense(features, kernel_init=HIDDEN_INIT, bias_init=BIAS_ZERO, name=name)
 
 
 def actor_logit_dense(features: int, name: str | None = None) -> nn.Dense:
+    """策略 logits 输出层：较小初始化，让初始策略更接近均匀探索。"""
     return nn.Dense(features, kernel_init=ACTOR_LOGIT_INIT, bias_init=BIAS_ZERO, name=name)
 
 
 def value_out_dense(features: int, name: str | None = None) -> nn.Dense:
+    """价值函数输出层初始化。"""
     return nn.Dense(features, kernel_init=VALUE_OUT_INIT, bias_init=BIAS_ZERO, name=name)
 
 
 @dataclass(frozen=True)
 class AutoPolicyOutput:
-    """Autoregressive actor forward outputs for a fixed action prefix."""
+    """固定动作前缀下，所有 decoder 位置的策略 logits 和 value。"""
     end_logits: jnp.ndarray     # [B, K]
     src_logits: jnp.ndarray     # [B, K, P+1]
     tgt_logits: jnp.ndarray     # [B, K, P+1]
@@ -52,7 +61,7 @@ class MLP(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    """Pre-LN Transformer encoder block for planet/fleet tokens."""
+    """前置 LayerNorm 的 Transformer 编码块，用于星球/舰队 token 交互。"""
     hidden_size: int
     num_heads: int
     mlp_ratio: int = 4
@@ -77,12 +86,11 @@ class TransformerEncoderLayer(nn.Module):
 
 
 class AutoregressiveActorCritic(nn.Module):
-    """State-level autoregressive actor.
+    """状态级自回归 actor-critic。
 
-    The module returns logits for all K positions conditioned on the provided
-    rollout prefix. During rollout the caller repeatedly feeds the prefix,
-    samples step t, validates physics, then marks `executed[t]` before decoding
-    the next token. PPO recomputation uses the stored sequence in one call.
+    前向时给定已经采样出的动作前缀，模型一次性返回 K 个位置的 logits。
+    rollout 时外层代码逐 token 采样、做物理层校验，并把通过校验的动作标记为 executed。
+    PPO 更新时使用存下来的整段序列一次性重算 log-prob。
     """
 
     planet_dim: int
@@ -120,6 +128,7 @@ class AutoregressiveActorCritic(nn.Module):
         fleet_features=None,
         fleet_mask=None,
     ):
+        """重算一整段动作序列的 logits，供 PPO update 使用。"""
         batch_size, source_count = planet_features.shape[:2]
         hidden = self.hidden_size
         cls_out, planet_out, relative_h = self._encode(
@@ -179,8 +188,7 @@ class AutoregressiveActorCritic(nn.Module):
             h_new, _ = decoder_cell(h, decoder_input)
 
             end_logits = end_out(h_new).squeeze(-1)
-            # Set the initial bias through a named parameter so it can be
-            # monitored and adjusted independently.
+            # end head 的初始偏置单独作为参数，便于监控和调整结束倾向。
             end_logits = end_logits + end_bias[0]
 
             q_src = src_out(nn.relu(src_pre(h_new)))
@@ -272,7 +280,7 @@ class AutoregressiveActorCritic(nn.Module):
         fleet_features=None,
         fleet_mask=None,
     ):
-        """Encode state once and initialize the incremental GRU decoder."""
+        """只编码一次棋盘状态，并初始化增量式 GRU decoder。"""
         hidden = self.hidden_size
         cls_out, planet_out, relative_h = self._encode(
             planet_features,
@@ -297,7 +305,7 @@ class AutoregressiveActorCritic(nn.Module):
 
     @nn.compact
     def auto_step_base(self, state_emb, h, prev_tok, remaining, relative_features, source_mask, src_key_proj):
-        """Run one GRU step and produce END/SRC logits."""
+        """运行一步 GRU，并输出 end/src logits。"""
         hidden = self.hidden_size
         decoder_cell = nn.GRUCell(features=hidden, name="decoder_gru")
         decoder_input = jnp.concatenate([prev_tok, state_emb], axis=-1)
@@ -321,7 +329,7 @@ class AutoregressiveActorCritic(nn.Module):
 
     @nn.compact
     def auto_tgt_logits(self, h_new, src_t, planet_out, relative_h, key_proj, candidate_mask):
-        """Produce target logits for the current sampled source."""
+        """在给定 src 后输出目标星球 logits。"""
         hidden = self.hidden_size
         batch_idx = jnp.arange(h_new.shape[0])
         source_count = relative_h.shape[1]
@@ -339,7 +347,7 @@ class AutoregressiveActorCritic(nn.Module):
 
     @nn.compact
     def auto_amt_logits(self, h_new, src_t, tgt_t, planet_out, relative_h, remaining, amount_mask):
-        """Produce amount logits for the current sampled source/target pair."""
+        """在给定 src+tgt 后输出派兵档位 logits，并应用动态剩余兵力约束。"""
         hidden = self.hidden_size
         batch_idx = jnp.arange(h_new.shape[0])
         source_count = relative_h.shape[1]
@@ -359,7 +367,7 @@ class AutoregressiveActorCritic(nn.Module):
 
     @nn.compact
     def auto_token_embed(self, src_t, tgt_t, amt_t, end_t, executed_t, step_i, planet_out):
-        """Build the token fed into the next GRU step."""
+        """把当前 token 的执行结果编码成下一步 GRU 输入。"""
         hidden = self.hidden_size
         batch_idx = jnp.arange(src_t.shape[0])
         end_tok = self.param("end_token", nn.initializers.normal(0.02), (hidden,))
@@ -379,6 +387,7 @@ class AutoregressiveActorCritic(nn.Module):
         )
 
     def _pointer_logit_scale(self):
+        """可学习的 pointer logit 温度，限制范围避免注意力过尖或过平。"""
         pointer_logit_scale = self.param(
             "pointer_logit_scale",
             nn.initializers.constant(math.log(10.0)),
@@ -387,6 +396,7 @@ class AutoregressiveActorCritic(nn.Module):
         return jnp.clip(jnp.exp(pointer_logit_scale[0]), 1.0, 20.0)
 
     def _source_key_proj(self, planet_out, map_features):
+        """构造 source 选择 head 的 key；启用 CNN 时融合局部地图特征。"""
         hidden = self.hidden_size
         batch_size = planet_out.shape[0]
         planet_keys = actor_logit_dense(hidden, name="auto_src_key_proj")(planet_out)
@@ -414,6 +424,7 @@ class AutoregressiveActorCritic(nn.Module):
         return planet_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(planet_keys), axis=-1, keepdims=True), 1e-12))
 
     def _encode(self, planet_features, relative_features, global_features, candidate_mask, map_features, fleet_features, fleet_mask):
+        """编码棋盘状态，返回全局 CLS、星球 token 和 source-target 相对表示。"""
         batch_size, source_count = planet_features.shape[:2]
         hidden = self.hidden_size
         transformer_planet_features = self._planet_features_with_noop(planet_features)
@@ -443,10 +454,12 @@ class AutoregressiveActorCritic(nn.Module):
         return cls_out, planet_out, relative_h
 
     def _ships_for_bucket(self, ships, bucket):
+        """根据当前剩余兵力和档位索引得到实际派兵数。"""
         buckets = self._bucket_values(ships)
         return jnp.take_along_axis(buckets, jnp.clip(bucket, 0, self.ship_bucket_count - 1)[:, None], axis=-1).squeeze(-1)
 
     def _bucket_values(self, ships):
+        """按比例生成动态派兵档位，最小合法发射数为 10。"""
         ratios = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)
         ratios = ratios[: self.ship_bucket_count]
         s = jnp.floor(ships)
@@ -454,10 +467,12 @@ class AutoregressiveActorCritic(nn.Module):
         return jnp.where(s[:, None] >= 10.0, raw, jnp.zeros_like(raw))
 
     def _dynamic_amount_mask(self, ships):
+        """动态 amount mask：只允许剩余兵力能覆盖的正数档位。"""
         buckets = self._bucket_values(ships)
         positive = buckets >= 10.0
         return positive
 
     def _planet_features_with_noop(self, planet_features):
+        """在 planet token 前补 no-op slot，使动作索引 0 始终可用。"""
         noop = jnp.zeros(planet_features.shape[:1] + (1, planet_features.shape[-1]), dtype=planet_features.dtype)
         return jnp.concatenate([noop, planet_features], axis=1)

@@ -1,4 +1,8 @@
-"""PPO helpers for the JAX autoregressive Orbit Wars agent."""
+"""JAX 自回归策略的 PPO 训练工具。
+
+本文件只负责优化器、优势估计、PPO 损失和 rollout 张量展平，不负责采样动作。
+动作采样在 train_jax.py 中完成，采样得到的 token 序列会在这里重新计算 log-prob。
+"""
 
 from __future__ import annotations
 
@@ -11,11 +15,11 @@ import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
 
-NEG_INF = -1.0e9
+NEG_INF = -1.0e9  # mask 后使用的大负数，避免 softmax 选到非法动作。
 
 
 def _assert_all_finite(name: str, value):
-    """Raise during JIT execution if a tensor contains NaN/Inf."""
+    """在 JIT 内检查数值是否有限，尽早暴露 NaN/Inf。"""
     ok = jnp.all(jnp.isfinite(value))
 
     def _check(is_ok):
@@ -30,14 +34,14 @@ def _assert_all_finite(name: str, value):
 class PPOParams:
     """训练超参（编译时固定）。"""
     gamma: float = 0.99        # 折扣因子
-    gae_lambda: float = 0.95   # GAE 将来奖励平滞系数
-    clip_coef: float = 0.2     # PPO 策略梯度剥裁系数 ε
+    gae_lambda: float = 0.95   # GAE 对未来优势的平滑系数
+    clip_coef: float = 0.2     # PPO 策略比率裁剪系数 ε
     ent_coef: float = 0.01     # 熵奖励系数（鼓励探索）
     ent_coef_fire: float = 0.01
     ent_coef_target: float = 0.01
     ent_coef_amount: float = 0.01
     vf_coef: float = 0.5       # 价值函数损失系数
-    max_grad_norm: float = 0.5 # 梯度裁剔阈値
+    max_grad_norm: float = 0.5 # 梯度范数裁剪阈值
     epochs: int = 4            # 每次 rollout 训练轮数
     minibatch_size: int = 4096 # 单个 minibatch 大小
     norm_adv: bool = True      # 是否对 advantage 做 batch 内平均方差归一化
@@ -45,7 +49,11 @@ class PPOParams:
 
 
 class AutoRollout(NamedTuple):
-    """Autoregressive rollout data, stacked as [T, B, ...]."""
+    """自回归 rollout 数据，按 [T, B, ...] 堆叠。
+
+    end/src/tgt/amt 是每个 decoder token 的动作；executed 表示动作通过物理层并真实发射；
+    token_valid 表示该 token 在终止前被解码过，用于 end head 的 PPO loss。
+    """
     planet_features: jnp.ndarray
     relative_features: jnp.ndarray
     global_features: jnp.ndarray
@@ -79,7 +87,7 @@ def make_lr_schedule(
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.0,
 ):
-    """Build an Optax learning-rate schedule.
+    """构造 Optax 学习率调度器。
 
     schedule_name:
     - constant: 固定 lr
@@ -118,6 +126,7 @@ def make_auto_train_state(
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.0,
 ) -> TrainState:
+    """初始化自回归模型参数和优化器状态。"""
     b = sample_batch.planet_features.shape[0]
     k = max_action_tokens
     variables = model.init(
@@ -144,21 +153,25 @@ def make_auto_train_state(
 
 
 def bernoulli_log_prob(logits, action_bool):
+    """计算 Bernoulli 动作的 log-prob。"""
     action = action_bool.astype(jnp.float32)
     return -optax.sigmoid_binary_cross_entropy(logits, action)
 
 
 def categorical_log_prob(logits, action):
+    """按离散动作索引从 log_softmax 中取 log-prob。"""
     return jnp.take_along_axis(jax.nn.log_softmax(logits), action[..., None], axis=-1).squeeze(-1)
 
 
 def categorical_entropy(logits):
+    """计算离散分布熵，用于 PPO 的探索奖励。"""
     logp = jax.nn.log_softmax(logits)
     p = jnp.exp(logp)
     return -(p * logp).sum(axis=-1)
 
 
 def safe_logits(logits):
+    """修复全非法 logits 行，避免 softmax/categorical 产生 NaN。"""
     _assert_all_finite("ppo/logits", logits)
     invalid = ~jnp.isfinite(logits).any(axis=-1)
     fixed = jnp.where(invalid[..., None], NEG_INF, logits)
@@ -166,6 +179,7 @@ def safe_logits(logits):
 
 
 def _fire_entropy(logits):
+    """二分类 head 的熵。end head 和旧 fire head 都可复用这个形式。"""
     p = jax.nn.sigmoid(logits)
     return -(p * jnp.log(jnp.clip(p, 1e-8, 1.0)) + (1.0 - p) * jnp.log(jnp.clip(1.0 - p, 1e-8, 1.0)))
 
@@ -194,13 +208,17 @@ def compute_gae(rewards, dones, values, last_values, params: PPOParams):
 
 
 def compute_gae_state(rewards, dones, values, last_values, params: PPOParams):
-    """State-level GAE for autoregressive actor: tensors are [T, B]."""
+    """状态级 GAE：自回归 actor 的 value 是每个环境状态一个标量，形状为 [T, B]。"""
     return compute_gae(rewards, dones, values, last_values, params)
 
 
 @partial(jax.jit, static_argnames=("params", "max_action_tokens"))
 def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, advantages, params: PPOParams, rng, max_action_tokens: int, ent_scale=1.0):
-    """PPO update for autoregressive state-level rollouts."""
+    """对自回归 rollout 执行一次 PPO 更新。
+
+    一个 update 内包含多个 epoch，每个 epoch 随机打乱状态样本并切 minibatch。
+    KL 超过阈值时会提前停止后续 epoch，防止策略单次更新过大。
+    """
     flat = flatten_auto_rollout(rollout, returns, advantages)
     size = flat["source_mask"].shape[0]
     states_per_minibatch = min(max(params.minibatch_size, 1), size)
@@ -268,7 +286,7 @@ def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, adva
 
 
 def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams, ent_scale=1.0):
-    """Single minibatch PPO update for autoregressive actor."""
+    """单个 minibatch 的自回归 PPO 损失与梯度更新。"""
 
     def loss_fn(model_params):
         outputs = train_state.apply_fn(
@@ -298,8 +316,8 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         amt_logp = categorical_log_prob(amt_logits, batch["amt_action"])
 
         token_valid = batch["token_valid"].astype(jnp.float32)
-        end_mask = token_valid
-        arg_mask = batch["executed"].astype(jnp.float32)
+        end_mask = token_valid              # end head 对所有“已解码 token”学习。
+        arg_mask = batch["executed"].astype(jnp.float32)  # src/tgt/amt 只学习真实执行动作。
         adv = batch["advantages"]
         if params.norm_adv:
             adv_mean = adv.mean()
@@ -307,6 +325,7 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         adv_k = adv[:, None]
 
         def token_loss(new_logp, old_logp, mask):
+            """单个 head 的 PPO-clip 损失、KL、clipfrac 和 log-ratio 统计。"""
             raw_lr = jnp.where(mask > 0.0, new_logp - old_logp, 0.0)
             lr = jnp.clip(raw_lr, -5.0, jnp.log(jnp.array(10.0, dtype=jnp.float32)))
             ratio = jnp.exp(lr)
@@ -384,6 +403,7 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
 
 
 def flatten_auto_rollout(rollout: AutoRollout, returns, advantages):
+    """把 [T, B, ...] rollout 展平成 [T*B, ...]，便于 minibatch 采样。"""
     def flat(x):
         return x.reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
 

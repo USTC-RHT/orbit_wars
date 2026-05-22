@@ -1,4 +1,4 @@
-"""JAX-native training opponents used inside rollout JIT."""
+"""rollout JIT 内使用的 JAX 原生训练对手。"""
 
 from .opponents import (
     nearest_opponent_actions,

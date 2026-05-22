@@ -1,4 +1,8 @@
-"""Generate cached Orbit Wars initial states for the JAX simulator."""
+"""为 JAX 模拟器生成可复用的 Orbit Wars 初始状态池。
+
+训练时 reset 直接从 state bank 采样，避免每次都调用 Kaggle Python 环境。
+彗星未来路径也在这里预生成，保证 JAX fast_env 可以在纯数组逻辑里复现比赛环境。
+"""
 
 from __future__ import annotations
 

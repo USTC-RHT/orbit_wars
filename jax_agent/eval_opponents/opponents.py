@@ -1,4 +1,4 @@
-"""Evaluation opponents for the JAX autoregressive agent."""
+"""JAX 自回归 agent 的评估对手集合。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ EvalResult = dict[str, float | int]
 
 @dataclass(frozen=True)
 class EvalContext:
-    """Runtime objects needed to evaluate the current JAX learner."""
+    """评估当前 learner 时需要的运行时对象。"""
 
     train_state: Any
     model: Any
@@ -43,7 +43,7 @@ class EvalContext:
 
 
 class JaxEvalOpponent(Protocol):
-    """One benchmark opponent for evaluating the current JAX learner."""
+    """单个评估基准对手的统一接口。"""
 
     name: str
     metric_prefix: str
@@ -74,7 +74,7 @@ class JaxEvalOpponent(Protocol):
 
 
 class ExternalScriptOpponent:
-    """Load an Orbit Wars lab agent directory with isolated module state."""
+    """加载 Orbit Wars Lab agent 目录，并隔离每局的模块状态。"""
 
     def __init__(self, agent_dir: Path) -> None:
         self.agent_dir = agent_dir.resolve()
@@ -127,7 +127,7 @@ class ExternalScriptOpponent:
 
 @dataclass(frozen=True)
 class NearestJaxEvalOpponent:
-    """Nearest-rule opponent evaluated entirely inside JAX fast_env."""
+    """完全在 JAX fast_env 内运行的 nearest 规则对手。"""
 
     name: str = "nearest"
     metric_prefix: str = "nearest"
@@ -170,7 +170,7 @@ class NearestJaxEvalOpponent:
 
 @dataclass(frozen=True)
 class ExternalScriptJaxEvalOpponent:
-    """Orbit Wars Lab external script opponent against the current JAX learner."""
+    """用 Kaggle 环境评估当前 JAX learner 对外部脚本 agent 的胜率。"""
 
     name: str
     metric_prefix: str
@@ -243,7 +243,7 @@ class ExternalScriptJaxEvalOpponent:
 
 
 def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpponent]:
-    """Default benchmark set for JAX training."""
+    """根据配置创建默认评估对手列表。"""
 
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
     external_root = root / "orbit-wars-lab" / "agents" / "external"

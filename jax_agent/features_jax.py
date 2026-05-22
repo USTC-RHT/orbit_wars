@@ -52,7 +52,7 @@ SHIP_RATIOS = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtyp
 class FeatureParams:
     """特征编码参数（编译时固定，安全传入 jit/vmap）。"""
     max_planets: int = 64         # 星球槽位数（应等于 EnvParams.max_planets）
-    ship_bucket_count: int = 8    # 派兵树位数量
+    ship_bucket_count: int = 8    # 派兵档位数量
     max_ships: float = 500.0      # 归一化基准船数上限
     max_production: float = 5.0   # 归一化基准生产力上限
     episode_steps: int = 500      # 归一化基准回合数
@@ -78,6 +78,11 @@ class FeatureParams:
 
 
 class EncodedBatch(NamedTuple):
+    """网络输入张量集合。
+
+    candidate_mask 控制目标选择，amount_mask 控制派兵档位，
+    source_mask 控制哪些星球可以作为发射来源。
+    """
     planet_features: jnp.ndarray
     relative_features: jnp.ndarray
     global_features: jnp.ndarray
@@ -94,14 +99,17 @@ class EncodedBatch(NamedTuple):
 
 
 def target_count(params: FeatureParams) -> int:
+    """目标槽位数量：slot 0 是 no-op，后面是所有星球。"""
     return params.max_planets + 1
 
 
 def encode_batch(state: EnvState, params: FeatureParams) -> EncodedBatch:
+    """批量编码 EnvState，外层 batch 通过 vmap 并行。"""
     return jax.vmap(lambda s: encode_single(s, params))(state)
 
 
 def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
+    """编码单局棋盘，把每个星球位置都组织成一个候选 source 行。"""
     planets = state.planets
     alive = state.planet_alive
     owner = planets[:, 1].astype(jnp.int32)
@@ -143,6 +151,7 @@ def build_source_decision(
     fleet_m: jnp.ndarray,
     params: FeatureParams,
 ) -> EncodedBatch:
+    """构造某个 source 星球对应的一行决策输入。"""
     src = state.planets[src_idx]
     planet_f = build_planet_features(state, src_idx, inbound, params)
     rel_f, cand_mask, amount_mask, candidate_ids, ship_buckets = build_relative_features(state, src_idx, inbound, params)
@@ -223,6 +232,7 @@ def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.nd
 
 
 def planet_local_topology_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
+    """统计 source 周围的最近距离和局部星球密度。"""
     planets = state.planets
     src = planets[src_idx]
     alive = state.planet_alive
@@ -332,7 +342,7 @@ def apply_target_filter(
     defense_pressure: jnp.ndarray,
     params: FeatureParams,
 ) -> jnp.ndarray:
-    """Mirror Python target_filter: no-op + top proto attacks + top defense friends."""
+    """可选目标过滤：保留 no-op、评分最高的进攻目标和最需要防守的友方目标。"""
 
     planet_mask = mask[1:]
     keep_planets = jnp.zeros((params.max_planets,), dtype=bool)
@@ -350,6 +360,7 @@ def apply_target_filter(
 
 
 def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray:
+    """构建全局态势特征，给 decoder/critic 提供局面摘要。"""
     planets = state.planets
     alive = state.planet_alive
     owner = planets[:, 1].astype(jnp.int32)
@@ -378,12 +389,12 @@ def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray
 
 
 def predict_fleet_targets(state: EnvState, horizon: int = int(INBOUND_HORIZON)) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Predict the first planet each fleet will hit within the lookahead horizon.
+    """预测每支舰队在前瞻窗口内第一个会撞到的星球。
 
-    Returns:
-      target_idx: [F] planet slot index. Meaningful only when target_valid=True.
-      target_valid: [F] whether the fleet hits a live planet in horizon.
-      target_t: [F] first hit timestep as float.
+    返回：
+      target_idx: [F] 星球槽位下标，只有 target_valid=True 时有意义。
+      target_valid: [F] 该舰队是否会在 horizon 内撞到存活星球。
+      target_t: [F] 第一次命中的整数回合，用浮点数表示。
     """
     fleets = state.fleets
     planets = state.planets
@@ -455,13 +466,11 @@ def predict_fleet_targets(state: EnvState, horizon: int = int(INBOUND_HORIZON)) 
 
 
 def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
-    """JAX port of src.features.precompute_inbound for planet/fleet arrays.
+    """预估未来一段时间内每个星球会收到的我方/敌方舰队压力。
 
-    Returns [P, 6]:
-      my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean
-
-    This mirrors the Python feature path for regular/rotating planets and
-    comet path lookup by path_index + T.
+    返回 [P, 6]：
+      my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean。
+    普通星球、旋转星球和彗星都按 fast_env 的轨迹规则查表或预测。
     """
 
     fleets = state.fleets
@@ -537,7 +546,7 @@ def compute_defense_pressure(planets: jnp.ndarray, inbound: jnp.ndarray) -> jnp.
 
 
 def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """构建 per-state top-K 舰队 token，用于 Transformer 编码。"""
+    """构建单局 top-K 舰队 token，用于 Transformer 编码。"""
     fleets = state.fleets
     alive = state.fleet_alive
     dist_center = jnp.sqrt((fleets[:, 2] - CENTER) ** 2 + (fleets[:, 3] - CENTER) ** 2)
@@ -612,6 +621,7 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
 
 
 def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
+    """构建 source 周围的 8x8 小地图，作为 src head 的局部空间提示。"""
     grid = jnp.zeros((MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=jnp.float32)
     planets = state.planets
     owner = planets[:, 1].astype(jnp.int32)
@@ -633,6 +643,7 @@ def _accum_many(grid, channels, x, y, values):
 
 
 def build_ship_buckets(src_ships: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
+    """按当前 source 船数生成可选派兵档位；不足最小发射数则全为 0。"""
     ratios = SHIP_RATIOS[: params.ship_bucket_count]
     s = jnp.floor(src_ships)
     raw = jnp.clip(jnp.round(s * ratios), MIN_LAUNCH, s)

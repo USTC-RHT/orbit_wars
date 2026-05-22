@@ -1,9 +1,9 @@
 # orbit-wars-lab 识别这个 agent 时使用的元信息。
-# 真正的推理入口在 main.py；这里只描述名称、标签和是否启用。
+# 旧 Torch PPO 入口已归档到 torch_agent/main.py；根目录当前不再作为可运行 agent。
 
-name: "Clean RL PPO"
-description: "Readable PPO rewrite for Orbit Wars: source-level target and ship-amount selection, MLP actor-critic, GAE, shaped reward, CUDA training support."
+name: "Legacy Torch PPO"
+description: "Archived PyTorch PPO implementation. Current training/inference uses the JAX autoregressive agent."
 author: "local"
 license: "Apache 2.0"
-tags: [mine, reinforcement-learning, ppo, gpu, neural-network]
-disabled: false
+tags: [legacy, torch, reinforcement-learning, ppo, neural-network]
+disabled: true

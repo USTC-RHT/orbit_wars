@@ -10,14 +10,15 @@ import sys
 from pathlib import Path
 
 _HERE = Path(globals().get("__file__", ".")).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_ROOT = _HERE.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-from src.config import load_config  # noqa: E402
-from src.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
-from src.model import ActorCritic  # noqa: E402
-from src.normalization import StateNormalizer  # noqa: E402
-from src.opponents import actions_from_policy  # noqa: E402
+from torch_agent.config import load_config  # noqa: E402
+from torch_agent.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
+from torch_agent.model import ActorCritic  # noqa: E402
+from torch_agent.normalization import StateNormalizer  # noqa: E402
+from torch_agent.opponents import actions_from_policy  # noqa: E402
 
 _CFG = None
 _MODEL = None
@@ -26,12 +27,12 @@ _STATE_NORMALIZER = None
 
 
 def _checkpoint_candidates() -> list[Path]:
-    cfg = load_config(_HERE / "default_cfg.yaml")
+    cfg = load_config(_ROOT / "default_cfg.yaml")
     candidates: list[Path] = []
-    local = _HERE / "artifacts" / cfg.run_name / "ckpt_last.pt"
+    local = _ROOT / "artifacts" / cfg.run_name / "ckpt_last.pt"
     if local.exists():
         candidates.append(local)
-    artifact_root = _HERE / "artifacts"
+    artifact_root = _ROOT / "artifacts"
     if artifact_root.exists():
         candidates.extend(
             path
@@ -42,7 +43,7 @@ def _checkpoint_candidates() -> list[Path]:
             )
             if path not in candidates
         )
-    weights = _HERE / "weights" / "ckpt_last.pt"
+    weights = _ROOT / "weights" / "ckpt_last.pt"
     if weights.exists():
         candidates.append(weights)
     return candidates
@@ -51,7 +52,7 @@ def _checkpoint_candidates() -> list[Path]:
 def _load():
     import torch
 
-    cfg = load_config(_HERE / "default_cfg.yaml")
+    cfg = load_config(_ROOT / "default_cfg.yaml")
     device = torch.device("cpu")
     model = ActorCritic(
         self_dim=SELF_DIM,

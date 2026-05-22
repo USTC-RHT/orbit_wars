@@ -315,7 +315,7 @@ def init_wandb(cfg: TrainConfig, run_dir: Path, device: torch.device) -> Any | N
     """初始化 wandb 记录器。
 
     只有 cfg.wandb.enabled=True 时才会启用。这样本地调试、Kaggle 推理都
-    不依赖 wandb；需要实验追踪时，用 `RL/train.py --wandb` 打开即可。
+    不依赖 wandb；需要实验追踪时，用 `python -m torch_agent.train --wandb` 打开即可。
     """
 
     if not cfg.wandb.enabled:

@@ -1,6 +1,6 @@
 """训练入口。
 
-负责解析命令行参数、读取 YAML 配置，并把最终配置交给 `src.train_loop.train`。
+负责解析命令行参数、读取 YAML 配置，并把最终配置交给 `torch_agent.train_loop.train`。
 真正的环境交互、rollout 收集和 PPO 更新都在 train_loop.py 里。
 """
 
@@ -11,16 +11,17 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
+ROOT = HERE.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
-from src.train_loop import train  # noqa: E402
+from torch_agent.config import load_config  # noqa: E402
+from torch_agent.train_loop import train  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(HERE / "default_cfg.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "default_cfg.yaml"))
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)

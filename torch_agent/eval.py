@@ -13,20 +13,21 @@ from pathlib import Path
 import torch
 
 HERE = Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
+ROOT = HERE.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
-from src.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
-from src.model import ActorCritic  # noqa: E402
-from src.normalization import StateNormalizer  # noqa: E402
-from src.opponents import NearestOpponent, RandomOpponent, actions_from_policy  # noqa: E402
-from src.state import read  # noqa: E402
+from torch_agent.config import load_config  # noqa: E402
+from torch_agent.features import CANDIDATE_DIM, GLOBAL_DIM, SELF_DIM, encode_turn, target_count  # noqa: E402
+from torch_agent.model import ActorCritic  # noqa: E402
+from torch_agent.normalization import StateNormalizer  # noqa: E402
+from torch_agent.opponents import NearestOpponent, RandomOpponent, actions_from_policy  # noqa: E402
+from torch_agent.state import read  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(HERE / "default_cfg.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "default_cfg.yaml"))
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1000)

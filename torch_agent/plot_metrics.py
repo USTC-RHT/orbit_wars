@@ -13,11 +13,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
 def parse_args() -> argparse.Namespace:
     """解析画图参数。"""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="RL/artifacts/sb3_style_nearest_1000/metrics.csv")
+    parser.add_argument("--csv", default=str(ROOT / "artifacts" / "sb3_style_nearest_1000" / "metrics.csv"))
     parser.add_argument("--out", default=None)
     parser.add_argument("--window", type=int, default=20)
     return parser.parse_args()

@@ -8,7 +8,7 @@
 #   can be re-enabled after autoregressive opponent inference is implemented.
 
 seed: 42
-run_name: "jax_fixed_pool_0520"
+run_name: "jax_fixed_pool_0522_fix_mask"
 device: auto
 save_dir: outputs
 checkpoint_every: 100
@@ -60,7 +60,7 @@ state_norm:
 ppo:
   rollout_steps: 32
   num_envs: 16
-  total_updates: 10000
+  total_updates: 50000
   epochs: 4
   minibatch_size: 128
   gamma: 0.99
@@ -75,7 +75,7 @@ ppo:
   ent_min_ratio: 0.2
   lr: 5e-5
   lr_schedule: warmup_cosine
-  # 可能需要增加 warmup_updates 来稳定训练初期的 autoregressive 模型
+  # 增加 warmup_updates 来稳定训练初期的 autoregressive 模型
   warmup_updates: 50
   min_lr_ratio: 0.1
   max_grad_norm: 0.5
@@ -93,12 +93,12 @@ promote_consecutive_evals: 2
 
 eval:
   enabled: true
-  every: 200          # 默认间隔（fallback）
-  nearest_every: 200  # nearest 每 200 步评估一次
-  slow_every: 500     # sigma / tamrazov 每 500 步评估一次
+  every: 1000           # 默认间隔（fallback）
+  nearest_every: 100    # nearest 每 100 步评估一次
+  slow_every: 1000      # sigma / tamrazov 每 1000 步评估一次
   games: 20
   seed: 200000
-  opponents: ["nearest", "sigma", "tamrazov"]
+  opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]
 
 log_every: 1
 

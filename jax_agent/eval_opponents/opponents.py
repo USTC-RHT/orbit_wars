@@ -195,6 +195,9 @@ class ExternalScriptJaxEvalOpponent:
                 jax_state = ctx.kaggle_obs_to_jax_state(obs, ctx.env_params)
                 learner_action = ctx.jax_actions_to_kaggle(infer(jax_state))
                 opp_action = opponent.act_for_env(0, opp_obs)
+                load_error = getattr(opponent.modules.get(0), "_LOAD_ERROR", None)
+                if load_error is not None:
+                    raise RuntimeError(f"External eval opponent {self.name} failed to load: {load_error}") from load_error
                 states = env.step([learner_action, opp_action])
                 obs = states[0]["observation"]
                 opp_obs = states[1]["observation"]
@@ -306,6 +309,13 @@ def default_eval_opponents(root: Path, *, checkpoint_opponent=None, enabled_name
             metric_prefix="tamrazov",
             agent_dir=external_root / "tamrazov-starwars",
             seed_offset=0,
+        ))
+    if "pool_ckpt900" in enabled:
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="jax-pool-0514-resume-ckpt900",
+            metric_prefix="pool_ckpt900",
+            agent_dir=root / "orbit-wars-lab" / "agents" / "mine" / "jax-pool-0514-resume-ckpt900",
+            seed_offset=31337,
         ))
     if checkpoint_opponent is not None and ("checkpoint400" in enabled or "checkpoint" in enabled):
         opponents.append(

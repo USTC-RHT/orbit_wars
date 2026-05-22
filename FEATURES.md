@@ -33,11 +33,13 @@ fleet_mask         # [B, P, max_fleet_tokens]
 
 ```python
 # 训练和模型内部统一从 learner 视角看局面，learner 永远是 owner == 0。
-# source_mask 是唯一可靠的 source 合法性 mask：
+# source_mask 是静态 source 所属权 mask：
 #   source_mask = planet_alive & (owner == 0)
 #
-# candidate slot 0 是 no-op。
+# candidate slot 0 是 no-op / padding 类目标位。
 # candidate slot i + 1 对应 planet slot i。
+# autoregressive target head 实际选择 target 时会把 slot 0 关掉；
+# 停止生成命令由 end head 负责，不靠 target no-op。
 #
 # relative_features 只保存 source-target 相对关系；target 的绝对属性在 planet_features 里。
 ```
@@ -187,24 +189,32 @@ sort_key = -ships + 0.01 * dist_to_center
 
 ```python
 # source_mask[src]:
-#   planet slot src 存活，且 owner == 0 时为 True。
+#   我方存活星球。
 #
-# candidate_mask[src, tgt]:
-#   slot 0 no-op 永远为 True。
-#   真实 target 必须存活。
-#   target 不能是 source 自己。
-#   source 船数必须至少达到 MIN_LAUNCH。
-#   至少有一个 amount bucket 合法。
-#   如果开启 target_filter，则只保留 top attack 和 top defense candidates。
+# src_mask[src]:
+#   哪些源星球可以被选。
+#   src_mask = source_mask & (remaining_ships[src] >= MIN_LAUNCH)
+#   remaining_ships 是动态预算；同一 env step 内前面几个 token
+#   已派出去的船会扣掉，避免超发。
 #
-# amount_mask[src, tgt, bucket]:
-#   no-op 允许所有 bucket。
-#   友方 target 允许所有正数 bucket。
-#   中立/敌方 target 要求 bucket ships > target ships。
-#   如果 candidate_mask 为 False，所有 bucket 都为 False。
+# tgt_mask_t[tgt]:
+#   选定 src 后，哪些目标可以被攻击/增援。
+#   tgt_mask_t = target_alive & (target != src)
+#   autoregressive target head 会把 slot 0 关掉；是否停止由 end head 决定。
+#
+# amt_mask_t[bucket]:
+#   选定 src + tgt 后，哪些兵力档位合法。
+#   amt_mask_t = (ship_buckets[bucket] >= MIN_LAUNCH)
+#              & (ship_buckets[bucket] <= remaining_ships[src])
+#
+# MIN_LAUNCH = 10
+# 下界：必须至少派 MIN_LAUNCH 艘。
+# 上界：不能超过当前 source 的动态预算。
 ```
 
-autoregressive 解码时，还会根据当前环境 step 内该 source 的剩余可用船数，对 amount 做动态 mask。
+实现上，`candidate_mask[src, tgt]` 是 `tgt_mask_t` 的静态编码版本；
+`amount_mask[src, tgt, bucket]` 提供静态下界，decoder 内再叠加
+`remaining_ships[src]` 得到最终 `amt_mask_t`。
 
 ## ship_buckets
 
@@ -242,6 +252,7 @@ SHIP_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
 #
 # Source selection:
 #   使用 Transformer planet keys + source CNN map_features + source_mask。
+#   实际 src_logits 还会叠加 remaining_ships >= MIN_LAUNCH 的动态约束。
 #
 # Target selection:
 #   使用已选 source、planet tokens、relative_features、candidate_mask。
@@ -253,6 +264,6 @@ SHIP_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
 重要易错点：
 
 ```python
-# source 合法性永远使用 source_mask。
+# source_mask 只表示“我方存活星球”，真正的 source head 还会检查当前剩余兵力。
 # target 绝对属性永远看 planet_features / planet_out，不再从 relative_features 里取。
 ```

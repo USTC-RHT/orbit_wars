@@ -264,7 +264,7 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     返回：(relative_features[P+1, 8], candidate_mask[P+1], amount_mask[P+1, B], candidate_ids[P+1], ship_buckets[B])
     - slot 0 固定为 no-op（不发射）
     - slot 1..P 对应所有星球（包括来源星球自身，不过 mask=False）
-    攻击/中立必须发超过驻军的船，进攻组 amount mask 只开放足够多的档位。
+    amount mask 只负责约束正数派兵；是否值得以少打多交给策略和奖励学习。
     """
     src = state.planets[src_idx]
     planets = state.planets
@@ -306,13 +306,12 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     )
     relative_features = jnp.concatenate([noop_features, rel], axis=0)
 
-    # 候选星球合法性 mask：必须存活、不是自身、来源有足够船、存在合法档位
-    can_send = alive & (~is_source) & (src[5] >= MIN_LAUNCH) & valid_buckets.any()
+    # target 合法性只约束目标本身。source 船数和 bucket 合法性分别由
+    # decoder src_mask / amount_mask 处理，避免在 target head 阶段剪掉可学动作。
+    target_valid = alive & (~is_source)
     positive_amount = valid_buckets
-    # 进攻明星时只开放能压制驻军的派兵档位；增援友方时任意正数均可
-    enough = ship_buckets[None, :] > planets[:, 5:6]
-    per_planet_amount = jnp.where(is_friend[:, None], positive_amount[None, :], enough & positive_amount[None, :])
-    per_planet_mask = can_send & per_planet_amount.any(axis=-1)
+    per_planet_amount = jnp.broadcast_to(positive_amount[None, :], (params.max_planets, params.ship_bucket_count))
+    per_planet_mask = target_valid
     # slot 0 永远可选（no-op）
     mask = jnp.concatenate([jnp.asarray([True]), per_planet_mask])
     amount_mask = jnp.concatenate([jnp.ones((1, params.ship_bucket_count), dtype=bool), per_planet_amount], axis=0)

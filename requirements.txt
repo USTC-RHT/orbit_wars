@@ -33,7 +33,6 @@ pettingzoo==1.24.0
 pygame==2.6.1
 trueskill==0.4.5
 
-# Current local lab package source. If the cloud machine already has this repo
-# mounted, installing the local repo with `pip install -e /path/to/orbit-wars-lab`
-# is also fine.
-orbit-wars-lab @ git+https://github.com/automatylicza/orbit-wars-lab.git@fc55481aee85db2431a91a32922bc6bc99fba49e
+# Current lab package source. If the cloud machine already has this repo mounted,
+# installing it with `pip install -e /path/to/orbit-wars-lab` is also fine.
+orbit-wars-lab @ git+https://github.com/automatylicza/orbit-wars-lab.git@22654dcb74cbb1deca098ce3799d59eb8750c569

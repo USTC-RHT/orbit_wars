@@ -5,4 +5,4 @@ dependencies:
   - python=3.12
   - pip
   - pip:
-      - -r requirements.cloud-gpu.txt
+      - -r requirements.txt

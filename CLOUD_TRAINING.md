@@ -13,14 +13,14 @@ The local training environment currently used for this project is:
 From the `rl-agent` directory:
 
 ```bash
-conda env create -f environment.cloud-gpu.yml
+conda env create -f environment.yml
 conda activate orbit-wars-lab
 ```
 
 If the cloud image already has a suitable conda env, install only the pip deps:
 
 ```bash
-python -m pip install -r requirements.cloud-gpu.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Verify JAX GPU

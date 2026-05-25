@@ -58,7 +58,7 @@ state_norm:
 
 ppo:
   rollout_steps: 128
-  num_envs: 256
+  num_envs: 128
   total_updates: 50000
   epochs: 4
   minibatch_size: 4096

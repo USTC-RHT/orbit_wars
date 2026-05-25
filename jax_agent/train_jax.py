@@ -557,9 +557,10 @@ def main() -> None:
             "policy_loss",
             "value_loss",
             "entropy",
-            "entropy_fire",
-            "entropy_target",
-            "entropy_amount",
+            "entropy_end",
+            "entropy_src",
+            "entropy_tgt",
+            "entropy_amt",
             "approx_kl",
             "clipfrac",
             "max_abs_log_ratio",
@@ -873,7 +874,7 @@ def main() -> None:
             selected_pool_entry["winrate"] = 0.95 * old_wr + 0.05 * float(metrics["win_rate"])
             metrics["pool_selected_winrate"] = selected_pool_entry["winrate"]
         elapsed = time.perf_counter() - start
-        samples = cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets
+        samples = cfg.ppo.num_envs * cfg.ppo.rollout_steps
         sps = samples / max(elapsed, 1e-9)
         line = (
             f"update={update} sps={sps:.1f} loss={metrics['loss']:.4f} "
@@ -1005,9 +1006,10 @@ def main() -> None:
                 f"{metrics['policy_loss']:.8f}",
                 f"{metrics['value_loss']:.8f}",
                 f"{metrics['entropy']:.8f}",
-                f"{metrics.get('entropy_fire', 0.0):.8f}",
-                f"{metrics.get('entropy_target', 0.0):.8f}",
-                f"{metrics.get('entropy_amount', 0.0):.8f}",
+                f"{metrics.get('entropy_end', 0.0):.8f}",
+                f"{metrics.get('entropy_src', 0.0):.8f}",
+                f"{metrics.get('entropy_tgt', 0.0):.8f}",
+                f"{metrics.get('entropy_amt', 0.0):.8f}",
                 f"{metrics['approx_kl']:.8f}",
                 f"{metrics['clipfrac']:.8f}",
                 f"{metrics.get('max_abs_log_ratio', 0.0):.8f}",
@@ -1026,9 +1028,6 @@ def main() -> None:
                 "losses/policy_loss": float(metrics["policy_loss"]),
                 "losses/value_loss": float(metrics["value_loss"]),
                 "losses/entropy": float(metrics["entropy"]),
-                "entropy/fire": float(metrics.get("entropy_fire", 0.0)),
-                "entropy/target": float(metrics.get("entropy_target", 0.0)),
-                "entropy/amount": float(metrics.get("entropy_amount", 0.0)),
                 "entropy/scale": float(metrics.get("ent_scale", 1.0)),
                 "losses/approx_kl": float(metrics["approx_kl"]),
                 "losses/clipfrac": float(metrics["clipfrac"]),

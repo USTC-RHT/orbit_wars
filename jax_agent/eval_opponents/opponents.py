@@ -55,22 +55,10 @@ class JaxEvalOpponent(Protocol):
         ...
 
     def metric_fields(self) -> list[str]:
-        return [
-            f"eval_{self.metric_prefix}_win_rate",
-            f"eval_{self.metric_prefix}_loss_rate",
-            f"eval_{self.metric_prefix}_wins",
-            f"eval_{self.metric_prefix}_losses",
-            f"eval_{self.metric_prefix}_draws",
-        ]
+        return [f"eval_{self.metric_prefix}_win_rate"]
 
     def metric_values(self, result: EvalResult) -> dict[str, float | int]:
-        return {
-            f"eval_{self.metric_prefix}_win_rate": result["win_rate"],
-            f"eval_{self.metric_prefix}_loss_rate": result["loss_rate"],
-            f"eval_{self.metric_prefix}_wins": result["wins"],
-            f"eval_{self.metric_prefix}_losses": result["losses"],
-            f"eval_{self.metric_prefix}_draws": result["draws"],
-        }
+        return {f"eval_{self.metric_prefix}_win_rate": result["win_rate"]}
 
 
 class ExternalScriptOpponent:

@@ -199,7 +199,13 @@ sort_key = -ships + 0.01 * dist_to_center
 #
 # tgt_mask_t[tgt]:
 #   选定 src 后，哪些目标可以被攻击/增援。
-#   tgt_mask_t = target_alive & (target != src)
+#   tgt_mask_t = target_alive
+#              & (target != src)
+#              & (
+#                   target_is_friend
+#                   | ((target_is_enemy | target_is_neutral)
+#                      & (src.ships > target.ships))
+#                )
 #   autoregressive target head 会把 slot 0 关掉；是否停止由 end head 决定。
 #
 # amt_mask_t[bucket]:

@@ -56,6 +56,12 @@ def build_bank(output: Path, seeds: int, start_seed: int, params: EnvParams) -> 
 
 
 def load_orbit_wars_module():
+    try:
+        from kaggle_environments.envs.orbit_wars import orbit_wars
+        return orbit_wars
+    except ImportError:
+        pass
+
     import types
 
     path = Path(__file__).resolve().parents[2] / "orbit_wars.py"

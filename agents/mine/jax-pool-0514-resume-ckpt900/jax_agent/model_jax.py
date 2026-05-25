@@ -1,0 +1,118 @@
+"""Orbit Wars 策略网络（Flax 实现）。
+
+架构说明：
+- 三头输出：fire（是否发射）、target（指针注意力选星球）、amount（派兵档位）。
+- context 由三部分拼接：self_h + global_h + map_h（+ CNN）。
+- map_h = max/mean 混合池化候选层表示，得到全局感知。
+- 目标选择：单头 scaled dot-product cross-attention（query 来源星球、key 目标星球）。
+- 候选星球之间没有 self-attention，与标准 Transformer 的区别在此。
+- 与 PyTorch 版 src/model.py 架构对齐，可将权重可靠地反序列化。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+
+
+@dataclass(frozen=True)
+class PolicyOutput:
+    """网络前向输出。"""
+    fire_logits: jnp.ndarray    # [批量]：是否发射的 Bernoulli logit
+    target_logits: jnp.ndarray  # [批量, P+1]：候选星球 attention 分数
+    amount_logits: jnp.ndarray  # [批量, B]：派兵档位 logits
+    value: jnp.ndarray          # [批量]：状态价值估计
+
+
+class MLP(nn.Module):
+    """两层 MLP + LayerNorm + ReLU，用于平行编码每个元素。"""
+    hidden_size: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.hidden_size)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_size)(x)
+        return nn.relu(x)
+
+
+class ActorCritic(nn.Module):
+    """主策略网络，封装 fire/target/amount/value 四个头。"""
+    self_dim: int          # 来源星球特征维度 (SELF_DIM=18)
+    candidate_dim: int     # 候选星球特征维度 (CANDIDATE_DIM=26)
+    global_dim: int        # 全局局势特征维度 (GLOBAL_DIM=11)
+    candidate_count: int   # 候选数量 = max_planets + 1 (slot 0 为 no-op)
+    ship_bucket_count: int # 派兵档位数
+    hidden_size: int = 128 # 隐层宽度
+    use_cnn: bool = False  # 是否启用 CNN 小地图分支
+    map_channels: int = 6  # CNN 输入通道数
+    map_grid_size: int = 8 # CNN 输入分辨率
+
+    @nn.compact
+    def __call__(self, self_features, candidate_features, global_features, candidate_mask, map_features=None, selected_targets=None):
+        # 将三类输入分别编码为等长 hidden 向量
+        self_h = MLP(self.hidden_size)(self_features)
+        cand_h = MLP(self.hidden_size)(candidate_features)
+        global_h = MLP(self.hidden_size)(global_features)
+        # 全图池化：对存活星球做 max/mean 混合池，得到全局感知
+        # safe_mask 保证当没有星球时至少保留 slot 0 参与池化
+        planet_mask = candidate_features[..., 1] > 0.5
+        safe_mask = jnp.where(planet_mask.any(axis=-1, keepdims=True), planet_mask, jnp.arange(self.candidate_count)[None, :] == 0)
+        masked = jnp.where(safe_mask[..., None], cand_h, jnp.finfo(jnp.float32).min)
+        max_pool = masked.max(axis=1)
+        mean_pool = (cand_h * safe_mask[..., None]).sum(axis=1) / jnp.maximum(safe_mask.sum(axis=1, keepdims=True), 1)
+        map_h = 0.5 * (max_pool + mean_pool)  # 全图池化结果
+        context_parts = [self_h, global_h, map_h]
+        if self.use_cnn:
+            if map_features is None:
+                map_features = jnp.zeros((self_h.shape[0], self.map_channels, self.map_grid_size, self.map_grid_size), dtype=self_h.dtype)
+            # Flax Conv expects NHWC.
+            x = jnp.transpose(map_features, (0, 2, 3, 1))
+            x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
+            x = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(x))
+            x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
+            x = x.mean(axis=(1, 2))
+            x = nn.relu(nn.Dense(16)(x))
+            context_parts.append(x)
+        context_h = jnp.concatenate(context_parts, axis=-1)  # [B, hidden*3 (+ cnn_out)]
+
+        # 单头 scaled dot-product cross-attention 实现目标选择
+        # query = 来源星球 context 经非线性变换 + L2 归一化
+        # 注意：用 sqrt(max(sum(x²), eps²)) 而非 max(norm(x), eps)。
+        # 后者在 x=0 时反向传播会产生 0/0=NaN（norm 梯度 = x/norm(x)，
+        # 即使 max 截断使前向为 eps，反向仍通过 d(norm)/dx=x/0 产生 NaN 梯度）。
+        q = nn.Dense(self.hidden_size)(context_h)
+        q = nn.relu(q)
+        q = nn.Dense(self.hidden_size)(q)
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
+        # key = 候选星球编码 + L2 归一化；slot 0 用可学习 no-op key 覆盖
+        keys = nn.Dense(self.hidden_size)(cand_h)
+        noop_key = self.param("noop_key", nn.initializers.zeros, (self.hidden_size,))
+        keys = keys.at[:, 0, :].set(noop_key)
+        keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
+        # logit = q · key / sqrt(d)，非法目标置 -inf
+        target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
+        target_logits = jnp.where(candidate_mask, target_logits, -1.0e9)
+
+        # fire 头：二分类逻辑回归
+        fire_logits = nn.Dense(self.hidden_size)(context_h)
+        fire_logits = nn.relu(fire_logits)
+        fire_logits = nn.Dense(1)(fire_logits).squeeze(-1)
+
+        # amount 头：拼接已选目标和 context，输出派兵档位 logits
+        if selected_targets is None:
+            selected_targets = jnp.zeros((self_h.shape[0],), dtype=jnp.int32)
+        row = jnp.arange(selected_targets.shape[0])
+        selected_h = cand_h[row, selected_targets]
+        amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
+        amount_h = nn.relu(nn.Dense(self.hidden_size)(amount_h))
+        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+
+        # critic 头：当前状态价值
+        value_h = nn.relu(nn.Dense(self.hidden_size)(context_h))
+        value = nn.Dense(1)(value_h).squeeze(-1)
+        return PolicyOutput(fire_logits, target_logits, amount_logits, value)

@@ -246,7 +246,8 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
     """根据配置创建默认评估对手列表。"""
 
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
-    external_root = root / "orbit-wars-lab" / "agents" / "external"
+    agents_root = root / "agents"
+    external_root = agents_root / "external"
     opponents: list[JaxEvalOpponent] = []
     if "nearest" in enabled:
         opponents.append(NearestJaxEvalOpponent())
@@ -268,7 +269,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
         opponents.append(ExternalScriptJaxEvalOpponent(
             name="jax-pool-0514-resume-ckpt900",
             metric_prefix="pool_ckpt900",
-            agent_dir=root / "orbit-wars-lab" / "agents" / "mine" / "jax-pool-0514-resume-ckpt900",
+            agent_dir=agents_root / "mine" / "jax-pool-0514-resume-ckpt900",
             seed_offset=31337,
         ))
     return opponents

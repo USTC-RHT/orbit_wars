@@ -1,0 +1,3 @@
+name: jax-pool-0514-resume-ckpt900
+description: "JAX PPO agent - jax_pool_0514_vs_ckpt400 ckpt_000900."
+main: main.py

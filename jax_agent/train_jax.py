@@ -22,7 +22,6 @@ import jax.numpy as jnp
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -542,7 +541,7 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.csv"
     eval_opponents = default_eval_opponents(
-        WORKSPACE_ROOT,
+        REPO_ROOT,
         enabled_names=getattr(cfg.eval, "opponents", None),
     )
     eval_metric_fields = build_eval_metric_fields(eval_opponents)

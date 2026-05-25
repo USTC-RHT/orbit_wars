@@ -55,7 +55,6 @@ If the cloud platform cannot access wandb, change `wandb.mode` in the config to
 
 - `cfg_jax_fixed_pool_0522.yaml` is currently set to `total_updates: 50000`.
 - The config evaluates against `nearest`, `sigma`, `tamrazov`, and
-  `pool_ckpt900`; external opponents must exist under the expected
-  `orbit-wars-lab/agents/mine/...` paths for those evals to run.
+  `pool_ckpt900`; bundled external opponents live under `rl-agent/agents/...`.
 - The requirements pin the Kaggle environment by Git commit to reduce mismatch
   between local physics tests and cloud training.

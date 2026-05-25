@@ -627,7 +627,7 @@ def _update_terminal(state: EnvState, params: EnvParams) -> EnvState:
     # 判断每个玩家是否仍在场（有星球或有飞行舰队均算存活）
     alive0 = ((p_alive & (owner == 0)).any()) | ((f_alive & (f_owner == 0)).any())
     alive1 = ((p_alive & (owner == 1)).any()) | ((f_alive & (f_owner == 1)).any())
-    terminal = (state.step >= params.episode_steps - 2) | ((alive0.astype(jnp.int32) + alive1.astype(jnp.int32)) <= 1)
+    terminal = (state.step >= params.episode_steps - 1) | ((alive0.astype(jnp.int32) + alive1.astype(jnp.int32)) <= 1)
     # 终局分数 = 己方所有星球船数 + 飞行中舰队船数
     score0 = jnp.where(state.planet_alive & (owner == 0), state.planets[:, 5], 0.0).sum()
     score1 = jnp.where(state.planet_alive & (owner == 1), state.planets[:, 5], 0.0).sum()

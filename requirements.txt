@@ -1,0 +1,39 @@
+# Cloud GPU training environment for the current JAX autoregressive PPO stack.
+# Python: 3.12
+# Recommended GPU stack: NVIDIA driver with CUDA 12 support.
+
+absl-py==2.4.0
+chex==0.1.91
+flax==0.12.7
+gymnasium==1.2.0
+gymnax==0.0.8
+jax[cuda12]==0.10.0
+jaxlib==0.10.0
+matplotlib==3.10.9
+numpy==2.4.4
+onnx==1.21.0
+onnxruntime==1.26.0
+optax==0.2.8
+orbax-checkpoint==0.11.36
+pandas==3.0.2
+PyYAML==6.0.3
+scipy==1.17.1
+seaborn==0.13.2
+tqdm==4.67.3
+wandb==0.26.1
+
+# Kaggle Orbit Wars environment. This pins the exact source currently installed
+# in the local training env rather than relying on PyPI drift.
+kaggle==2.0.2
+kaggle-environments @ git+https://github.com/Kaggle/kaggle-environments.git@27660ecca553b96b1e3d6b282ca855fd1f274847
+
+# Optional but useful for local evaluation/export compatibility.
+open_spiel==1.6.12
+pettingzoo==1.24.0
+pygame==2.6.1
+trueskill==0.4.5
+
+# Current local lab package source. If the cloud machine already has this repo
+# mounted, installing the local repo with `pip install -e /path/to/orbit-wars-lab`
+# is also fine.
+orbit-wars-lab @ git+https://github.com/automatylicza/orbit-wars-lab.git@fc55481aee85db2431a91a32922bc6bc99fba49e

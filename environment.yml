@@ -1,0 +1,8 @@
+name: orbit-wars-lab
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements.cloud-gpu.txt

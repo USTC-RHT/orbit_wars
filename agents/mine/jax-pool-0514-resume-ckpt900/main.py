@@ -27,6 +27,7 @@ _RL_ROOT = _HERE
 _INFER_FN = None
 _ENV_PARAMS = None
 _FLIP_STATE = None
+_FLIP_ACTIONS = None
 _KAGGLE_OBS_TO_JAX_STATE = None
 _JAX_ACTIONS_TO_KAGGLE = None
 _LOAD_ERROR: BaseException | None = None
@@ -67,7 +68,7 @@ def _local_agent_imports():
 
 
 def _load_model() -> None:
-    global _INFER_FN, _ENV_PARAMS, _FLIP_STATE, _KAGGLE_OBS_TO_JAX_STATE, _JAX_ACTIONS_TO_KAGGLE, _LOAD_ERROR
+    global _INFER_FN, _ENV_PARAMS, _FLIP_STATE, _FLIP_ACTIONS, _KAGGLE_OBS_TO_JAX_STATE, _JAX_ACTIONS_TO_KAGGLE, _LOAD_ERROR
     t0 = time.time()
     try:
         with _local_agent_imports():
@@ -87,6 +88,7 @@ def _load_model() -> None:
             from jax_agent.ppo_jax import safe_logits
             from jax_agent.train_jax import (
                 actions_from_decisions,
+                flip_actions,
                 flip_state,
                 jax_actions_to_kaggle,
                 kaggle_obs_to_jax_state,
@@ -198,6 +200,7 @@ def _load_model() -> None:
 
         _ENV_PARAMS = env_params
         _FLIP_STATE = flip_state
+        _FLIP_ACTIONS = flip_actions
         _KAGGLE_OBS_TO_JAX_STATE = kaggle_obs_to_jax_state
         _JAX_ACTIONS_TO_KAGGLE = jax_actions_to_kaggle
         _INFER_FN = _infer
@@ -233,6 +236,8 @@ def agent(observation, configuration):
         if player == 1:
             jax_state = _FLIP_STATE(jax_state)
         acts_jax = _INFER_FN(jax_state)
+        if player == 1:
+            acts_jax = _FLIP_ACTIONS(acts_jax)
         return _JAX_ACTIONS_TO_KAGGLE(acts_jax)
     except Exception:  # noqa: BLE001
         return []

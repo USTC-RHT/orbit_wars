@@ -9,7 +9,7 @@
 seed: 42
 run_name: "jax_fixed_pool_with_mask-0525"
 device: auto
-save_dir: ../outputs
+save_dir: ../kaggle
 checkpoint_every: 100
 log_every: 1
 opponent: "pool"
@@ -82,18 +82,18 @@ ppo:
   clip_vloss: true
   target_kl: 0.02
 
-self_play_update_interval: 100
+self_play_update_interval: 50
 pool_mode: fixed_pool
 pool_start_phase: 1
-pool_lag_interval: 100
+pool_lag_interval: 50
 promote_nearest_win_rate: 1.0
 promote_consecutive_evals: 2
 
 eval:
   enabled: true
   every: 1000
-  nearest_every: 100
-  slow_every: 1000
+  nearest_every: 50
+  slow_every: 400
   games: 20
   seed: 200000
   opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]

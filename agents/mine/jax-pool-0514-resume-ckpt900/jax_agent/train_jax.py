@@ -5,7 +5,7 @@
 - policy_sample: 两次前向传播（第一次采 fire/target，第二次带 target 采 amount）。
 - actions_from_decisions: 将网络决策转换为游戏动作格式 [from, angle, ships]。
 - aim_with_prediction_jax: 60 步轨迹预测锁定目标（旋转星球/彗星均支持）。
-- target_is_first_collision_jax: 验证目标星球是否为舰队路径上第一个碰撜体。
+- target_is_first_collision_jax: 验证目标星球是否为舰队路径上第一个碰撞体。
 - 环境并行度 B = num_envs，星球并行度 P = max_planets。
 """
 
@@ -27,7 +27,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import load_config  # noqa: E402
-from src.opponents import ExternalScriptOpponent, NearestOpponent  # noqa: E402
 from src.state import parse_observation  # noqa: E402
 
 try:
@@ -58,6 +57,11 @@ from .ppo_jax import PPOParams, Rollout, compute_gae, log_prob_entropy, make_tra
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 
 NEG_INF = -1.0e9
+
+
+def flip_actions(actions: jnp.ndarray) -> jnp.ndarray:
+    """此模型仅做 owner swap（无坐标翻转），动作角度无需修正，直接原样返回。"""
+    return actions
 
 
 def flip_state(state: EnvState) -> EnvState:
@@ -254,6 +258,8 @@ def eval_vs_external(
     except ImportError:
         print("[eval] kaggle_environments 未安装，跳过外部智能体评估")
         return {}
+
+    from src.opponents import ExternalScriptOpponent
 
     opponent = ExternalScriptOpponent(opponent_dir)
     wins = losses = draws = 0

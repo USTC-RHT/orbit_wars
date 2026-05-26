@@ -115,19 +115,70 @@ def _current_lr(cfg, optimizer_step: int, total_steps: int, warmup_steps: int) -
     return base_lr
 
 
-def flip_state(state: EnvState) -> EnvState:
-    """将棋盘视角从 player 0 翻转到 player 1（owner 0↔1 互换）。
+def _flip_owner(owner):
+    return jnp.where(owner == 0.0, 1.0, jnp.where(owner == 1.0, 0.0, owner))
 
-    用于自博弈：把当前局面翻转后，网络以为自己是 player 0，实际输出的是 player 1 的动作。
+
+def _rotate_angle_pi(angle):
+    return jnp.arctan2(-jnp.sin(angle), -jnp.cos(angle))
+
+
+def _mirror_planet_indices(count: int) -> jnp.ndarray:
+    idx = jnp.arange(count, dtype=jnp.int32)
+    mirror = (idx // 4) * 4 + (3 - (idx % 4))
+    return jnp.where(mirror < count, mirror, idx)
+
+
+def flip_actions(actions: jnp.ndarray) -> jnp.ndarray:
+    """把规范视角动作旋转 180 度，转回真实地图坐标。"""
+    ships = actions[..., 2]
+    angle = jnp.where(ships > 0.0, _rotate_angle_pi(actions[..., 1]), 0.0)
+    return actions.at[..., 1].set(angle)
+
+
+def flip_state(state: EnvState) -> EnvState:
+    """将 player 1 局面转成 player 0 规范视角。
+
+    Orbit Wars 的 2p 初始点关于地图中心 180 度对称。player 1 推理时需要
+    owner 互换、坐标旋转、舰队角度旋转、对称星球槽位重排，才能看到与
+    player 0 一致的视角。星球行内的真实 id 不改，输出动作仍可直接映射
+    回真实环境。
     """
-    # 星球 owner：0→1，1→0，中立 -1 不变
-    po = state.planets[..., 1]
-    new_po = jnp.where(po == 0.0, 1.0, jnp.where(po == 1.0, 0.0, po))
-    new_planets = state.planets.at[..., 1].set(new_po)
-    # 舰队 owner：只有 0/1，直接取反
-    new_fo = 1.0 - state.fleets[..., 1]
+    planet_perm = _mirror_planet_indices(state.planets.shape[-2])
+    new_planet_alive = state.planet_alive[..., planet_perm]
+
+    planets = state.planets[..., planet_perm, :]
+    po = planets[..., 1]
+    new_po = _flip_owner(po)
+    new_planets = planets.at[..., 1].set(new_po)
+    new_planets = new_planets.at[..., 2].set(100.0 - planets[..., 2])
+    new_planets = new_planets.at[..., 3].set(100.0 - planets[..., 3])
+
+    initial_planets = state.initial_planets[..., planet_perm, :]
+    ipo = initial_planets[..., 1]
+    new_initial_planets = initial_planets.at[..., 1].set(_flip_owner(ipo))
+    new_initial_planets = new_initial_planets.at[..., 2].set(100.0 - initial_planets[..., 2])
+    new_initial_planets = new_initial_planets.at[..., 3].set(100.0 - initial_planets[..., 3])
+
+    new_fo = _flip_owner(state.fleets[..., 1])
     new_fleets = state.fleets.at[..., 1].set(new_fo)
-    return state._replace(planets=new_planets, fleets=new_fleets)
+    new_fleets = new_fleets.at[..., 2].set(100.0 - state.fleets[..., 2])
+    new_fleets = new_fleets.at[..., 3].set(100.0 - state.fleets[..., 3])
+    new_fleets = new_fleets.at[..., 4].set(_rotate_angle_pi(state.fleets[..., 4]))
+
+    new_comet_paths = state.comet_paths.at[..., 0].set(100.0 - state.comet_paths[..., 0])
+    new_comet_paths = new_comet_paths.at[..., 1].set(100.0 - state.comet_paths[..., 1])
+    safe_comet_slots = jnp.clip(state.comet_slots, 0, state.planets.shape[-2] - 1)
+    new_comet_slots = jnp.where(state.comet_slots >= 0, planet_perm[safe_comet_slots], -1)
+
+    return state._replace(
+        planets=new_planets,
+        initial_planets=new_initial_planets,
+        planet_alive=new_planet_alive,
+        fleets=new_fleets,
+        comet_paths=new_comet_paths,
+        comet_slots=new_comet_slots,
+    )
 
 
 def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
@@ -400,7 +451,7 @@ def auto_opponent_policy_actions(
         ended = ended | end_t
         h = h_new
 
-    return actions
+    return flip_actions(actions)
 
 
 def main() -> None:

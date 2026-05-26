@@ -363,11 +363,15 @@ def auto_opponent_policy_actions(
     max_action_tokens: int,
     *,
     flip_state_fn,
+    rng,
 ):
-    """自博弈训练用的冻结参数贪心对手。
+    """自博弈训练用的冻结参数对手。
 
     它先把棋盘翻转到 player 1 视角，再用冻结的 opponent_params 生成动作。
-    这里直接调用 model.apply，保证能在 jax.lax.scan 里运行。
+    与 learner 的 ``auto_policy_sample`` 保持一致：end / src / tgt / amount
+    四个 head 都按当前 logits 采样（categorical / bernoulli），不再 argmax，
+    用于训练时给学习者提供有探索的对手。评估路径仍使用
+    ``auto_deterministic_policy_actions`` 走 argmax。
     """
     flipped = flip_state_fn(state)
     raw_enc = encode_batch(flipped, opp_fp)
@@ -395,9 +399,11 @@ def auto_opponent_policy_actions(
             state_emb, h, prev_tok, remaining, encoded.relative_features, encoded.source_mask, src_key_proj,
             method=model.auto_step_base,
         )
+        rng, key_end, key_src, key_tgt, key_amt = jax.random.split(rng, 5)
         tv = ~ended
-        end_t = tv & (jax.nn.sigmoid(end_logits_t) > 0.5)
-        src_t = jnp.argmax(safe_logits(src_logits_t), axis=-1)
+        sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
+        end_t = tv & sampled_end
+        src_t = jax.random.categorical(key_src, safe_logits(src_logits_t), axis=-1)
         src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
 
         tgt_logits_t = model.apply(
@@ -405,7 +411,7 @@ def auto_opponent_policy_actions(
             h_new, src_for_heads, planet_out, relative_h, key_proj, encoded.candidate_mask,
             method=model.auto_tgt_logits,
         )
-        tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
+        tgt_t = jax.random.categorical(key_tgt, safe_logits(tgt_logits_t), axis=-1)
         tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
 
         amt_logits_t = model.apply(
@@ -414,7 +420,7 @@ def auto_opponent_policy_actions(
             relative_h, remaining, encoded.amount_mask,
             method=model.auto_amt_logits,
         )
-        amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
+        amt_t = jax.random.categorical(key_amt, safe_logits(amt_logits_t), axis=-1)
 
         src_slot = jnp.clip(src_t - 1, 0, opp_fp.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, opp_fp.max_planets - 1)
@@ -1181,6 +1187,7 @@ def collect_rollout_auto(
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,
+                rng=opp_key,
             )
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)

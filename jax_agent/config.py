@@ -85,6 +85,7 @@ class EvalConfig:
     slow_every: int = 0       # 外部脚本对手间隔（0 = 跟随 every）
     games: int = 20
     seed: int = 100000
+    player: int = 0          # 0=learner as player0, 1=learner as player1 during eval
     opponents: list[str] = field(default_factory=lambda: ["nearest", "sigma", "tamrazov"])
 
 

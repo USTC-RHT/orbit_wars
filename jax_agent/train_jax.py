@@ -977,7 +977,8 @@ def main() -> None:
         _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
         _do_slow   = eval_enabled and eval_slow_interval   > 0 and update % eval_slow_interval   == 0
         if _do_nearest or _do_slow:
-            print(f"[eval] update={update} 开始评估 ({eval_games} 局)...")
+            eval_player = 1 if int(getattr(cfg.eval, "player", 0)) == 1 else 0
+            print(f"[eval] update={update} 开始评估 ({eval_games} 局, learner=player{eval_player})...")
             rng, eval_rng = jax.random.split(rng)
 
             eval_ctx = EvalContext(
@@ -995,8 +996,10 @@ def main() -> None:
                 nearest_opponent_actions=nearest_opponent_actions,
                 reset_from_bank=reset_from_bank,
                 flip_state=flip_state,
+                flip_actions=flip_actions,
                 kaggle_obs_to_jax_state=kaggle_obs_to_jax_state,
                 jax_actions_to_kaggle=jax_actions_to_kaggle,
+                eval_player=eval_player,
             )
             eval_results: dict[str, dict] = {}
             for eval_opponent in eval_opponents:

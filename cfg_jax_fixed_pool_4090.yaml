@@ -96,6 +96,7 @@ eval:
   slow_every: 400
   games: 20
   seed: 200000
+  player: 1
   opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]
 
 wandb:

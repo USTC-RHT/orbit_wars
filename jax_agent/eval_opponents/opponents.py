@@ -38,8 +38,10 @@ class EvalContext:
     nearest_opponent_actions: Callable
     reset_from_bank: Callable
     flip_state: Callable
+    flip_actions: Callable
     kaggle_obs_to_jax_state: Callable
     jax_actions_to_kaggle: Callable
+    eval_player: int = 0
 
 
 class JaxEvalOpponent(Protocol):
@@ -132,27 +134,42 @@ class NearestJaxEvalOpponent:
     def evaluate(self, ctx: EvalContext) -> EvalResult:
         _rng, reset_key = jax.random.split(ctx.rng)
         state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
+        learner_idx = 1 if int(getattr(ctx, "eval_player", 0)) == 1 else 0
+        opponent_idx = 1 - learner_idx
 
         def step_fn(st, _):
-            learner_acts = ctx.deterministic_policy_actions(
-                ctx.train_state,
-                st,
-                ctx.feat_params,
-                ctx.normalizer_state,
-                ctx.norm_params,
-            )
-            opp_acts = ctx.nearest_opponent_actions(st, player=1, params=ctx.feat_params)
-            joint = jnp.stack([learner_acts, opp_acts], axis=1)
+            if learner_idx == 1:
+                learner_st = ctx.flip_state(st)
+                learner_acts = ctx.deterministic_policy_actions(
+                    ctx.train_state,
+                    learner_st,
+                    ctx.feat_params,
+                    ctx.normalizer_state,
+                    ctx.norm_params,
+                )
+                learner_acts = ctx.flip_actions(learner_acts)
+                opp_acts = ctx.nearest_opponent_actions(st, player=0, params=ctx.feat_params)
+                joint = jnp.stack([opp_acts, learner_acts], axis=1)
+            else:
+                learner_acts = ctx.deterministic_policy_actions(
+                    ctx.train_state,
+                    st,
+                    ctx.feat_params,
+                    ctx.normalizer_state,
+                    ctx.norm_params,
+                )
+                opp_acts = ctx.nearest_opponent_actions(st, player=1, params=ctx.feat_params)
+                joint = jnp.stack([learner_acts, opp_acts], axis=1)
             return step_batch(st, joint, ctx.env_params), None
 
         final_state, _ = jax.lax.scan(step_fn, state, None, length=ctx.env_params.episode_steps)
         winners = np.array(final_state.winner)
-        wins = int((winners == 0).sum())
-        losses = int((winners == 1).sum())
+        wins = int((winners == learner_idx).sum())
+        losses = int((winners == opponent_idx).sum())
         draws = int((winners == 2).sum())
         total = max(ctx.num_games, 1)
         result = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total, "loss_rate": losses / total}
-        print(f"[eval/{self.name}]   wins={wins} losses={losses} draws={draws} win_rate={result['win_rate']:.3f}")
+        print(f"[eval/{self.name}]   p{learner_idx} wins={wins} losses={losses} draws={draws} win_rate={result['win_rate']:.3f}")
         return result
 
 
@@ -200,19 +217,29 @@ class ExternalScriptJaxEvalOpponent:
             env = kag_make("orbit_wars", configuration={"seed": seed, "randomSeed": seed}, debug=False)
             env.reset(num_agents=2)
             states = env.step([[], []])
-            obs = states[0]["observation"]
-            opp_obs = states[1]["observation"]
+            learner_idx = 1 if int(getattr(ctx, "eval_player", 0)) == 1 else 0
+            opponent_idx = 1 - learner_idx
+            obs = states[learner_idx]["observation"]
+            opp_obs = states[opponent_idx]["observation"]
             done = states[0]["status"] != "ACTIVE"
             while not done:
                 jax_state = ctx.kaggle_obs_to_jax_state(obs, ctx.env_params)
-                learner_action = ctx.jax_actions_to_kaggle(infer(jax_state))
+                if learner_idx == 1:
+                    jax_state = ctx.flip_state(jax_state)
+                jax_acts = infer(jax_state)
+                if learner_idx == 1:
+                    jax_acts = ctx.flip_actions(jax_acts)
+                learner_action = ctx.jax_actions_to_kaggle(jax_acts)
                 opp_action = opponent.act_for_env(0, opp_obs)
-                states = env.step([learner_action, opp_action])
-                obs = states[0]["observation"]
-                opp_obs = states[1]["observation"]
+                joint_actions = [None, None]
+                joint_actions[learner_idx] = learner_action
+                joint_actions[opponent_idx] = opp_action
+                states = env.step(joint_actions)
+                obs = states[learner_idx]["observation"]
+                opp_obs = states[opponent_idx]["observation"]
                 done = states[0]["status"] != "ACTIVE"
 
-            reward = states[0].get("reward", 0.0) or 0.0
+            reward = states[learner_idx].get("reward", 0.0) or 0.0
             if reward > 0:
                 wins += 1
                 outcome = "win"
@@ -222,7 +249,7 @@ class ExternalScriptJaxEvalOpponent:
             else:
                 draws += 1
                 outcome = "draw"
-            print(f"  [eval/{self.name}] game={game_idx + 1} seed={seed} {outcome} reward={reward:.1f}")
+            print(f"  [eval/{self.name}] game={game_idx + 1} seed={seed} p{learner_idx} {outcome} reward={reward:.1f}")
 
         total = max(ctx.num_games, 1)
         result = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total, "loss_rate": losses / total}

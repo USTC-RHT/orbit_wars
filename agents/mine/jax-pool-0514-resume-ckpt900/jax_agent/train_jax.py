@@ -59,24 +59,61 @@ from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 NEG_INF = -1.0e9
 
 
+def _flip_owner(owner):
+    return jnp.where(owner == 0.0, 1.0, jnp.where(owner == 1.0, 0.0, owner))
+
+
+def _rotate_angle_pi(angle):
+    return jnp.arctan2(-jnp.sin(angle), -jnp.cos(angle))
+
+
+def _mirror_planet_indices(count: int) -> jnp.ndarray:
+    idx = jnp.arange(count, dtype=jnp.int32)
+    mirror = (idx // 4) * 4 + (3 - (idx % 4))
+    return jnp.where(mirror < count, mirror, idx)
+
+
 def flip_actions(actions: jnp.ndarray) -> jnp.ndarray:
-    """此模型仅做 owner swap（无坐标翻转），动作角度无需修正，直接原样返回。"""
-    return actions
+    """把规范视角动作旋转 180 度，转回真实地图坐标。"""
+    ships = actions[..., 2]
+    angle = jnp.where(ships > 0.0, _rotate_angle_pi(actions[..., 1]), 0.0)
+    return actions.at[..., 1].set(angle)
 
 
 def flip_state(state: EnvState) -> EnvState:
-    """将棋盘视角从 player 0 翻转到 player 1（owner 0↔1 互换）。
+    """将 player 1 局面转成 player 0 规范视角。"""
+    planet_perm = _mirror_planet_indices(state.planets.shape[-2])
+    new_planet_alive = state.planet_alive[..., planet_perm]
 
-    用于自博弈：把当前局面翻转后，网络以为自己是 player 0，实际输出的是 player 1 的动作。
-    """
-    # 星球 owner：0→1，1→0，中立 -1 不变
-    po = state.planets[..., 1]
-    new_po = jnp.where(po == 0.0, 1.0, jnp.where(po == 1.0, 0.0, po))
-    new_planets = state.planets.at[..., 1].set(new_po)
-    # 舰队 owner：只有 0/1，直接取反
-    new_fo = 1.0 - state.fleets[..., 1]
+    planets = state.planets[..., planet_perm, :]
+    new_planets = planets.at[..., 1].set(_flip_owner(planets[..., 1]))
+    new_planets = new_planets.at[..., 2].set(100.0 - planets[..., 2])
+    new_planets = new_planets.at[..., 3].set(100.0 - planets[..., 3])
+
+    initial_planets = state.initial_planets[..., planet_perm, :]
+    new_initial_planets = initial_planets.at[..., 1].set(_flip_owner(initial_planets[..., 1]))
+    new_initial_planets = new_initial_planets.at[..., 2].set(100.0 - initial_planets[..., 2])
+    new_initial_planets = new_initial_planets.at[..., 3].set(100.0 - initial_planets[..., 3])
+
+    new_fo = _flip_owner(state.fleets[..., 1])
     new_fleets = state.fleets.at[..., 1].set(new_fo)
-    return state._replace(planets=new_planets, fleets=new_fleets)
+    new_fleets = new_fleets.at[..., 2].set(100.0 - state.fleets[..., 2])
+    new_fleets = new_fleets.at[..., 3].set(100.0 - state.fleets[..., 3])
+    new_fleets = new_fleets.at[..., 4].set(_rotate_angle_pi(state.fleets[..., 4]))
+
+    new_comet_paths = state.comet_paths.at[..., 0].set(100.0 - state.comet_paths[..., 0])
+    new_comet_paths = new_comet_paths.at[..., 1].set(100.0 - state.comet_paths[..., 1])
+    safe_comet_slots = jnp.clip(state.comet_slots, 0, state.planets.shape[-2] - 1)
+    new_comet_slots = jnp.where(state.comet_slots >= 0, planet_perm[safe_comet_slots], -1)
+
+    return state._replace(
+        planets=new_planets,
+        initial_planets=new_initial_planets,
+        planet_alive=new_planet_alive,
+        fleets=new_fleets,
+        comet_paths=new_comet_paths,
+        comet_slots=new_comet_slots,
+    )
 
 
 def policy_sample_params(params, model, flat, rng):
@@ -784,7 +821,7 @@ def collect_rollout(train_state, opponent_params, state, normalizer_state, rng, 
             enc_opp = normalize_encoded(raw_enc_opp, ns, norm_params)  # 只读，不更新归一化器
             flat_opp = flatten_sources(enc_opp)
             f_opp, t_opp, a_opp, _, _ = policy_sample_params(opponent_params, model, flat_opp, opp_key)
-            opponent_actions = actions_from_decisions(flipped, enc_opp, f_opp.reshape(flipped.planets.shape[:2]), t_opp.reshape(flipped.planets.shape[:2]), a_opp.reshape(flipped.planets.shape[:2]), feat_params)
+            opponent_actions = flip_actions(actions_from_decisions(flipped, enc_opp, f_opp.reshape(flipped.planets.shape[:2]), t_opp.reshape(flipped.planets.shape[:2]), a_opp.reshape(flipped.planets.shape[:2]), feat_params))
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)  # 对手：最近敌方简单基线
         joint = jnp.stack([learner_actions, opponent_actions], axis=1)  # 双方动作合并

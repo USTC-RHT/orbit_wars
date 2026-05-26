@@ -66,6 +66,7 @@ from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
 
 NEG_INF = -1.0e9
+REACHABILITY_TARGET_ATTEMPTS = 2
 
 
 def _resolve_lr_schedule(cfg) -> str:
@@ -249,6 +250,86 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
 
 
+def _valid_logit_mask(logits):
+    return logits > (NEG_INF * 0.5)
+
+
+def _amount_reachability_mask(state, encoded, remaining, src_t, tgt_t, feat_params, batch_idx):
+    """Return dynamic bucket values and per-bucket physical reachability for selected src/tgt."""
+    src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
+    tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
+    src_safe = jnp.clip(src_t, 0, feat_params.max_planets)
+    tgt_safe = jnp.clip(tgt_t, 0, feat_params.max_planets)
+    source_buckets = dynamic_ship_buckets(remaining[batch_idx, src_safe], feat_params.ship_bucket_count)
+    src_planets = state.planets[batch_idx, src_slot]
+    tgt_planets = state.planets[batch_idx, tgt_slot]
+
+    src_all = jnp.broadcast_to(src_planets[:, None, :], (src_planets.shape[0], feat_params.ship_bucket_count, src_planets.shape[-1]))
+    tgt_all = jnp.broadcast_to(tgt_planets[:, None, :], (tgt_planets.shape[0], feat_params.ship_bucket_count, tgt_planets.shape[-1]))
+    tgt_idx_all = jnp.broadcast_to(tgt_slot[:, None], (tgt_slot.shape[0], feat_params.ship_bucket_count))
+    _angle, physical_hit = aim_with_prediction_jax(src_all, tgt_all, tgt_idx_all, state, source_buckets)
+
+    source_amount_mask = encoded.amount_mask[batch_idx, jnp.clip(src_safe - 1, 0, feat_params.max_planets - 1)]
+    selected_amount_mask = jnp.take_along_axis(source_amount_mask, tgt_safe[:, None, None], axis=1).squeeze(1)
+    src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
+    tgt_valid = tgt_t > 0
+    amount_valid = selected_amount_mask & (source_buckets > 0.0)
+    reach_mask = physical_hit & amount_valid & src_valid[:, None] & tgt_valid[:, None]
+    return source_buckets, reach_mask, src_slot, tgt_slot
+
+
+def _select_tgt_with_reachability(
+    base_tgt_logits,
+    src_t,
+    active,
+    state,
+    encoded,
+    remaining,
+    feat_params,
+    batch_idx,
+    unreachable_pair_mask,
+    rng=None,
+):
+    """Select a target; if all 8 amount buckets miss, mask that target and try once more."""
+    b, target_count = base_tgt_logits.shape
+    src_safe = jnp.clip(src_t, 0, target_count - 1)
+    blocked = unreachable_pair_mask[batch_idx, src_safe]
+    final_tgt = jnp.zeros((b,), dtype=jnp.int32)
+    final_tgt_logits = safe_logits(base_tgt_logits)
+    final_amount_mask = jnp.zeros((b, feat_params.ship_bucket_count), dtype=bool)
+    done = ~active
+
+    for attempt in range(REACHABILITY_TARGET_ATTEMPTS):
+        masked_tgt_logits_raw = jnp.where(blocked, NEG_INF, base_tgt_logits)
+        target_available = _valid_logit_mask(masked_tgt_logits_raw).any(axis=-1)
+        masked_tgt_logits = safe_logits(masked_tgt_logits_raw)
+        if rng is None:
+            candidate_tgt = jnp.argmax(masked_tgt_logits, axis=-1)
+        else:
+            candidate_tgt = jax.random.categorical(jax.random.fold_in(rng, attempt), masked_tgt_logits, axis=-1)
+        candidate_tgt = jnp.where(done, final_tgt, candidate_tgt)
+
+        _buckets, candidate_amount_mask, _src_slot, _tgt_slot = _amount_reachability_mask(
+            state, encoded, remaining, src_t, candidate_tgt, feat_params, batch_idx
+        )
+        has_reachable_amount = candidate_amount_mask.any(axis=-1)
+        take = ~done
+        success = take & target_available & (candidate_tgt > 0) & has_reachable_amount
+        failed_pair = take & target_available & (candidate_tgt > 0) & (~has_reachable_amount)
+        no_target_left = take & (~target_available)
+
+        final_tgt = jnp.where(take, candidate_tgt, final_tgt)
+        final_tgt_logits = jnp.where(take[:, None], masked_tgt_logits, final_tgt_logits)
+        final_amount_mask = jnp.where(take[:, None], candidate_amount_mask, final_amount_mask)
+        new_blocked_tgt = jax.nn.one_hot(candidate_tgt, target_count, dtype=bool) & failed_pair[:, None]
+        blocked = blocked | new_blocked_tgt
+        new_blocked_pair = jax.nn.one_hot(src_safe, target_count, dtype=bool)[:, :, None] & new_blocked_tgt[:, None, :]
+        unreachable_pair_mask = unreachable_pair_mask | new_blocked_pair
+        done = done | success | no_target_left
+
+    return final_tgt, final_tgt_logits, final_amount_mask, unreachable_pair_mask
+
+
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
     """评估用贪心自回归策略。
 
@@ -278,6 +359,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         method=model.auto_start,
     )
     batch_idx = jnp.arange(b)
+    unreachable_pair_mask = jnp.zeros((b, feat_params.max_planets + 1, feat_params.max_planets + 1), dtype=bool)
 
     for t in range(k):
         h_new, end_logits_t, src_logits_t = train_state.apply_fn(
@@ -297,7 +379,17 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
             encoded.candidate_mask,
             method=model.auto_tgt_logits,
         )
-        tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
+        tgt_t, _tgt_logits_masked, amount_reach_mask, unreachable_pair_mask = _select_tgt_with_reachability(
+            safe_logits(tgt_logits_t),
+            src_for_heads,
+            tv & (~end_t),
+            state,
+            encoded,
+            remaining,
+            feat_params,
+            batch_idx,
+            unreachable_pair_mask,
+        )
 
         tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
         amt_logits_t = train_state.apply_fn(
@@ -306,7 +398,9 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
             relative_h, remaining, encoded.amount_mask,
             method=model.auto_amt_logits,
         )
+        amt_logits_t = jnp.where(amount_reach_mask, amt_logits_t, NEG_INF)
         amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
+        chosen_amount_reachable = jnp.take_along_axis(amount_reach_mask, amt_t[:, None], axis=-1).squeeze(-1)
 
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
@@ -324,7 +418,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & chosen_amount_reachable & aim_hit
 
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -363,11 +457,15 @@ def auto_opponent_policy_actions(
     max_action_tokens: int,
     *,
     flip_state_fn,
+    rng,
 ):
-    """自博弈训练用的冻结参数贪心对手。
+    """自博弈训练用的冻结参数对手。
 
     它先把棋盘翻转到 player 1 视角，再用冻结的 opponent_params 生成动作。
-    这里直接调用 model.apply，保证能在 jax.lax.scan 里运行。
+    与 learner 的 ``auto_policy_sample`` 保持一致：end / src / tgt / amount
+    四个 head 都按当前 logits 采样（categorical / bernoulli），不再 argmax，
+    用于训练时给学习者提供有探索的对手。评估路径仍使用
+    ``auto_deterministic_policy_actions`` 走 argmax。
     """
     flipped = flip_state_fn(state)
     raw_enc = encode_batch(flipped, opp_fp)
@@ -388,6 +486,7 @@ def auto_opponent_policy_actions(
         method=model.auto_start,
     )
     batch_idx = jnp.arange(b)
+    unreachable_pair_mask = jnp.zeros((b, opp_fp.max_planets + 1, opp_fp.max_planets + 1), dtype=bool)
 
     for t in range(k):
         h_new, end_logits_t, src_logits_t = model.apply(
@@ -395,9 +494,11 @@ def auto_opponent_policy_actions(
             state_emb, h, prev_tok, remaining, encoded.relative_features, encoded.source_mask, src_key_proj,
             method=model.auto_step_base,
         )
+        rng, key_end, key_src, key_tgt, key_amt = jax.random.split(rng, 5)
         tv = ~ended
-        end_t = tv & (jax.nn.sigmoid(end_logits_t) > 0.5)
-        src_t = jnp.argmax(safe_logits(src_logits_t), axis=-1)
+        sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
+        end_t = tv & sampled_end
+        src_t = jax.random.categorical(key_src, safe_logits(src_logits_t), axis=-1)
         src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
 
         tgt_logits_t = model.apply(
@@ -405,7 +506,18 @@ def auto_opponent_policy_actions(
             h_new, src_for_heads, planet_out, relative_h, key_proj, encoded.candidate_mask,
             method=model.auto_tgt_logits,
         )
-        tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
+        tgt_t, _tgt_logits_masked, amount_reach_mask, unreachable_pair_mask = _select_tgt_with_reachability(
+            safe_logits(tgt_logits_t),
+            src_for_heads,
+            tv & (~end_t),
+            flipped,
+            encoded,
+            remaining,
+            opp_fp,
+            batch_idx,
+            unreachable_pair_mask,
+            rng=key_tgt,
+        )
         tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
 
         amt_logits_t = model.apply(
@@ -414,7 +526,9 @@ def auto_opponent_policy_actions(
             relative_h, remaining, encoded.amount_mask,
             method=model.auto_amt_logits,
         )
-        amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
+        amt_logits_t = jnp.where(amount_reach_mask, amt_logits_t, NEG_INF)
+        amt_t = jax.random.categorical(key_amt, safe_logits(amt_logits_t), axis=-1)
+        chosen_amount_reachable = jnp.take_along_axis(amount_reach_mask, amt_t[:, None], axis=-1).squeeze(-1)
 
         src_slot = jnp.clip(src_t - 1, 0, opp_fp.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, opp_fp.max_planets - 1)
@@ -431,7 +545,7 @@ def auto_opponent_policy_actions(
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & chosen_amount_reachable & aim_hit
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
             [jnp.where(exec_t, source_ids, 0.0), jnp.where(exec_t, angle, 0.0), jnp.where(exec_t, ships, 0.0)],
@@ -1181,6 +1295,7 @@ def collect_rollout_auto(
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,
+                rng=opp_key,
             )
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
@@ -1205,6 +1320,8 @@ def collect_rollout_auto(
             sample["src_action"],
             sample["tgt_action"],
             sample["amt_action"],
+            sample["tgt_action_mask"],
+            sample["amt_action_mask"],
             sample["executed"],
             sample["invalid"],
             sample["old_logp_end"],
@@ -1292,6 +1409,9 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
     src_action = jnp.zeros((b, k), dtype=jnp.int32)
     tgt_action = jnp.zeros((b, k), dtype=jnp.int32)
     amt_action = jnp.zeros((b, k), dtype=jnp.int32)
+    tgt_action_mask = jnp.zeros((b, k, feat_params.max_planets + 1), dtype=bool)
+    amt_action_mask = jnp.zeros((b, k, feat_params.ship_bucket_count), dtype=bool)
+    unreachable_pair_mask = jnp.zeros((b, feat_params.max_planets + 1, feat_params.max_planets + 1), dtype=bool)
     executed = jnp.zeros((b, k), dtype=bool)
     invalid = jnp.zeros((b, k), dtype=bool)
     token_valid = jnp.zeros((b, k), dtype=bool)
@@ -1316,7 +1436,8 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
     batch_idx = jnp.arange(b)
 
     def body(t, carry):
-        (key, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+        (key, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action,
+         tgt_action_mask, amt_action_mask, unreachable_pair_mask, executed, invalid,
          token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = carry
         key, key_end, key_src, key_tgt, key_amt = jax.random.split(key, 5)
         h_new, end_logits_t, src_logits_t = train_state.apply_fn(
@@ -1348,7 +1469,18 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
             method=model.auto_tgt_logits,
         )
         tgt_logits_t = safe_logits(tgt_logits_t)
-        tgt_t = jax.random.categorical(key_tgt, tgt_logits_t, axis=-1)
+        tgt_t, tgt_logits_t, amount_reach_mask, unreachable_pair_mask = _select_tgt_with_reachability(
+            tgt_logits_t,
+            src_for_heads,
+            tv & (~end_t),
+            state,
+            encoded,
+            remaining,
+            feat_params,
+            batch_idx,
+            unreachable_pair_mask,
+            rng=key_tgt,
+        )
 
         tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
         amt_logits_t = train_state.apply_fn(
@@ -1362,8 +1494,10 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
             encoded.amount_mask,
             method=model.auto_amt_logits,
         )
+        amt_logits_t = jnp.where(amount_reach_mask, amt_logits_t, NEG_INF)
         amt_logits_t = safe_logits(amt_logits_t)
         amt_t = jax.random.categorical(key_amt, amt_logits_t, axis=-1)
+        chosen_amount_reachable = jnp.take_along_axis(amount_reach_mask, amt_t[:, None], axis=-1).squeeze(-1)
 
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
@@ -1376,7 +1510,7 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & chosen_amount_reachable & aim_hit
         invalid_t = tv & (~end_t) & (~exec_t)
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -1404,6 +1538,8 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         src_action = src_action.at[:, t].set(src_for_heads)
         tgt_action = tgt_action.at[:, t].set(tgt_for_heads)
         amt_action = amt_action.at[:, t].set(jnp.where(tv & (~end_t), amt_t, 0))
+        tgt_action_mask = tgt_action_mask.at[:, t, :].set(_valid_logit_mask(tgt_logits_t))
+        amt_action_mask = amt_action_mask.at[:, t, :].set(amount_reach_mask)
         executed = executed.at[:, t].set(exec_t)
         invalid = invalid.at[:, t].set(invalid_t)
         token_valid = token_valid.at[:, t].set(tv)
@@ -1412,12 +1548,15 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         old_logp_tgt = old_logp_tgt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(tgt_logits_t, tgt_t), 0.0))
         old_logp_amt = old_logp_amt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(amt_logits_t, amt_t), 0.0))
         ended = ended | end_t
-        return (key, ended, h_new, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+        return (key, ended, h_new, prev_tok, remaining, end_action, src_action, tgt_action, amt_action,
+                tgt_action_mask, amt_action_mask, unreachable_pair_mask, executed, invalid,
                 token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
 
-    init = (rng, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+    init = (rng, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action,
+            tgt_action_mask, amt_action_mask, unreachable_pair_mask, executed, invalid,
             token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
-    (_, _ended, _h, _prev_tok, _remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
+    (_, _ended, _h, _prev_tok, _remaining, end_action, src_action, tgt_action, amt_action,
+     tgt_action_mask, amt_action_mask, _unreachable_pair_mask, executed, invalid,
      token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = jax.lax.fori_loop(0, k, body, init)
     return {
         "actions": actions,
@@ -1426,6 +1565,8 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         "src_action": src_action,
         "tgt_action": tgt_action,
         "amt_action": amt_action,
+        "tgt_action_mask": tgt_action_mask,
+        "amt_action_mask": amt_action_mask,
         "executed": executed,
         "invalid": invalid,
         "token_valid": token_valid,

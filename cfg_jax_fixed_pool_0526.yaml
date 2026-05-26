@@ -8,7 +8,7 @@
 #   can be re-enabled after autoregressive opponent inference is implemented.
 
 seed: 42
-run_name: "jax_fixed_pool_0525_with_mask"
+run_name: "jax_fixed_pool_0526_Fix_mask"
 device: auto
 save_dir: outputs
 checkpoint_every: 100

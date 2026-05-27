@@ -201,7 +201,11 @@ class AutoregressiveActorCritic(nn.Module):
             src_budget = remaining >= 10.0
             src_mask = source_mine & src_budget
             src_logits = jnp.where(src_mask, src_logits, -1.0e9)
-            src_logits = src_logits.at[:, 0].set(-1.0e9)
+            src_logits = jnp.where(
+                jnp.arange(src_logits.shape[1])[None, :] == 0,
+                -1.0e9,
+                src_logits,
+            )
 
             src_safe = jnp.clip(src_t, 0, self.relative_count - 1)
             src_h = planet_out[batch_idx, src_safe]
@@ -212,7 +216,7 @@ class AutoregressiveActorCritic(nn.Module):
             tgt_keys = tgt_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(tgt_keys), axis=-1, keepdims=True), 1e-12))
             tgt_logits = jnp.einsum("bh,bch->bc", q_tgt, tgt_keys) * pointer_logit_scale
             src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-            tgt_mask = src_candidate_mask.at[:, 0].set(False)
+            tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
             tgt_logits = jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
             tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
@@ -324,7 +328,11 @@ class AutoregressiveActorCritic(nn.Module):
         src_budget = remaining >= 10.0
         src_mask = source_mine & src_budget
         src_logits = jnp.where(src_mask, src_logits, -1.0e9)
-        src_logits = src_logits.at[:, 0].set(-1.0e9)
+        src_logits = jnp.where(
+            jnp.arange(src_logits.shape[1])[None, :] == 0,
+            -1.0e9,
+            src_logits,
+        )
         return h_new, end_logits, src_logits
 
     @nn.compact
@@ -342,7 +350,7 @@ class AutoregressiveActorCritic(nn.Module):
         tgt_keys = tgt_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(tgt_keys), axis=-1, keepdims=True), 1e-12))
         tgt_logits = jnp.einsum("bh,bch->bc", q_tgt, tgt_keys) * self._pointer_logit_scale()
         src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-        tgt_mask = src_candidate_mask.at[:, 0].set(False)
+        tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
         return jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
     @nn.compact
@@ -359,10 +367,11 @@ class AutoregressiveActorCritic(nn.Module):
         selected_rel_h = jnp.take_along_axis(rel_for_src, tgt_safe[:, None, None], axis=1).squeeze(1)
         amt_h = nn.relu(hidden_dense(hidden, name="auto_amt_pre")(jnp.concatenate([h_new, src_h, tgt_h, selected_rel_h], axis=-1)))
         amount_logits = actor_logit_dense(self.ship_bucket_count, name="auto_amt_out")(amt_h)
-        source_amount_mask = amount_mask[batch_idx, jnp.clip(src_safe - 1, 0, amount_mask.shape[1] - 1)]
+        amount_mask_f = amount_mask.astype(jnp.float32)
+        source_amount_mask = amount_mask_f[batch_idx, jnp.clip(src_safe - 1, 0, amount_mask_f.shape[1] - 1)]
         selected_amount_mask = jnp.take_along_axis(source_amount_mask, tgt_safe[:, None, None], axis=1).squeeze(1)
-        dynamic_amount_mask = self._dynamic_amount_mask(remaining[batch_idx, src_safe])
-        selected_amount_mask = selected_amount_mask & dynamic_amount_mask
+        dynamic_amount_mask = self._dynamic_amount_mask(remaining[batch_idx, src_safe]).astype(jnp.float32)
+        selected_amount_mask = (selected_amount_mask * dynamic_amount_mask) > 0.5
         return jnp.where(selected_amount_mask, amount_logits, -1.0e9)
 
     @nn.compact
@@ -420,7 +429,11 @@ class AutoregressiveActorCritic(nn.Module):
             src_keys = actor_logit_dense(hidden, name="auto_src_map_key")(
                 nn.relu(hidden_dense(hidden, name="auto_src_map_fuse")(jnp.concatenate([src_planet_h, map_h], axis=-1)))
             )
-            planet_keys = planet_keys.at[:, 1:1 + source_count, :].set(src_keys)
+            slot_idx = jnp.arange(planet_keys.shape[1])
+            src_region = (slot_idx >= 1) & (slot_idx < 1 + source_count)
+            src_idx = jnp.clip(slot_idx - 1, 0, source_count - 1)
+            src_keys_padded = src_keys[:, src_idx, :]
+            planet_keys = jnp.where(src_region[None, :, None], src_keys_padded, planet_keys)
         return planet_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(planet_keys), axis=-1, keepdims=True), 1e-12))
 
     def _encode(self, planet_features, relative_features, global_features, candidate_mask, map_features, fleet_features, fleet_mask):
@@ -442,7 +455,7 @@ class AutoregressiveActorCritic(nn.Module):
         tokens = jnp.concatenate([cls + type_embed[0], planet_h + type_embed[1], fleet_h + type_embed[2]], axis=1)
         cls_mask = jnp.ones((batch_size, 1), dtype=bool)
         planet_alive = transformer_planet_features[..., 1] > 0.5
-        planet_alive = planet_alive.at[:, 0].set(True)
+        planet_alive = planet_alive | (jnp.arange(planet_alive.shape[1])[None, :] == 0)
         token_mask = jnp.concatenate([cls_mask, planet_alive, shared_fleet_mask], axis=1)
         x = tokens
         for _ in range(self.num_transformer_layers):

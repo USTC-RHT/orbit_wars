@@ -5,7 +5,7 @@
 - 星球/舰队槽位预分配，通过 alive 掩码区分有效元素，避免动态列表。
 - 支持预生成 state bank（.npz），复位时直接从 bank 随机抽取，消除 Python 初始化开销。
 - 彗星使用预计算路径存储在 EnvState 中，step 时按 path_index 查表，无需调用 Python RNG。
-- V1 范围：双人、无 wandb、无评估；彗星已支持（路径需通过 build_initial_state_bank 预计算）。
+- 支持 4 人规则；num_players 也可显式设为 2 做兼容检查。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ ROTATION_RADIUS_LIMIT = 50.0 # 轨道半径 + 星球半径 < 此值则为旋转�
 DEFAULT_MAX_PLANETS = 64     # 星球槽位上限（含彗星占用的临时槽位）
 DEFAULT_MAX_FLEETS = 512     # 舰队槽位上限
 DEFAULT_MAX_ACTIONS = 64     # 每方每回合最多发射动作数
+DEFAULT_NUM_PLAYERS = 4      # Orbit Wars 四人局玩家数
 COMET_SPAWN_STEPS = jnp.asarray([50, 150, 250, 350, 450], dtype=jnp.int32)  # 彗星触发回合
 COMET_RADIUS = 1.0           # 彗星星球半径
 COMET_PRODUCTION = 1.0       # 彗星每回合生产力
@@ -45,7 +46,7 @@ class EnvState(NamedTuple):
     angular_velocity: jnp.ndarray  # 全图行星公转角速度（rad/回合）
     next_fleet_id: jnp.ndarray   # 下一支舰队的 ID（自增）
     done: jnp.ndarray            # 游戏是否已结束（标量 bool）
-    winner: jnp.ndarray          # 胜者：0/1=某方胜，2=平局，-1=未结束
+    winner: jnp.ndarray          # 胜者：0..N-1；N=平局/无人得分；-1=未结束
     overflow_fleets: jnp.ndarray # 因 fleet slot 满而丢弃的发射次数（调试用）
     comet_paths: jnp.ndarray     # [5, 4, 40, 2]：每批次每颗彗星的预计算路径坐标
     comet_lengths: jnp.ndarray   # [5, 4]：每颗彗星路径的实际有效步数
@@ -64,6 +65,7 @@ class EnvParams:
     max_planets: int = DEFAULT_MAX_PLANETS  # 星球槽位数（含彗星临时槽位）
     max_fleets: int = DEFAULT_MAX_FLEETS    # 舰队槽位数
     max_actions: int = DEFAULT_MAX_ACTIONS  # 每方每回合动作槽位数
+    num_players: int = DEFAULT_NUM_PLAYERS  # 玩家数；四人局为 4
 
 
 def fleet_speed(ships: jnp.ndarray, max_speed: float = 6.0) -> jnp.ndarray:
@@ -282,7 +284,7 @@ def select_from_bank(bank: EnvState, indices: jnp.ndarray) -> EnvState:
 def step_batch(state: EnvState, actions: jnp.ndarray, params: EnvParams) -> EnvState:
     """批量推进环境一步。
 
-    actions 形状为 [B, 2, max_actions, 3]，每条动作是
+    actions 形状为 [B, num_players, max_actions, 3]，每条动作是
     [from_planet_id, angle_rad, ships]。
     """
 
@@ -302,42 +304,42 @@ def _active_step(state: EnvState, actions: jnp.ndarray, params: EnvParams) -> En
     state = _expire_comets(state)
     # 1. 彗星生成（在 COMET_SPAWN_STEPS 对应回合触发，step+1 判断）
     state = _spawn_comets(state)
-    # 2. 双方发射舰队（先扣除来源星球船数，再写入舰队槽位）
+    # 2. 所有玩家发射舰队（先扣除来源星球船数，再写入舰队槽位）
     state = _launch_all(state, actions, params)
     # 3. 生产：所有有主星球 +production 船（在舰队移动之前）
     owned = (state.planets[:, 1] >= 0.0) & state.planet_alive
     planets = state.planets.at[:, 5].add(jnp.where(owned, state.planets[:, 6], 0.0))
     state = state._replace(planets=planets)
     # 4. 舰队移动 + 连续碰撞检测（超界 / 穿太阳 / 撞星球）
-    state, combat0, combat1 = _move_fleets(state, params)
+    state, combat = _move_fleets(state, params)
     # 5. 行星旋转 + sweep（行星从旧位置扫向新位置，捕获路径上的舰队）
-    state, sweep0, sweep1 = _rotate_planets_and_sweep(state, params)
+    state, sweep = _rotate_planets_and_sweep(state, params)
     # 6. 彗星移动 + sweep（沿预计算路径前进一步）
-    state, comet0, comet1 = _move_comets_and_sweep(state)
+    state, comet = _move_comets_and_sweep(state, params)
     # 7. 过期检查（移动后路径走完的彗星立即清除）
     state = _expire_comets(state)
     # 8. 战斗解算（合并三类来源的战斗贡献：舰队碰撞 / 行星 sweep / 彗星 sweep）
-    state = _resolve_combat(state, combat0 + sweep0 + comet0, combat1 + sweep1 + comet1)
+    state = _resolve_combat(state, combat + sweep + comet, params)
     state = state._replace(step=state.step + 1)
     state = _update_terminal(state, params)
     return state
 
 
 def _launch_all(state: EnvState, actions: jnp.ndarray, params: EnvParams) -> EnvState:
-    """依次处理双方所有发射动作。
+    """依次处理所有玩家的发射动作。
 
     用 fori_loop 串行处理是为了保证每次发射后星球船数立即更新，
     后续动作能看到最新的余量，与 orbit_wars.py 的 Python 循环语义一致。
     性能瓶颈在此；如需加速可改为预扣兵力后并行写入，但会引入竞争写。
     """
-    # 将 [2, max_actions, 3] 展开为 [2*max_actions, 3]，player 标记同步展开
-    flat_players = jnp.repeat(jnp.arange(2, dtype=jnp.int32), params.max_actions)
-    flat_actions = actions.reshape((2 * params.max_actions, 3))
+    # 将 [num_players, max_actions, 3] 展开为 [num_players*max_actions, 3]。
+    flat_players = jnp.repeat(jnp.arange(params.num_players, dtype=jnp.int32), params.max_actions)
+    flat_actions = actions.reshape((params.num_players * params.max_actions, 3))
 
     def body(i: jnp.ndarray, carry: EnvState) -> EnvState:
         return _launch_one(carry, flat_players[i], flat_actions[i], params)
 
-    return jax.lax.fori_loop(0, 2 * params.max_actions, body, state)
+    return jax.lax.fori_loop(0, params.num_players * params.max_actions, body, state)
 
 
 def _launch_one(state: EnvState, player: jnp.ndarray, action: jnp.ndarray, params: EnvParams) -> EnvState:
@@ -446,7 +448,28 @@ def _spawn_comet_group(state: EnvState, spawn_idx: jnp.ndarray) -> EnvState:
     return state._replace(planets=planets, initial_planets=initial_planets, planet_alive=planet_alive, comet_slots=comet_slots, comet_path_index=comet_path_index)
 
 
-def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+def _empty_combat(state: EnvState, params: EnvParams) -> jnp.ndarray:
+    return jnp.zeros((params.num_players, state.planets.shape[0]), dtype=jnp.float32)
+
+
+def _combat_from_hits(
+    state: EnvState,
+    hit_idx: jnp.ndarray,
+    valid_hit: jnp.ndarray,
+    owner: jnp.ndarray,
+    ships: jnp.ndarray,
+    params: EnvParams,
+) -> jnp.ndarray:
+    """把舰队命中列表聚合成 [num_players, P] 的战斗贡献矩阵。"""
+    valid_owner = (owner >= 0) & (owner < params.num_players)
+    player_ships = (
+        jax.nn.one_hot(jnp.clip(owner, 0, params.num_players - 1), params.num_players, dtype=jnp.float32)
+        * jnp.where(valid_hit & valid_owner, ships, 0.0)[:, None]
+    )
+    return _empty_combat(state, params).at[:, hit_idx].add(player_ships.T)
+
+
+def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray]:
     """移动普通舰队，并收集撞星球产生的战斗贡献。"""
     fleets = state.fleets
     old_x = fleets[:, 2]
@@ -480,16 +503,11 @@ def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndar
     owner = fleets[:, 1].astype(jnp.int32)
     ships = fleets[:, 6]
     valid_combat = alive & any_planet_hit & in_bounds & (~sun_hit)
-    combat0 = jnp.zeros((state.planets.shape[0],), dtype=jnp.float32).at[hit_idx].add(
-        jnp.where(valid_combat & (owner == 0), ships, 0.0)
-    )
-    combat1 = jnp.zeros((state.planets.shape[0],), dtype=jnp.float32).at[hit_idx].add(
-        jnp.where(valid_combat & (owner == 1), ships, 0.0)
-    )
-    return state._replace(fleets=moved, fleet_alive=alive & (~remove)), combat0, combat1
+    combat = _combat_from_hits(state, hit_idx, valid_combat, owner, ships, params)
+    return state._replace(fleets=moved, fleet_alive=alive & (~remove)), combat
 
 
-def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray]:
     """旋转行星，并处理行星扫过舰队时产生的碰撞。"""
     old_x = state.planets[:, 2]
     old_y = state.planets[:, 3]
@@ -521,29 +539,23 @@ def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvSt
     hit_idx = jnp.argmax(hit, axis=1)
     owner = state.fleets[:, 1].astype(jnp.int32)
     ships = state.fleets[:, 6]
-    combat0 = jnp.zeros((state.planets.shape[0],), dtype=jnp.float32).at[hit_idx].add(
-        jnp.where(any_hit & (owner == 0), ships, 0.0)
-    )
-    combat1 = jnp.zeros((state.planets.shape[0],), dtype=jnp.float32).at[hit_idx].add(
-        jnp.where(any_hit & (owner == 1), ships, 0.0)
-    )
-    return state._replace(planets=planets, fleet_alive=state.fleet_alive & (~any_hit)), combat0, combat1
+    combat = _combat_from_hits(state, hit_idx, any_hit, owner, ships, params)
+    return state._replace(planets=planets, fleet_alive=state.fleet_alive & (~any_hit)), combat
 
 
-def _move_comets_and_sweep(state: EnvState) -> tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+def _move_comets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndarray]:
     """沿预计算路径移动彗星，并处理彗星扫过舰队的碰撞。"""
     active = state.comet_path_index >= -1
 
     def body(i: jnp.ndarray, carry):
-        st, c0, c1 = carry
-        return jax.lax.cond(active[i], lambda x: _move_one_comet_group(i, *x), lambda x: x, (st, c0, c1))
+        st, c = carry
+        return jax.lax.cond(active[i], lambda x: _move_one_comet_group(i, x[0], x[1], params), lambda x: x, (st, c))
 
-    zeros = jnp.zeros((state.planets.shape[0],), dtype=jnp.float32)
-    state, combat0, combat1 = jax.lax.fori_loop(0, MAX_COMET_SPAWNS, body, (state, zeros, zeros))
-    return state, combat0, combat1
+    state, combat = jax.lax.fori_loop(0, MAX_COMET_SPAWNS, body, (state, _empty_combat(state, params)))
+    return state, combat
 
 
-def _move_one_comet_group(i: jnp.ndarray, state: EnvState, combat0: jnp.ndarray, combat1: jnp.ndarray):
+def _move_one_comet_group(i: jnp.ndarray, state: EnvState, combat: jnp.ndarray, params: EnvParams):
     """移动单个彗星组，返回更新后的状态和战斗贡献。"""
     new_index = state.comet_path_index[i] + 1
     slots = state.comet_slots[i]
@@ -570,30 +582,34 @@ def _move_one_comet_group(i: jnp.ndarray, state: EnvState, combat0: jnp.ndarray,
     hit_slots = safe_slots[hit_group_idx]
     owner = state.fleets[:, 1].astype(jnp.int32)
     ships = state.fleets[:, 6]
-    combat0 = combat0.at[hit_slots].add(jnp.where(any_hit & (owner == 0), ships, 0.0))
-    combat1 = combat1.at[hit_slots].add(jnp.where(any_hit & (owner == 1), ships, 0.0))
+    valid_owner = (owner >= 0) & (owner < params.num_players)
+    player_ships = (
+        jax.nn.one_hot(jnp.clip(owner, 0, params.num_players - 1), params.num_players, dtype=jnp.float32)
+        * jnp.where(any_hit & valid_owner, ships, 0.0)[:, None]
+    )
+    combat = combat.at[:, hit_slots].add(player_ships.T)
     state = state._replace(fleet_alive=state.fleet_alive & (~any_hit))
-    return state, combat0, combat1
+    return state, combat
 
 
-def _resolve_combat(state: EnvState, combat0: jnp.ndarray, combat1: jnp.ndarray) -> EnvState:
+def _resolve_combat(state: EnvState, combat: jnp.ndarray, params: EnvParams) -> EnvState:
     """战斗解算：向量化版本，对所有星球同时处理。
 
     规则（对应 orbit_wars.py）：
-    - 单方到达：直接加入/攻击驻军。
-    - 双方到达：top - second = survivor；平局时 survivor = 0，驻军不变。
+    - 同一 owner 的到达舰队先求和。
+    - 到达方 top1 与 top2 相消，top1 平局时无 survivor。
+    - 单方到达等价于 top2=0，全部 survivor 继续结算。
     - survivor > 0 且与驻军方相同：驻军增加。
     - survivor > 0 且与驻军方不同：驻军减少；减到负数则易主，新船数取绝对值。
     """
     planets = state.planets
-    has0 = combat0 > 0.0
-    has1 = combat1 > 0.0
-    top_owner = jnp.where(combat0 >= combat1, 0.0, 1.0)   # 船多的一方
-    top_ships = jnp.maximum(combat0, combat1)
-    second_ships = jnp.minimum(combat0, combat1)
-    # 双方都有：survivor = 差值；单方：survivor = 全部
-    survivor = jnp.where(has0 & has1, top_ships - second_ships, top_ships)
-    has_combat = has0 | has1
+    sorted_ships = jnp.sort(combat, axis=0)
+    top_ships = sorted_ships[-1]
+    second_ships = sorted_ships[-2]
+    top_owner = jnp.argmax(combat, axis=0).astype(jnp.float32)
+    has_combat = top_ships > 0.0
+    top_tie = ((combat == top_ships[None, :]) & has_combat[None, :]).sum(axis=0) > 1
+    survivor = jnp.where(top_tie, 0.0, top_ships - second_ships)
     survivor_positive = has_combat & (survivor > 0.0)  # survivor=0 时平局，不改变驻军
     same_owner = planets[:, 1] == top_owner            # 胜方是否与驻军同属一方
     new_ships_same = planets[:, 5] + survivor          # 友方增援
@@ -618,34 +634,61 @@ def _update_terminal(state: EnvState, params: EnvParams) -> EnvState:
     2. 仅剩 0 或 1 个玩家在场（星球 + 飞行舰队均无则视为不在场）
 
     胜负规则：终局分数 = 拥有星球船数 + 飞行舰队船数之和。
-    winner: 0/1 = 得分高的一方，2 = 平局（同分），-1 = 游戏进行中。
+    winner: 0..num_players-1 = 唯一最高分玩家，num_players = 平局或无人得分，-1 = 游戏进行中。
     """
     owner = state.planets[:, 1].astype(jnp.int32)
     p_alive = state.planet_alive & (owner >= 0)   # 排除中立星球
     f_owner = state.fleets[:, 1].astype(jnp.int32)
     f_alive = state.fleet_alive
-    # 判断每个玩家是否仍在场（有星球或有飞行舰队均算存活）
-    alive0 = ((p_alive & (owner == 0)).any()) | ((f_alive & (f_owner == 0)).any())
-    alive1 = ((p_alive & (owner == 1)).any()) | ((f_alive & (f_owner == 1)).any())
-    terminal = (state.step >= params.episode_steps - 1) | ((alive0.astype(jnp.int32) + alive1.astype(jnp.int32)) <= 1)
-    # 终局分数 = 己方所有星球船数 + 飞行中舰队船数
-    score0 = jnp.where(state.planet_alive & (owner == 0), state.planets[:, 5], 0.0).sum()
-    score1 = jnp.where(state.planet_alive & (owner == 1), state.planets[:, 5], 0.0).sum()
-    score0 = score0 + jnp.where(state.fleet_alive & (f_owner == 0), state.fleets[:, 6], 0.0).sum()
-    score1 = score1 + jnp.where(state.fleet_alive & (f_owner == 1), state.fleets[:, 6], 0.0).sum()
-    # 2 = 平局（相同分），与 reward_jax.terminal_reward_player0 的 scores() 计算方式独立
-    winner = jnp.where(score0 == score1, 2, jnp.where(score0 > score1, 0, 1))
+    players = jnp.arange(params.num_players, dtype=jnp.int32)
+    alive_planets = ((owner[:, None] == players[None, :]) & p_alive[:, None]).any(axis=0)
+    alive_fleets = ((f_owner[:, None] == players[None, :]) & f_alive[:, None]).any(axis=0)
+    alive_players = alive_planets | alive_fleets
+    terminal = (state.step >= params.episode_steps - 1) | (alive_players.astype(jnp.int32).sum() <= 1)
+    score = scores(state, params.num_players)
+    max_score = score.max()
+    top_count = ((score == max_score) & (max_score > 0.0)).sum()
+    unique_winner = (top_count == 1) & (max_score > 0.0)
+    winner = jnp.where(unique_winner, jnp.argmax(score).astype(jnp.int32), jnp.asarray(params.num_players, dtype=jnp.int32))
     return state._replace(done=terminal, winner=jnp.where(terminal, winner, -1))
 
 
-def scores(state: EnvState) -> jnp.ndarray:
-    """计算双方当前总分：星球驻军 + 飞行舰队船数。"""
+def scores(state: EnvState, num_players: int = DEFAULT_NUM_PLAYERS) -> jnp.ndarray:
+    """计算每个玩家当前总分：星球驻军 + 飞行舰队船数。"""
     if state.planets.ndim == 3:
-        return jax.vmap(scores)(state)
+        return jax.vmap(lambda s: scores(s, num_players))(state)
     owner = state.planets[:, 1].astype(jnp.int32)
     f_owner = state.fleets[:, 1].astype(jnp.int32)
-    score0 = jnp.where(state.planet_alive & (owner == 0), state.planets[:, 5], 0.0).sum(axis=-1)
-    score1 = jnp.where(state.planet_alive & (owner == 1), state.planets[:, 5], 0.0).sum(axis=-1)
-    score0 = score0 + jnp.where(state.fleet_alive & (f_owner == 0), state.fleets[:, 6], 0.0).sum(axis=-1)
-    score1 = score1 + jnp.where(state.fleet_alive & (f_owner == 1), state.fleets[:, 6], 0.0).sum(axis=-1)
-    return jnp.stack([score0, score1], axis=-1)
+    players = jnp.arange(num_players, dtype=jnp.int32)
+    planet_score = jnp.where(
+        state.planet_alive[:, None] & (owner[:, None] == players[None, :]),
+        state.planets[:, 5:6],
+        0.0,
+    ).sum(axis=0)
+    fleet_score = jnp.where(
+        state.fleet_alive[:, None] & (f_owner[:, None] == players[None, :]),
+        state.fleets[:, 6:7],
+        0.0,
+    ).sum(axis=0)
+    return planet_score + fleet_score
+
+
+def player_order(state: EnvState, num_players: int = DEFAULT_NUM_PLAYERS) -> jnp.ndarray:
+    """按当前分数从高到低返回玩家 id；同分时按玩家 id 小者在前，保证确定性。"""
+    if state.planets.ndim == 3:
+        return jax.vmap(lambda s: player_order(s, num_players))(state)
+    score = scores(state, num_players)
+    # argsort(stable=True) 保留同分玩家的原始 id 顺序，因此同分时 player id 小者在前。
+    return jnp.argsort(-score, stable=True).astype(jnp.int32)
+
+
+def placements(state: EnvState, num_players: int = DEFAULT_NUM_PLAYERS) -> jnp.ndarray:
+    """返回每个玩家的名次，使用竞赛排名：并列第一后下一名是第三名。
+
+    例：分数 [10, 10, 5, 1] -> 名次 [1, 1, 3, 4]。
+    """
+    if state.planets.ndim == 3:
+        return jax.vmap(lambda s: placements(s, num_players))(state)
+    score = scores(state, num_players)
+    better_count = (score[None, :] > score[:, None]).sum(axis=1)
+    return (better_count + 1).astype(jnp.int32)

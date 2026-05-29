@@ -20,6 +20,7 @@ env:
   episode_steps: 500
   ship_bucket_count: 8
   max_planets: 45
+  num_players: 4
   max_ships: 500.0
   max_production: 5.0
   target_filter_enabled: true

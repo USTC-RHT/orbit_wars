@@ -6,7 +6,7 @@
 - 每颗我方星球独立对应一行决策（source）。
 - 每行决策包含：planet_features（星球自身）、relative_features（source-target 相对特征）、
   global_features（全局态势）、map_features（CNN 小地图）。
-- 特征维度：PLANET=26 / RELATIVE=8 / GLOBAL=11。
+- 特征维度：PLANET=38 / RELATIVE=13 / GLOBAL=22。
 - precompute_inbound 使用 60 步轨迹预测，支持旋转星球和彗星路径。
 - encode_batch: vmap over 单局；encode_single: vmap over 来源星球。
 """
@@ -35,17 +35,19 @@ from .fast_env import (
 
 
 # 特征向量维度（JAX 主训练路径使用；修改时需要同步 model/normalizer/docs）
-PLANET_DIM = 26         # 星球局部特征维度
-RELATIVE_DIM = 8     # source-target 相对特征维度
-GLOBAL_DIM = 11       # 全局局势特征维度
-FLEET_DIM = 28        # 单支舰队 token 特征维度
+PLANET_DIM = 38        # 星球局部特征维度
+RELATIVE_DIM = 13      # source-target 相对特征维度
+GLOBAL_DIM = 22        # 全局局势特征维度
+FLEET_DIM = 39         # 单支舰队 token 特征维度
 MAX_FLEET_TOKENS = 32 # 每个 source 选择进入 Transformer 的舰队 token 数
-MAP_CHANNELS = 6      # CNN 小地图通道数（来源星/友方/敌方/中立/我方飞船强度/敌方飞船强度）
+MAP_CHANNELS = 10     # CNN 小地图通道数（来源星/各 owner 星球/各玩家飞船强度）
 MAP_GRID_SIZE = 8     # CNN 小地图分辨率（8x8）
 INBOUND_HORIZON = 60.0  # 预测舰队未来 N 回合内命中的星球
 MIN_LAUNCH = 10.0     # 最小发射船数：驻军不足此数时禁止全部档位
 LOCAL_PLANET_RADIUS = 25.0  # 局部星球密度统计半径
 SHIP_RATIOS = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)  # 派兵比例档位
+OWNER_CLASS_COUNT = 5
+PLAYER_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,20 @@ class EncodedBatch(NamedTuple):
 def target_count(params: FeatureParams) -> int:
     """目标槽位数量：slot 0 是 no-op，后面是所有星球。"""
     return params.max_planets + 1
+
+
+def owner_class_one_hot(owner: jnp.ndarray) -> jnp.ndarray:
+    """owner -> [neutral, self, opp1, opp2, opp3]."""
+    idx = jnp.clip(owner.astype(jnp.int32) + 1, 0, OWNER_CLASS_COUNT - 1)
+    return jax.nn.one_hot(idx, OWNER_CLASS_COUNT, dtype=jnp.float32)
+
+
+def player_owner_one_hot(owner: jnp.ndarray) -> jnp.ndarray:
+    """fleet owner -> [self, opp1, opp2, opp3]，非玩家 owner 输出全 0。"""
+    owner = owner.astype(jnp.int32)
+    valid = (owner >= 0) & (owner < PLAYER_COUNT)
+    idx = jnp.clip(owner, 0, PLAYER_COUNT - 1)
+    return jax.nn.one_hot(idx, PLAYER_COUNT, dtype=jnp.float32) * valid[..., None].astype(jnp.float32)
 
 
 def encode_batch(state: EnvState, params: FeatureParams) -> EncodedBatch:
@@ -174,21 +190,21 @@ def build_source_decision(
 
 
 def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
-    """构建星球局部特征（PLANET_DIM=26）。
+    """构建星球局部特征（PLANET_DIM=38）。
 
     各维语义（与 FEATURES.md 对应）：
       0: is_planet=1.0（占位）
       1: is_alive
-      2-4: is_neutral / is_mine / is_enemy
-      5-6: x/y 归一化坐标
-      7: radius / 5
-      8: ships / max_ships (clamp)
-      9: production / max_production
-      10-12: is_static / is_rotating_planet / is_comet_planet
-      13: 到太阳距离 / board_size
-      14-16: 最近我方/敌方/中立星球距离 / board_size
-      17-19: R=25 内我方/敌方/中立星球数量 / max_planets
-      20-25: inbound[src] = (my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean)
+      2-6: owner one-hot = neutral / self / opp1 / opp2 / opp3
+      7-8: x/y 归一化坐标
+      9: radius / 5
+      10: ships / max_ships (clamp)
+      11: production / max_production
+      12-14: is_static / is_rotating_planet / is_comet_planet
+      15: 到太阳距离 / board_size
+      16-20: 最近各 owner 类星球距离 / board_size
+      21-25: R=25 内各 owner 类星球数量 / max_planets
+      26-37: inbound[src] = 各 player ships / eta_min / eta_mean
     """
     src = state.planets[src_idx]
     alive = state.planet_alive[src_idx]
@@ -198,13 +214,10 @@ def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.nd
     is_static_planet = alive & (~is_rotating_planet) & (~is_comet)
     topo = planet_local_topology_features(state, src_idx, params)
     inb = inbound[src_idx]  # 预测的到达该星球的舰队信息
-    return jnp.asarray(
+    base = jnp.asarray(
         [
             1.0,
             alive.astype(jnp.float32),
-            (owner == -1).astype(jnp.float32),
-            (owner == 0).astype(jnp.float32),
-            (owner == 1).astype(jnp.float32),
             src[2] / BOARD_SIZE,
             src[3] / BOARD_SIZE,
             src[4] / 5.0,
@@ -214,21 +227,17 @@ def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.nd
             is_rotating_planet.astype(jnp.float32),
             is_comet.astype(jnp.float32),
             distance_to_sun(src) / BOARD_SIZE,
-            topo[0],
-            topo[1],
-            topo[2],
-            topo[3],
-            topo[4],
-            topo[5],
-            clip01(inb[0] / params.max_ships),
-            clip01(inb[1] / params.max_ships),
-            inb[2],
-            inb[3],
-            inb[4],
-            inb[5],
         ],
         dtype=jnp.float32,
     )
+    inbound_f = jnp.concatenate(
+        [
+            clip01(inb[:PLAYER_COUNT] / params.max_ships),
+            inb[PLAYER_COUNT : PLAYER_COUNT * 3],
+        ],
+        axis=0,
+    )
+    return jnp.concatenate([base[:2], owner_class_one_hot(owner), base[2:], topo, inbound_f], axis=0)
 
 
 def planet_local_topology_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
@@ -243,10 +252,6 @@ def planet_local_topology_features(state: EnvState, src_idx: jnp.ndarray, params
     dy = planets[:, 3] - src[3]
     dist = jnp.sqrt(dx * dx + dy * dy)
 
-    my_mask = valid & (owner == 0)
-    enemy_mask = valid & (owner == 1)
-    neutral_mask = valid & (owner == -1)
-
     def nearest(mask):
         any_mask = mask.any()
         nearest_dist = jnp.where(mask, dist, 1.0e9).min()
@@ -255,23 +260,16 @@ def planet_local_topology_features(state: EnvState, src_idx: jnp.ndarray, params
     def count_in_radius(mask):
         return (mask & (dist <= LOCAL_PLANET_RADIUS)).sum() / params.max_planets
 
-    return jnp.asarray(
-        [
-            nearest(my_mask),
-            nearest(enemy_mask),
-            nearest(neutral_mask),
-            count_in_radius(my_mask),
-            count_in_radius(enemy_mask),
-            count_in_radius(neutral_mask),
-        ],
-        dtype=jnp.float32,
-    )
+    masks = jnp.stack([valid & (owner == -1), valid & (owner == 0), valid & (owner == 1), valid & (owner == 2), valid & (owner == 3)], axis=0)
+    nearest_f = jax.vmap(nearest)(masks)
+    count_f = jax.vmap(count_in_radius)(masks)
+    return jnp.concatenate([nearest_f, count_f], axis=0).astype(jnp.float32)
 
 
 def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams):
-    """构建 source-target 相对特征、mask 和派兵档位（RELATIVE_DIM=8）。
+    """构建 source-target 相对特征、mask 和派兵档位（RELATIVE_DIM=13）。
 
-    返回：(relative_features[P+1, 8], candidate_mask[P+1], amount_mask[P+1, B], candidate_ids[P+1], ship_buckets[B])
+    返回：(relative_features[P+1, 13], candidate_mask[P+1], amount_mask[P+1, B], candidate_ids[P+1], ship_buckets[B])
     - slot 0 固定为 no-op（不发射）
     - slot 1..P 对应所有星球（包括来源星球自身，不过 mask=False）
     amount mask 只负责约束正数派兵；是否值得以少打多交给策略和奖励学习。
@@ -297,20 +295,21 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     is_source = jnp.arange(params.max_planets) == src_idx
     is_neutral = owner == -1
     is_friend = (owner == 0) & (~is_source)
-    is_enemy = owner == 1
+    is_enemy = owner > 0
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
     eta_max = dist / jnp.maximum(spd_max, 1e-6) / INBOUND_HORIZON  # 最快到达时间归一化
     defense_pressure = compute_defense_pressure(planets, inbound)  # 是否需要增援
-    rel = jnp.stack(
+    rel = jnp.concatenate(
         [
-            is_source.astype(jnp.float32),
-            dx / BOARD_SIZE,
-            dy / BOARD_SIZE,
-            dist / BOARD_SIZE,
-            clip01((planets[:, 5] + 1.0) / jnp.maximum(src[5], 1.0)),
-            clip01(src[5] / params.max_ships) * jnp.ones_like(dist),
-            proto,
-            eta_max,
+            is_source.astype(jnp.float32)[:, None],
+            owner_class_one_hot(owner),
+            (dx / BOARD_SIZE)[:, None],
+            (dy / BOARD_SIZE)[:, None],
+            (dist / BOARD_SIZE)[:, None],
+            clip01((planets[:, 5] + 1.0) / jnp.maximum(src[5], 1.0))[:, None],
+            (clip01(src[5] / params.max_ships) * jnp.ones_like(dist))[:, None],
+            proto[:, None],
+            eta_max[:, None],
         ],
         axis=-1,
     )
@@ -367,27 +366,34 @@ def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray
     planets = state.planets
     alive = state.planet_alive
     owner = planets[:, 1].astype(jnp.int32)
-    my = alive & (owner == 0)
-    enemy = alive & (owner == 1)
-    neutral = alive & (owner == -1)
     fowner = state.fleets[:, 1].astype(jnp.int32)
-    my_f = state.fleet_alive & (fowner == 0)
-    enemy_f = state.fleet_alive & (fowner == 1)
-    return jnp.asarray(
+    owner_masks = jnp.stack(
+        [alive & (owner == -1), alive & (owner == 0), alive & (owner == 1), alive & (owner == 2), alive & (owner == 3)],
+        axis=0,
+    )
+    fleet_masks = jnp.stack(
         [
-            state.step / params.episode_steps,
-            state.angular_velocity / 0.05,
-            my.sum() / params.max_planets,
-            enemy.sum() / params.max_planets,
-            neutral.sum() / params.max_planets,
-            jnp.where(my, planets[:, 5], 0.0).sum() / (params.max_planets * params.max_ships),
-            jnp.where(enemy, planets[:, 5], 0.0).sum() / (params.max_planets * params.max_ships),
-            jnp.where(my_f, state.fleets[:, 6], 0.0).sum() / (params.max_planets * params.max_ships),
-            jnp.where(enemy_f, state.fleets[:, 6], 0.0).sum() / (params.max_planets * params.max_ships),
-            jnp.where(my, planets[:, 6], 0.0).sum() / (params.max_planets * params.max_production),
-            jnp.where(enemy, planets[:, 6], 0.0).sum() / (params.max_planets * params.max_production),
+            jnp.zeros_like(state.fleet_alive, dtype=bool),
+            state.fleet_alive & (fowner == 0),
+            state.fleet_alive & (fowner == 1),
+            state.fleet_alive & (fowner == 2),
+            state.fleet_alive & (fowner == 3),
         ],
-        dtype=jnp.float32,
+        axis=0,
+    )
+    planet_count = owner_masks.sum(axis=1) / params.max_planets
+    planet_ships = (owner_masks.astype(jnp.float32) * planets[None, :, 5]).sum(axis=1) / (params.max_planets * params.max_ships)
+    production = (owner_masks.astype(jnp.float32) * planets[None, :, 6]).sum(axis=1) / (params.max_planets * params.max_production)
+    fleet_ships = (fleet_masks.astype(jnp.float32) * state.fleets[None, :, 6]).sum(axis=1) / (params.max_planets * params.max_ships)
+    return jnp.concatenate(
+        [
+            jnp.asarray([state.step / params.episode_steps, state.angular_velocity / 0.05], dtype=jnp.float32),
+            planet_count.astype(jnp.float32),
+            planet_ships.astype(jnp.float32),
+            production.astype(jnp.float32),
+            fleet_ships.astype(jnp.float32),
+        ],
+        axis=0,
     )
 
 
@@ -469,10 +475,10 @@ def predict_fleet_targets(state: EnvState, horizon: int = int(INBOUND_HORIZON)) 
 
 
 def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
-    """预估未来一段时间内每个星球会收到的我方/敌方舰队压力。
+    """预估未来一段时间内每个星球会收到的各玩家舰队压力。
 
-    返回 [P, 6]：
-      my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean。
+    返回 [P, 12]：
+      player0..3 ships, player0..3 eta_min, player0..3 eta_mean。
     普通星球、旋转星球和彗星都按 fast_env 的轨迹规则查表或预测。
     """
 
@@ -484,21 +490,21 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
     target_onehot = jax.nn.one_hot(fleet_target, planet_count, dtype=jnp.float32)
     selected = target_onehot * fleet_valid[:, None].astype(jnp.float32)
     owner = fleets[:, 1].astype(jnp.int32)
-    my_sel = selected * (owner[:, None] == 0).astype(jnp.float32)
-    enemy_sel = selected * (owner[:, None] != 0).astype(jnp.float32)
+    owner_onehot = player_owner_one_hot(owner)
+    player_sel = selected[:, :, None] * owner_onehot[:, None, :]
 
-    my_ships = (my_sel * fleets[:, 6:7]).sum(axis=0)
-    enemy_ships = (enemy_sel * fleets[:, 6:7]).sum(axis=0)
+    player_ships = (player_sel * fleets[:, None, None, 6]).sum(axis=0)
     norm = INBOUND_HORIZON
-    my_count = my_sel.sum(axis=0)
-    enemy_count = enemy_sel.sum(axis=0)
-    t = fleet_first_t[:, None]
-    my_min = jnp.where(my_count > 0, jnp.where(my_sel > 0, t, 1e9).min(axis=0) / norm, 1.0)
-    enemy_min = jnp.where(enemy_count > 0, jnp.where(enemy_sel > 0, t, 1e9).min(axis=0) / norm, 1.0)
-    my_mean = jnp.where(my_count > 0, (my_sel * t).sum(axis=0) / jnp.maximum(my_count, 1.0) / norm, 1.0)
-    enemy_mean = jnp.where(enemy_count > 0, (enemy_sel * t).sum(axis=0) / jnp.maximum(enemy_count, 1.0) / norm, 1.0)
-    inbound = jnp.stack([my_ships, enemy_ships, my_min, my_mean, enemy_min, enemy_mean], axis=-1)
-    return jnp.where(p_alive[:, None], inbound, jnp.asarray([0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=jnp.float32))
+    player_count = player_sel.sum(axis=0)
+    t = fleet_first_t[:, None, None]
+    player_min = jnp.where(player_count > 0, jnp.where(player_sel > 0, t, 1e9).min(axis=0) / norm, 1.0)
+    player_mean = jnp.where(player_count > 0, (player_sel * t).sum(axis=0) / jnp.maximum(player_count, 1.0) / norm, 1.0)
+    inbound = jnp.concatenate([player_ships, player_min, player_mean], axis=-1)
+    default = jnp.concatenate(
+        [jnp.zeros((PLAYER_COUNT,), dtype=jnp.float32), jnp.ones((PLAYER_COUNT * 2,), dtype=jnp.float32)],
+        axis=0,
+    )
+    return jnp.where(p_alive[:, None], inbound, default)
 
 
 def planet_positions_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -542,8 +548,8 @@ def planet_positions_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.nd
 
 def compute_defense_pressure(planets: jnp.ndarray, inbound: jnp.ndarray) -> jnp.ndarray:
     my_inbound = inbound[:, 0]
-    enemy_inbound = inbound[:, 1]
-    enemy_eta = inbound[:, 4] * INBOUND_HORIZON
+    enemy_inbound = inbound[:, 1:PLAYER_COUNT].sum(axis=-1)
+    enemy_eta = inbound[:, PLAYER_COUNT + 1 : PLAYER_COUNT * 2].min(axis=-1) * INBOUND_HORIZON
     projected_defense = planets[:, 5] + my_inbound + enemy_eta * planets[:, 6]
     return jnp.where(enemy_inbound > 0.0, enemy_inbound - projected_defense, 0.0)
 
@@ -587,36 +593,66 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
     dist_from_origin = jnp.sqrt((sel[:, 2] - from_planets[:, 2]) ** 2 + (sel[:, 3] - from_planets[:, 3]) ** 2)
     launch_offset = from_planets[:, 4] + 0.1
     launch_age = jnp.maximum(dist_from_origin - launch_offset, 0.0) / jnp.maximum(speed, 1e-6)
-    features = jnp.stack(
+    owner_f = player_owner_one_hot(owner)
+    from_owner_f = owner_class_one_hot(from_planets[:, 1].astype(jnp.int32)) * has_from[:, None].astype(jnp.float32)
+    nearest_masks = jnp.stack(
         [
-            (owner == 0).astype(jnp.float32),
-            sel[:, 2] / BOARD_SIZE,
-            sel[:, 3] / BOARD_SIZE,
-            jnp.cos(sel[:, 4]),
-            jnp.sin(sel[:, 4]),
-            clip01(sel[:, 6] / params.max_ships),
-            speed / 6.0,
-            clip01(launch_age / params.episode_steps),
-            jnp.where(has_from, from_planets[:, 2] / BOARD_SIZE, 0.0),
-            jnp.where(has_from, from_planets[:, 3] / BOARD_SIZE, 0.0),
-            (has_from & (from_planets[:, 1].astype(jnp.int32) == 0)).astype(jnp.float32),
-            jnp.where(has_from, clip01(from_planets[:, 5] / params.max_ships), 0.0),
-            jnp.where(has_from, dist_from_origin / BOARD_SIZE, 0.0),
-            nearest_dist(planet_alive & (planet_owner == 1)),
-            nearest_dist(planet_alive & (planet_owner == -1)),
-            nearest_dist(planet_alive & (planet_owner == 0)),
-            target_valid.astype(jnp.float32),
-            (target_valid & (target_owner == 0)).astype(jnp.float32),
-            (target_valid & (target_owner == 1)).astype(jnp.float32),
-            (target_valid & (target_owner == -1)).astype(jnp.float32),
-            jnp.where(target_valid, target_planets[:, 2] / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_planets[:, 3] / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, clip01(target_planets[:, 5] / params.max_ships), 0.0),
-            jnp.where(target_valid, target_planets[:, 6] / params.max_production, 0.0),
-            jnp.where(target_valid, target_dx / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_dy / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_dist / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_eta, 0.0),
+            planet_alive & (planet_owner == -1),
+            planet_alive & (planet_owner == 0),
+            planet_alive & (planet_owner == 1),
+            planet_alive & (planet_owner == 2),
+            planet_alive & (planet_owner == 3),
+        ],
+        axis=0,
+    )
+    nearest_owner_f = jax.vmap(nearest_dist)(nearest_masks).T
+    target_owner_f = owner_class_one_hot(target_owner) * target_valid[:, None].astype(jnp.float32)
+    features = jnp.concatenate(
+        [
+            owner_f,
+            jnp.stack(
+                [
+                    sel[:, 2] / BOARD_SIZE,
+                    sel[:, 3] / BOARD_SIZE,
+                    jnp.cos(sel[:, 4]),
+                    jnp.sin(sel[:, 4]),
+                    clip01(sel[:, 6] / params.max_ships),
+                    speed / 6.0,
+                    clip01(launch_age / params.episode_steps),
+                ],
+                axis=-1,
+            ),
+            jnp.stack(
+                [
+                    jnp.where(has_from, from_planets[:, 2] / BOARD_SIZE, 0.0),
+                    jnp.where(has_from, from_planets[:, 3] / BOARD_SIZE, 0.0),
+                ],
+                axis=-1,
+            ),
+            from_owner_f,
+            jnp.stack(
+                [
+                    jnp.where(has_from, clip01(from_planets[:, 5] / params.max_ships), 0.0),
+                    jnp.where(has_from, dist_from_origin / BOARD_SIZE, 0.0),
+                ],
+                axis=-1,
+            ),
+            nearest_owner_f,
+            target_valid.astype(jnp.float32)[:, None],
+            target_owner_f,
+            jnp.stack(
+                [
+                    jnp.where(target_valid, target_planets[:, 2] / BOARD_SIZE, 0.0),
+                    jnp.where(target_valid, target_planets[:, 3] / BOARD_SIZE, 0.0),
+                    jnp.where(target_valid, clip01(target_planets[:, 5] / params.max_ships), 0.0),
+                    jnp.where(target_valid, target_planets[:, 6] / params.max_production, 0.0),
+                    jnp.where(target_valid, target_dx / BOARD_SIZE, 0.0),
+                    jnp.where(target_valid, target_dy / BOARD_SIZE, 0.0),
+                    jnp.where(target_valid, target_dist / BOARD_SIZE, 0.0),
+                    jnp.where(target_valid, target_eta, 0.0),
+                ],
+                axis=-1,
+            ),
         ],
         axis=-1,
     )
@@ -629,10 +665,12 @@ def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeaturePar
     planets = state.planets
     owner = planets[:, 1].astype(jnp.int32)
     idx = jnp.arange(params.max_planets)
-    channels = jnp.where(idx == src_idx, 0, jnp.where(owner == 0, 1, jnp.where(owner == -1, 3, 2)))
+    owner_channels = jnp.where(owner == -1, 5, jnp.clip(owner + 1, 1, 4))
+    channels = jnp.where(idx == src_idx, 0, owner_channels)
     values = state.planet_alive.astype(jnp.float32)
     grid = _accum_many(grid, channels, planets[:, 2], planets[:, 3], values)
-    ship_channels = jnp.where(state.fleets[:, 1].astype(jnp.int32) == 0, 4, 5)
+    ship_owner = state.fleets[:, 1].astype(jnp.int32)
+    ship_channels = 6 + jnp.clip(ship_owner, 0, PLAYER_COUNT - 1)
     ship_values = clip01(state.fleets[:, 6] / params.max_ships) * state.fleet_alive.astype(jnp.float32)
     return _accum_many(grid, ship_channels, state.fleets[:, 2], state.fleets[:, 3], ship_values)
 

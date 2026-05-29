@@ -29,8 +29,8 @@ def build_bank(output: Path, seeds: int, start_seed: int, params: EnvParams) -> 
     orbit_wars = load_orbit_wars_module()
     for seed in range(start_seed, start_seed + seeds):
         env = make("orbit_wars", configuration={"seed": int(seed), "randomSeed": int(seed)}, debug=False)
-        env.reset(num_agents=2)
-        player_states = env.step([[], []])
+        env.reset(num_agents=params.num_players)
+        player_states = env.step([[] for _ in range(params.num_players)])
         obs = extract_observation(player_states[0])
         state = state_from_observation(obs, params)
         states.append(state)
@@ -52,7 +52,10 @@ def build_bank(output: Path, seeds: int, start_seed: int, params: EnvParams) -> 
         comet_ships=np.stack([payload["ships"] for payload in comet_payloads]),
         comet_valid=np.stack([payload["valid"] for payload in comet_payloads]),
     )
-    print(f"wrote {output} seeds={seeds} max_planets={params.max_planets} max_fleets={params.max_fleets}")
+    print(
+        f"wrote {output} seeds={seeds} num_players={params.num_players} "
+        f"max_planets={params.max_planets} max_fleets={params.max_fleets}"
+    )
 
 
 def load_orbit_wars_module():
@@ -113,12 +116,18 @@ def main() -> None:
     parser.add_argument("--start-seed", type=int, default=100000)
     parser.add_argument("--max-planets", type=int, default=64)
     parser.add_argument("--max-fleets", type=int, default=512)
+    parser.add_argument("--num-players", type=int, default=4)
     args = parser.parse_args()
     build_bank(
         Path(args.output),
         args.seeds,
         args.start_seed,
-        EnvParams(max_planets=args.max_planets, max_fleets=args.max_fleets, max_actions=args.max_planets),
+        EnvParams(
+            max_planets=args.max_planets,
+            max_fleets=args.max_fleets,
+            max_actions=args.max_planets,
+            num_players=args.num_players,
+        ),
     )
 
 

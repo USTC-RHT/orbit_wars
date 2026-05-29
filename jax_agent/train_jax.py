@@ -116,61 +116,132 @@ def _current_lr(cfg, optimizer_step: int, total_steps: int, warmup_steps: int) -
     return base_lr
 
 
-def _flip_owner(owner):
-    return jnp.where(owner == 0.0, 1.0, jnp.where(owner == 1.0, 0.0, owner))
+PLAYER_PERM_NEW_TO_OLD = jnp.asarray(
+    [
+        [0, 1, 2, 3],
+        [1, 3, 0, 2],
+        [2, 0, 3, 1],
+        [3, 2, 1, 0],
+    ],
+    dtype=jnp.int32,
+)
+PLAYER_OWNER_OLD_TO_NEW = jnp.asarray(
+    [
+        [0, 1, 2, 3],
+        [2, 0, 3, 1],
+        [1, 3, 0, 2],
+        [3, 2, 1, 0],
+    ],
+    dtype=jnp.int32,
+)
 
 
-def _rotate_angle_pi(angle):
-    return jnp.arctan2(-jnp.sin(angle), -jnp.cos(angle))
-
-
-def _mirror_planet_indices(count: int) -> jnp.ndarray:
+def _canonical_planet_indices(count: int, player: int | jnp.ndarray) -> jnp.ndarray:
     idx = jnp.arange(count, dtype=jnp.int32)
-    mirror = (idx // 4) * 4 + (3 - (idx % 4))
-    return jnp.where(mirror < count, mirror, idx)
+    player = jnp.asarray(player, dtype=jnp.int32) % 4
+    group = (idx // 4) * 4
+    slot = idx % 4
+    perm_slot = PLAYER_PERM_NEW_TO_OLD[player, slot]
+    perm = group + perm_slot
+    return jnp.where(perm < count, perm, idx)
 
 
-def flip_actions(actions: jnp.ndarray) -> jnp.ndarray:
-    """把规范视角动作旋转 180 度，转回真实地图坐标。"""
+def _inverse_permutation(perm: jnp.ndarray) -> jnp.ndarray:
+    return jnp.zeros_like(perm).at[perm].set(jnp.arange(perm.shape[0], dtype=perm.dtype))
+
+
+def _canonical_owner(owner, player: int | jnp.ndarray):
+    player = jnp.asarray(player, dtype=jnp.int32) % 4
+    owner_i = owner.astype(jnp.int32)
+    valid = (owner_i >= 0) & (owner_i < 4)
+    mapped = PLAYER_OWNER_OLD_TO_NEW[player, jnp.clip(owner_i, 0, 3)].astype(owner.dtype)
+    return jnp.where(valid, mapped, owner)
+
+
+def _canonical_xy(x, y, player: int | jnp.ndarray):
+    player = jnp.asarray(player, dtype=jnp.int32) % 4
+    x0, y0 = x, y
+    x1, y1 = y, 100.0 - x
+    x2, y2 = 100.0 - y, x
+    x3, y3 = 100.0 - x, 100.0 - y
+    cx = jnp.where(player == 0, x0, jnp.where(player == 1, x1, jnp.where(player == 2, x2, x3)))
+    cy = jnp.where(player == 0, y0, jnp.where(player == 1, y1, jnp.where(player == 2, y2, y3)))
+    return cx, cy
+
+
+def _canonical_angle(angle, player: int | jnp.ndarray):
+    player = jnp.asarray(player, dtype=jnp.int32) % 4
+    vx = jnp.cos(angle)
+    vy = jnp.sin(angle)
+    vx1, vy1 = vy, -vx
+    vx2, vy2 = -vy, vx
+    vx3, vy3 = -vx, -vy
+    cvx = jnp.where(player == 0, vx, jnp.where(player == 1, vx1, jnp.where(player == 2, vx2, vx3)))
+    cvy = jnp.where(player == 0, vy, jnp.where(player == 1, vy1, jnp.where(player == 2, vy2, vy3)))
+    return jnp.arctan2(cvy, cvx)
+
+
+def _decanonical_angle(angle, player: int | jnp.ndarray):
+    player = jnp.asarray(player, dtype=jnp.int32) % 4
+    vx = jnp.cos(angle)
+    vy = jnp.sin(angle)
+    vx1, vy1 = -vy, vx
+    vx2, vy2 = vy, -vx
+    vx3, vy3 = -vx, -vy
+    rvx = jnp.where(player == 0, vx, jnp.where(player == 1, vx1, jnp.where(player == 2, vx2, vx3)))
+    rvy = jnp.where(player == 0, vy, jnp.where(player == 1, vy1, jnp.where(player == 2, vy2, vy3)))
+    return jnp.arctan2(rvy, rvx)
+
+
+def canonicalize_actions(actions: jnp.ndarray, player: int | jnp.ndarray) -> jnp.ndarray:
+    """把真实地图动作转成指定 player 的 player-0 规范视角。"""
     ships = actions[..., 2]
-    angle = jnp.where(ships > 0.0, _rotate_angle_pi(actions[..., 1]), 0.0)
+    angle = jnp.where(ships > 0.0, _canonical_angle(actions[..., 1], player), 0.0)
     return actions.at[..., 1].set(angle)
 
 
-def flip_state(state: EnvState) -> EnvState:
-    """将 player 1 局面转成 player 0 规范视角。
+def decanonicalize_actions(actions: jnp.ndarray, player: int | jnp.ndarray) -> jnp.ndarray:
+    """把 player-0 规范视角动作转回真实地图坐标。"""
+    ships = actions[..., 2]
+    angle = jnp.where(ships > 0.0, _decanonical_angle(actions[..., 1], player), 0.0)
+    return actions.at[..., 1].set(angle)
 
-    Orbit Wars 的 2p 初始点关于地图中心 180 度对称。player 1 推理时需要
-    owner 互换、坐标旋转、舰队角度旋转、对称星球槽位重排，才能看到与
-    player 0 一致的视角。星球行内的真实 id 不改，输出动作仍可直接映射
-    回真实环境。
+
+def canonicalize_state(state: EnvState, player: int | jnp.ndarray) -> EnvState:
+    """将任意四人局 player 视角转成 player 0 规范视角。
+
+    Orbit Wars 四人局的 home group 与彗星路径都按 4 折对称排列。这里把
+    指定真实 player 的 owner 重标为 0，并对坐标、舰队角度、planet 槽位
+    和 comet slot 做同一个对称变换。星球/舰队行内 id 不改，因此生成的
+    source id 仍可直接用于真实环境，只需要把 angle 转回去。
     """
-    planet_perm = _mirror_planet_indices(state.planets.shape[-2])
+    planet_perm = _canonical_planet_indices(state.planets.shape[-2], player)
+    old_to_new = _inverse_permutation(planet_perm)
     new_planet_alive = state.planet_alive[..., planet_perm]
 
     planets = state.planets[..., planet_perm, :]
-    po = planets[..., 1]
-    new_po = _flip_owner(po)
-    new_planets = planets.at[..., 1].set(new_po)
-    new_planets = new_planets.at[..., 2].set(100.0 - planets[..., 2])
-    new_planets = new_planets.at[..., 3].set(100.0 - planets[..., 3])
+    px, py = _canonical_xy(planets[..., 2], planets[..., 3], player)
+    new_planets = planets.at[..., 1].set(_canonical_owner(planets[..., 1], player))
+    new_planets = new_planets.at[..., 2].set(px)
+    new_planets = new_planets.at[..., 3].set(py)
 
     initial_planets = state.initial_planets[..., planet_perm, :]
-    ipo = initial_planets[..., 1]
-    new_initial_planets = initial_planets.at[..., 1].set(_flip_owner(ipo))
-    new_initial_planets = new_initial_planets.at[..., 2].set(100.0 - initial_planets[..., 2])
-    new_initial_planets = new_initial_planets.at[..., 3].set(100.0 - initial_planets[..., 3])
+    ipx, ipy = _canonical_xy(initial_planets[..., 2], initial_planets[..., 3], player)
+    new_initial_planets = initial_planets.at[..., 1].set(_canonical_owner(initial_planets[..., 1], player))
+    new_initial_planets = new_initial_planets.at[..., 2].set(ipx)
+    new_initial_planets = new_initial_planets.at[..., 3].set(ipy)
 
-    new_fo = _flip_owner(state.fleets[..., 1])
-    new_fleets = state.fleets.at[..., 1].set(new_fo)
-    new_fleets = new_fleets.at[..., 2].set(100.0 - state.fleets[..., 2])
-    new_fleets = new_fleets.at[..., 3].set(100.0 - state.fleets[..., 3])
-    new_fleets = new_fleets.at[..., 4].set(_rotate_angle_pi(state.fleets[..., 4]))
+    fx, fy = _canonical_xy(state.fleets[..., 2], state.fleets[..., 3], player)
+    new_fleets = state.fleets.at[..., 1].set(_canonical_owner(state.fleets[..., 1], player))
+    new_fleets = new_fleets.at[..., 2].set(fx)
+    new_fleets = new_fleets.at[..., 3].set(fy)
+    new_fleets = new_fleets.at[..., 4].set(_canonical_angle(state.fleets[..., 4], player))
 
-    new_comet_paths = state.comet_paths.at[..., 0].set(100.0 - state.comet_paths[..., 0])
-    new_comet_paths = new_comet_paths.at[..., 1].set(100.0 - state.comet_paths[..., 1])
+    cpx, cpy = _canonical_xy(state.comet_paths[..., 0], state.comet_paths[..., 1], player)
+    new_comet_paths = state.comet_paths.at[..., 0].set(cpx)
+    new_comet_paths = new_comet_paths.at[..., 1].set(cpy)
     safe_comet_slots = jnp.clip(state.comet_slots, 0, state.planets.shape[-2] - 1)
-    new_comet_slots = jnp.where(state.comet_slots >= 0, planet_perm[safe_comet_slots], -1)
+    new_comet_slots = jnp.where(state.comet_slots >= 0, old_to_new[safe_comet_slots], -1)
 
     return state._replace(
         planets=new_planets,
@@ -180,6 +251,16 @@ def flip_state(state: EnvState) -> EnvState:
         comet_paths=new_comet_paths,
         comet_slots=new_comet_slots,
     )
+
+
+def flip_actions(actions: jnp.ndarray, player: int | jnp.ndarray = 1) -> jnp.ndarray:
+    """兼容旧调用：把指定 player 的规范视角动作转回真实地图坐标。"""
+    return decanonicalize_actions(actions, player)
+
+
+def flip_state(state: EnvState, player: int | jnp.ndarray = 1) -> EnvState:
+    """兼容旧调用：将指定 player 局面转成 player 0 规范视角。"""
+    return canonicalize_state(state, player)
 
 
 def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
@@ -458,16 +539,18 @@ def auto_opponent_policy_actions(
     *,
     flip_state_fn,
     rng,
+    opponent_player: int | jnp.ndarray = 1,
 ):
     """自博弈训练用的冻结参数对手。
 
-    它先把棋盘翻转到 player 1 视角，再用冻结的 opponent_params 生成动作。
+    它先把棋盘转到指定 opponent_player 的 player-0 规范视角，再用冻结参数
+    生成动作，最后把动作角度转回真实地图。
     与 learner 的 ``auto_policy_sample`` 保持一致：end / src / tgt / amount
     四个 head 都按当前 logits 采样（categorical / bernoulli），不再 argmax，
     用于训练时给学习者提供有探索的对手。评估路径仍使用
     ``auto_deterministic_policy_actions`` 走 argmax。
     """
-    flipped = flip_state_fn(state)
+    flipped = flip_state_fn(state, opponent_player)
     raw_enc = encode_batch(flipped, opp_fp)
     encoded = normalize_encoded(raw_enc, opp_ns, norm_params)
     b = encoded.planet_features.shape[0]
@@ -565,7 +648,7 @@ def auto_opponent_policy_actions(
         ended = ended | end_t
         h = h_new
 
-    return flip_actions(actions)
+    return flip_actions(actions, opponent_player)
 
 
 def main() -> None:
@@ -592,6 +675,7 @@ def main() -> None:
         max_planets=cfg.env.max_planets,
         max_fleets=512,
         max_actions=cfg.env.max_planets,
+        num_players=int(getattr(cfg.env, "num_players", 4)),
     )
     feat_params = FeatureParams.from_train_config(cfg)
     norm_params = NormalizerParams.from_train_config(cfg)
@@ -639,6 +723,7 @@ def main() -> None:
         ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
         use_cnn=cfg.model.use_cnn,
+        map_channels=sample.map_features.shape[-3],
         fleet_dim=FLEET_DIM,
         max_fleet_tokens=feat_params.max_fleet_tokens,
         num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
@@ -716,6 +801,7 @@ def main() -> None:
             "sps",
             "episode_reward",
             "win_rate",
+            "top2_rate",
             "mean_return",
             "episodes_per_rollout",
             "loss",
@@ -1043,7 +1129,7 @@ def main() -> None:
         sps = samples / max(elapsed, 1e-9)
         line = (
             f"update={update} sps={sps:.1f} loss={metrics['loss']:.4f} "
-            f"ep_reward={metrics['episode_reward']:.3f} winrate={metrics['win_rate']:.3f} "
+            f"ep_reward={metrics['episode_reward']:.3f} winrate={metrics['win_rate']:.3f} top2={metrics['top2_rate']:.3f} "
             f"return={metrics['mean_return']:.3f} eps={metrics['episodes_per_rollout']:.0f} "
             f"ent={metrics['entropy']:.3f} kl={metrics['approx_kl']:.5f} "
             f"logr={metrics.get('max_abs_log_ratio', 0.0):.2f} "
@@ -1091,7 +1177,7 @@ def main() -> None:
         _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
         _do_slow   = eval_enabled and eval_slow_interval   > 0 and update % eval_slow_interval   == 0
         if _do_nearest or _do_slow:
-            eval_player = 1 if int(getattr(cfg.eval, "player", 0)) == 1 else 0
+            eval_player = int(getattr(cfg.eval, "player", 0)) % max(int(getattr(env_params, "num_players", 2)), 1)
             print(f"[eval] update={update} 开始评估 ({eval_games} 局, learner=player{eval_player})...")
             rng, eval_rng = jax.random.split(rng)
 
@@ -1124,7 +1210,11 @@ def main() -> None:
                     continue
                 if not _is_nearest and not _do_slow:
                     continue
-                result = eval_opponent.evaluate(eval_ctx)
+                try:
+                    result = eval_opponent.evaluate(eval_ctx)
+                except Exception as exc:
+                    print(f"[eval/{eval_opponent.metric_prefix}] 评估失败，跳过: {exc}")
+                    continue
                 if not result:
                     continue
                 eval_results[eval_opponent.metric_prefix] = result
@@ -1145,7 +1235,9 @@ def main() -> None:
             if use_wandb:
                 log_dict: dict = {}
                 for prefix, result in eval_results.items():
-                    log_dict[f"eval/{prefix}_win_rate"] = float(result["win_rate"])
+                    for suffix in ("win_rate", "top2_rate", "avg_place", "place1_rate", "place2_rate", "place3_rate", "place4_rate"):
+                        if suffix in result:
+                            log_dict[f"eval/{prefix}_{suffix}"] = float(result[suffix])
                 if use_pool:
                     if current_pool:
                         fixed_size = len(current_opponents)
@@ -1168,6 +1260,7 @@ def main() -> None:
                 f"{sps:.6f}",
                 f"{metrics['episode_reward']:.8f}",
                 f"{metrics['win_rate']:.8f}",
+                f"{metrics['top2_rate']:.8f}",
                 f"{metrics['mean_return']:.8f}",
                 f"{metrics['episodes_per_rollout']:.1f}",
                 f"{metrics['loss']:.8f}",
@@ -1189,6 +1282,7 @@ def main() -> None:
         if use_wandb:
             _wandb.log({
                 "charts/win_rate": float(metrics["win_rate"]),
+                "charts/top2_rate": float(metrics["top2_rate"]),
                 "charts/episode_reward": float(metrics["episode_reward"]),
                 "charts/mean_return": float(metrics["mean_return"]),
                 "charts/episodes_per_rollout": float(metrics["episodes_per_rollout"]),
@@ -1279,30 +1373,37 @@ def collect_rollout_auto(
     rng, rollout_key = jax.random.split(rng)
 
     def body(carry, _):
-        ts, st, ns, key = carry
+        ts, st, ns, key, first_place_sum, top2_sum = carry
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
-        if opponent_kind == "selfplay":
-            opponent_actions = auto_opponent_policy_actions(
-                st,
-                opponent_params,
-                model,
-                feat_params,
-                ns,
-                norm_params,
-                max_action_tokens,
-                flip_state_fn=flip_state,
-                rng=opp_key,
-            )
-        else:
-            opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
-        joint = jnp.stack([learner_actions, opponent_actions], axis=1)
+        opponent_keys = jax.random.split(opp_key, max(env_params.num_players - 1, 1))
+        opponent_action_list = []
+        for player in range(1, env_params.num_players):
+            if opponent_kind == "selfplay":
+                opponent_action = auto_opponent_policy_actions(
+                    st,
+                    opponent_params,
+                    model,
+                    feat_params,
+                    ns,
+                    norm_params,
+                    max_action_tokens,
+                    flip_state_fn=flip_state,
+                    rng=opponent_keys[player - 1],
+                    opponent_player=player,
+                )
+            else:
+                opponent_action = nearest_opponent_actions(st, player=player, params=feat_params)
+            opponent_action_list.append(opponent_action)
+        joint = jnp.stack([learner_actions] + opponent_action_list, axis=1)
         next_state = step_batch(st, joint, env_params)
-        reward_env, _reward_parts = reward_from_transition(st, next_state, learner_actions, reward_params)
+        reward_env, reward_parts = reward_from_transition(st, next_state, learner_actions, reward_params)
         done = next_state.done
+        first_place_sum = first_place_sum + ((next_state.winner == 0) & done).sum().astype(jnp.float32)
+        top2_sum = top2_sum + ((reward_parts["terminal_reward"] > 0.0) & done).sum().astype(jnp.float32)
         reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
         next_state = replace_done(next_state, reset_state)
         row = AutoRollout(
@@ -1333,11 +1434,13 @@ def collect_rollout_auto(
             reward_env,
             done,
         )
-        return (ts, next_state, ns, key), row
+        return (ts, next_state, ns, key, first_place_sum, top2_sum), row
 
-    (train_state, state, normalizer_state, rng), rollout = jax.lax.scan(
+    first_place_init = jnp.asarray(0.0, dtype=jnp.float32)
+    top2_init = jnp.asarray(0.0, dtype=jnp.float32)
+    (train_state, state, normalizer_state, rng, first_place_sum, top2_sum), rollout = jax.lax.scan(
         body,
-        (train_state, state, normalizer_state, rollout_key),
+        (train_state, state, normalizer_state, rollout_key, first_place_init, top2_init),
         None,
         length=rollout_steps,
     )
@@ -1370,11 +1473,12 @@ def collect_rollout_auto(
     ep_reward_sum = jnp.where(finished, ep_reward, 0.0).sum()
     episodes = jnp.maximum(finished.sum(), 1)
     episode_reward = ep_reward_sum / episodes
-    wins = ((ep_reward > 0.0) & finished).sum()
-    win_rate = wins / episodes
+    win_rate = first_place_sum / episodes
+    top2_rate = top2_sum / episodes
     ep_metrics = {
         "episode_reward": episode_reward,
         "win_rate": win_rate,
+        "top2_rate": top2_rate,
         "mean_return": returns.mean(),
         "episodes_per_rollout": finished.sum().astype(jnp.float32),
     }

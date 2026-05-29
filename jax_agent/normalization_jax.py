@@ -15,8 +15,11 @@ from .features_jax import EncodedBatch, GLOBAL_DIM
 
 
 # 只归一化连续特征列；布尔/类别列不参与 running statistics。
-PLANET_NORMALIZE_INDICES = jnp.asarray([5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25], dtype=jnp.int32)
-RELATIVE_NORMALIZE_INDICES = jnp.asarray([1, 2, 3, 4, 5, 6, 7], dtype=jnp.int32)
+PLANET_NORMALIZE_INDICES = jnp.asarray(
+    [7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+    dtype=jnp.int32,
+)
+RELATIVE_NORMALIZE_INDICES = jnp.asarray([6, 7, 8, 9, 10, 11, 12], dtype=jnp.int32)
 GLOBAL_NORMALIZE_INDICES = jnp.arange(GLOBAL_DIM, dtype=jnp.int32)
 
 

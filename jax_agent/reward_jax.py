@@ -1,8 +1,8 @@
 """Orbit Wars JAX 奖励塑造模块。
 
-与 PyTorch 版 src/env_wrapper.py 的奖励组件基本对齐；终局平局按当前训练策略有意惩罚：
+与 PyTorch 版 src/env_wrapper.py 的奖励组件基本对齐：
 - terminal_reward_player0: 利用 scores() 重新计算得分（不依赖 winner 字段）。
-  赢: +1，平局/输/0-0: -1。
+  四人局按终局排名给分：第 1/2/3/4 名 = +1.0/+0.3/-0.3/-1.0。
 - neutral_capture: 掌控中立星球奖励，较近且较早时加成。
 - enemy_capture: 占领敌方星球奖励。
 - lose_planet: 失去己方星球惩罚。
@@ -17,6 +17,9 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 
 from .fast_env import EnvState, fleet_speed, point_segment_distance_sq, scores
+
+
+TERMINAL_RANK_REWARDS = jnp.asarray([1.0, 0.3, -0.3, -1.0], dtype=jnp.float32)
 
 
 @dataclass(frozen=True)
@@ -87,16 +90,22 @@ def reward_from_transition(prev: EnvState, cur: EnvState, learner_actions: jnp.n
 def terminal_reward_player0(state: EnvState) -> jnp.ndarray:
     """计算学习方（player 0）终局奖励。
 
-    - 赢（score0 > score1）: +1
-    - 平局（score0 == score1）: -1（与输相同，逼迫主动进攻，防止 self-play 策略退化）
-    - 输或 0-0: -1
+    - 第 1 名: +1.0
+    - 第 2 名: +0.3
+    - 第 3 名: -0.3
+    - 第 4 名: -1.0
+    - 并列时取覆盖名次的平均值，例如并列第一为 (+1.0 + 0.3) / 2 = 0.65。
     - 使用 scores() 重新计算，而非直接读 winner 字段（winner 仅保存存活玩家数，不等价）。
     """
     score = scores(state)
     s0 = score[..., 0]
-    s1 = score[..., 1]
-    # 赢: +1, 平局/输/0-0: -1
-    return jnp.where(s0 > s1, 1.0, -1.0)
+    num_players = score.shape[-1]
+    rank_rewards = TERMINAL_RANK_REWARDS[:num_players]
+    better_count = (score > s0[..., None]).sum(axis=-1)
+    tied_count = (score == s0[..., None]).sum(axis=-1)
+    reward_idx = jnp.arange(num_players, dtype=jnp.int32)
+    tied_slots = (reward_idx >= better_count[..., None]) & (reward_idx < (better_count + tied_count)[..., None])
+    return (tied_slots.astype(jnp.float32) * rank_rewards).sum(axis=-1) / jnp.maximum(tied_count.astype(jnp.float32), 1.0)
 
 
 def score_snapshot(state: EnvState) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -152,7 +161,7 @@ def enemy_capture_reward(prev: EnvState, cur: EnvState, params: RewardParams) ->
         return jnp.zeros_like(prev.step, dtype=jnp.float32)
     prev_owner = prev.planets[..., 1].astype(jnp.int32)
     cur_owner = cur.planets[..., 1].astype(jnp.int32)
-    captured = prev.planet_alive & cur.planet_alive & (prev_owner == 1) & (cur_owner == 0)  # 敌方变为己方
+    captured = prev.planet_alive & cur.planet_alive & (prev_owner > 0) & (cur_owner == 0)  # 任意敌方变为己方
     return jnp.where(captured, params.enemy_capture_weight * (1.0 + prev.planets[..., 6]), 0.0).sum(axis=-1)
 
 

@@ -7,7 +7,7 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "jax_fixed_pool_with_mask-0525"
+run_name: "4P-0529"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 100
@@ -62,7 +62,7 @@ ppo:
   num_envs: 160
   total_updates: 50000
   epochs: 4
-  minibatch_size: 2048
+  minibatch_size: 1024
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.2

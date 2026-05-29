@@ -124,8 +124,6 @@ class AutoregressiveActorCritic(nn.Module):
         amt_actions,
         executed,
         initial_ships,
-        target_action_mask=None,
-        amount_action_mask=None,
         map_features=None,
         fleet_features=None,
         fleet_mask=None,
@@ -215,8 +213,6 @@ class AutoregressiveActorCritic(nn.Module):
             tgt_logits = jnp.einsum("bh,bch->bc", q_tgt, tgt_keys) * pointer_logit_scale
             src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
             tgt_mask = src_candidate_mask.at[:, 0].set(False)
-            if target_action_mask is not None:
-                tgt_mask = tgt_mask & target_action_mask[:, step_i]
             tgt_logits = jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
             tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
@@ -228,8 +224,6 @@ class AutoregressiveActorCritic(nn.Module):
             selected_amount_mask = jnp.take_along_axis(source_amount_mask, tgt_safe[:, None, None], axis=1).squeeze(1)
             dynamic_amount_mask = self._dynamic_amount_mask(remaining[batch_idx, src_safe])
             selected_amount_mask = selected_amount_mask & dynamic_amount_mask
-            if amount_action_mask is not None:
-                selected_amount_mask = selected_amount_mask & amount_action_mask[:, step_i]
             amount_logits = jnp.where(selected_amount_mask, amount_logits, -1.0e9)
 
             ships_sent = self._ships_for_bucket(remaining[batch_idx, src_safe], amt_t)

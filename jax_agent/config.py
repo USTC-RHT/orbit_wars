@@ -160,6 +160,8 @@ class TrainConfig:
     pool_lag_checkpoint_phase1_opponents: list[str] = field(default_factory=lambda: ["selfplay-lag"])
     pool_lag_checkpoint_phase2_opponents: list[str] = field(default_factory=lambda: ["selfplay-current", "selfplay-lag"])
     pool_lag_interval: int = 50
+    pool_lag_short_interval: int = 100
+    pool_lag_long_interval: int = 200
     pool_max_size: int = 4
     promote_nearest_win_rate: float = 0.8
     promote_consecutive_evals: int = 3

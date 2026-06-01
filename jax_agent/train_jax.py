@@ -797,6 +797,8 @@ def main() -> None:
     pool_phase = int(getattr(cfg, "pool_start_phase", 1)) if phased_pool else 1
     pool_include_nearest = bool(getattr(cfg, "pool_include_nearest", True)) if pfsp_pool else False
     pool_lag_interval = int(getattr(cfg, "pool_lag_interval", 50)) if lagged_pool else 0
+    pool_lag_short_interval = int(getattr(cfg, "pool_lag_short_interval", 100)) if fixed_pool else 0
+    pool_lag_long_interval = int(getattr(cfg, "pool_lag_long_interval", 200)) if fixed_pool else 0
     snapshot_interval = int(getattr(cfg, "snapshot_interval", 200)) if snapshot_pool else 0
     snapshot_current_ratio = float(getattr(cfg, "snapshot_current_ratio", 0.2)) if snapshot_pool else 0.0
     pool_max_size = int(getattr(cfg, "pool_max_size", 4)) if pfsp_pool else 0
@@ -810,7 +812,11 @@ def main() -> None:
         elif lag_checkpoint_pool:
             print(f"opponent=pool lag_checkpoint (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
         elif fixed_pool:
-            print(f"opponent=pool fixed_pool (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+            print(
+                "opponent=pool fixed_pool "
+                f"(start_phase={pool_phase}, lags={pool_lag_short_interval}/{pool_lag_long_interval}, "
+                f"promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})"
+            )
         elif snapshot_pool:
             print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
         else:
@@ -836,6 +842,9 @@ def main() -> None:
     # interval 时才发布，因此 lag 对手是真正间隔 pool_lag_interval 的 checkpoint。
     lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    fixed_lag100_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    fixed_lag100_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    fixed_lag200_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
     snapshot_pool_entries: list[dict] = []  # snapshot pool 快照列表
     pool_entries: list[dict] = []
     if use_pool and pfsp_pool:
@@ -885,12 +894,12 @@ def main() -> None:
         print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除{reason}，"
               f"对手池: {_pool_summary(pool_entries)}")
 
-    fixed_phase1_opponents = ["nearest", "selfplay-current", "selfplay-lag"]
-    fixed_phase2_opponents = ["selfplay-current", "selfplay-lag"]
+    fixed_phase1_opponents = ["nearest", "selfplay-current", "selfplay-lag100", "selfplay-lag200"]
+    fixed_phase2_opponents = ["selfplay-current", "selfplay-lag100", "selfplay-lag200"]
     current_opponents = ["selfplay-current"]
     lag_checkpoint_phase1_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase1_opponents", ["selfplay-lag"]))
     lag_checkpoint_phase2_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase2_opponents", ["selfplay-current", "selfplay-lag"]))
-    valid_fixed_opponents = {"nearest", "selfplay-current", "selfplay-lag"}
+    valid_fixed_opponents = {"nearest", "selfplay-current", "selfplay-lag", "selfplay-lag100", "selfplay-lag200"}
     if lag_checkpoint_pool:
         for phase_name, phase_opponents in (
             ("pool_lag_checkpoint_phase1_opponents", lag_checkpoint_phase1_opponents),
@@ -949,6 +958,10 @@ def main() -> None:
             return _run_step(_jit_selfplay, ts, opponent_params, ns, st, ns, key, ent_scale)
         if opponent_id == "selfplay-lag":
             return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
+        if opponent_id == "selfplay-lag100":
+            return _run_step(_jit_selfplay, ts, fixed_lag100_params, ns, st, ns, key, ent_scale)
+        if opponent_id == "selfplay-lag200":
+            return _run_step(_jit_selfplay, ts, fixed_lag200_params, ns, st, ns, key, ent_scale)
         raise ValueError(f"Unknown training opponent: {opponent_id}")
 
     for update in range(start_update, cfg.ppo.total_updates + 1):
@@ -1055,17 +1068,24 @@ def main() -> None:
             snapshot_pool_entries.append({"id": snap_id, "params": _copy_params(train_state.params)})
             print(f"[pool] update={update} 存入快照 {snap_id}，快照池大小={len(snapshot_pool_entries)}")
 
-        if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
-            if fixed_pool:
-                lagged_params = _copy_params(train_state.params)
-                print(f"[pool] update={update} 同步 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
-            elif lag_checkpoint_pool:
+        if use_pool and lagged_pool and (not fixed_pool) and pool_lag_interval > 0 and update % pool_lag_interval == 0:
+            if lag_checkpoint_pool:
                 lagged_params = _copy_params(lag_snapshot_params)
                 lag_snapshot_params = _copy_params(train_state.params)
                 print(f"[pool] update={update} 发布 lag_checkpoint 对手权重 (lag={pool_lag_interval})")
             elif pfsp_pool:
                 _add_lag_to_pool(update, lag_snapshot_params)
                 lag_snapshot_params = _copy_params(train_state.params)
+        if use_pool and fixed_pool and pool_lag_short_interval > 0 and update % pool_lag_short_interval == 0:
+            previous_lag100 = fixed_lag100_params
+            fixed_lag100_params = _copy_params(fixed_lag100_snapshot_params)
+            fixed_lag100_snapshot_params = _copy_params(train_state.params)
+            if pool_lag_long_interval == pool_lag_short_interval * 2:
+                fixed_lag200_params = _copy_params(previous_lag100)
+            print(
+                f"[pool] update={update} 同步 fixed_pool 历史对手 "
+                f"(lag{pool_lag_short_interval}/lag{pool_lag_long_interval})"
+            )
 
         eval_metrics = {field: "" for field in eval_metric_fields}
         _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
@@ -1124,7 +1144,8 @@ def main() -> None:
                         and all(r >= promote_nearest_win_rate for r in recent_nearest_win_rates)):
                     pool_phase = 2
                     print(f"[pool] update={update} ★ 升阶 Phase 2：连续 {promote_consecutive_evals} 次 "
-                          f"nearest win_rate >= {promote_nearest_win_rate:.2f}，切换为 selfplay-current/selfplay-lag 训练 + tamrazov-starwars eval")
+                          f"nearest win_rate >= {promote_nearest_win_rate:.2f}，"
+                          "切换为 selfplay-current/selfplay-lag100/selfplay-lag200 训练 + tamrazov-starwars eval")
 
             if use_wandb:
                 log_dict: dict = {}

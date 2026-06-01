@@ -29,17 +29,17 @@ env:
 reward:
   terminal_weight: 1.0
   ships_weight: 0.0
-  production_weight: 0.0
-  planet_weight: 0.0
+  production_weight: 0.004
+  planet_weight: 0.01
   time_penalty: 0.0
-  launch_penalty: 0.0
-  neutral_capture_weight: 0.0
+  launch_penalty: 0.0005
+  neutral_capture_weight: 0.05
   neutral_capture_eta_scale: 12.0
-  neutral_capture_early_steps: 150
-  enemy_capture_weight: 0.0
-  lose_planet_penalty: 0.0
+  neutral_capture_early_steps: 120
+  enemy_capture_weight: 0.02
+  lose_planet_penalty: 0.035
   wasted_attack_penalty: 0.0
-  step_clip: 0.0
+  step_clip: 0.20
 
 model:
   actor_type: autoregressive
@@ -86,7 +86,9 @@ ppo:
 self_play_update_interval: 50
 pool_mode: fixed_pool
 pool_start_phase: 1
-pool_lag_interval: 50
+pool_lag_interval: 100
+pool_lag_short_interval: 100
+pool_lag_long_interval: 200
 promote_nearest_win_rate: 1.0
 promote_consecutive_evals: 2
 

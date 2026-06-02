@@ -7,12 +7,14 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "jax_fixed_pool_with_mask-0525"
+run_name: "2p_improve_from32700_soft_target_prod"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 100
 log_every: 1
 opponent: "pool"
+init_from_checkpoint: /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+start_update_from_checkpoint: true
 
 env:
   board_size: 100.0
@@ -28,17 +30,17 @@ env:
 reward:
   terminal_weight: 1.0
   ships_weight: 0.0
-  production_weight: 0.0
+  production_weight: 0.006
   planet_weight: 0.0
   time_penalty: 0.0
   launch_penalty: 0.0
   neutral_capture_weight: 0.0
   neutral_capture_eta_scale: 12.0
   neutral_capture_early_steps: 150
-  enemy_capture_weight: 0.0
-  lose_planet_penalty: 0.0
+  enemy_capture_weight: 0.015
+  lose_planet_penalty: 0.015
   wasted_attack_penalty: 0.0
-  step_clip: 0.0
+  step_clip: 0.08
 
 model:
   actor_type: autoregressive
@@ -66,13 +68,13 @@ ppo:
   gae_lambda: 0.95
   clip_coef: 0.2
   vf_coef: 0.5
-  ent_coef: 0.01
-  ent_coef_fire: 0.005
-  ent_coef_target: 0.01
-  ent_coef_amount: 0.005
+  ent_coef: 0.015
+  ent_coef_fire: 0.008
+  ent_coef_target: 0.015
+  ent_coef_amount: 0.008
   ent_schedule: linear
-  ent_min_ratio: 0.2
-  lr: 5e-5
+  ent_min_ratio: 0.4
+  lr: 3e-5
   lr_schedule: warmup_cosine
   warmup_updates: 50
   min_lr_ratio: 0.1
@@ -80,7 +82,7 @@ ppo:
   anneal_lr: true
   norm_adv: true
   clip_vloss: true
-  target_kl: 0.02
+  target_kl: 0.03
 
 self_play_update_interval: 50
 pool_mode: fixed_pool

@@ -287,6 +287,13 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=agents_root / "mine" / "jax-pool-0514-resume-ckpt900",
             seed_offset=31337,
         ))
+    if "init_ckpt32700" in enabled:
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-vickimar-hybrid",
+            metric_prefix="init_ckpt32700",
+            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-vickimar-hybrid",
+            seed_offset=4000,
+        ))
     return opponents
 
 

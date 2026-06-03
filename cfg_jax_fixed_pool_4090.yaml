@@ -86,20 +86,20 @@ ppo:
 
 self_play_update_interval: 50
 pool_mode: fixed_pool
-pool_start_phase: 1
-pool_lag_interval: 50
+pool_start_phase: 2
+pool_lag_interval: 200
 promote_nearest_win_rate: 1.0
 promote_consecutive_evals: 2
 
 eval:
   enabled: true
   every: 1000
-  nearest_every: 50
+  nearest_every: 0
   slow_every: 400
   games: 20
   seed: 200000
   player: 1
-  opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]
+  opponents: ["sigma", "tamrazov", "pool_ckpt900", "init_ckpt32700"]
 
 wandb:
   enabled: true

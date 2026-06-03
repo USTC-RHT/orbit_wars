@@ -145,6 +145,7 @@ class TrainConfig:
     seed: int = 42
     run_name: str = "orbit_wars_clean_ppo"
     device: str = "auto"
+    multi_device: bool = False
     save_dir: str = "outputs"
     checkpoint_every: int = 10
     log_every: int = 1

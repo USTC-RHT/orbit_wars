@@ -20,6 +20,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -66,6 +67,60 @@ from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
 
 NEG_INF = -1.0e9
+
+
+def _is_array_leaf(value) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "dtype")
+
+
+def _put_array_tree(tree, sharding):
+    if sharding is None:
+        return tree
+    return jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, sharding) if _is_array_leaf(x) else x,
+        tree,
+    )
+
+
+def _put_leading_axis_tree(tree, sharding, leading_size: int):
+    if sharding is None:
+        return tree
+
+    def place(x):
+        if _is_array_leaf(x) and getattr(x, "ndim", 0) > 0 and int(x.shape[0]) == int(leading_size):
+            return jax.device_put(x, sharding)
+        return x
+
+    return jax.tree_util.tree_map(place, tree)
+
+
+def _make_train_shardings(cfg):
+    requested = bool(getattr(cfg, "multi_device", False)) or str(getattr(cfg, "device", "auto")).lower() in {
+        "all",
+        "data_parallel",
+        "multi",
+        "multi_device",
+        "multi_gpu",
+    }
+    devices = jax.local_devices()
+    if not requested:
+        return None, None, devices
+    if len(devices) < 2:
+        print("[multi-device] requested but only one local JAX device is visible; using single-device jit")
+        return None, None, devices
+    if cfg.ppo.num_envs % len(devices) != 0:
+        raise ValueError(
+            f"multi_device requires ppo.num_envs ({cfg.ppo.num_envs}) to be divisible by "
+            f"local device count ({len(devices)})."
+        )
+    mesh = Mesh(np.asarray(devices), ("data",))
+    data_sharding = NamedSharding(mesh, P("data"))
+    replicated_sharding = NamedSharding(mesh, P())
+    print(
+        f"[multi-device] enabled devices={len(devices)} "
+        f"envs_per_device={cfg.ppo.num_envs // len(devices)} devices={devices}"
+    )
+    return data_sharding, replicated_sharding, devices
 
 
 def _resolve_lr_schedule(cfg) -> str:
@@ -597,6 +652,20 @@ def main() -> None:
             "optimizer state is freshly initialized"
         )
 
+    data_sharding, replicated_sharding, _train_devices = _make_train_shardings(cfg)
+
+    def _place_train_runtime(ts, st, ns):
+        if data_sharding is None:
+            return ts, st, ns
+        ts = _put_array_tree(ts, replicated_sharding)
+        st = _put_leading_axis_tree(st, data_sharding, cfg.ppo.num_envs)
+        ns = _put_array_tree(ns, replicated_sharding)
+        return ts, st, ns
+
+    train_state, state, normalizer_state = _place_train_runtime(train_state, state, normalizer_state)
+    if replicated_sharding is not None:
+        bank = _put_array_tree(bank, replicated_sharding)
+
     run_dir = Path(cfg.save_dir) / f"{cfg.run_name}_jax"
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.csv"
@@ -856,6 +925,7 @@ def main() -> None:
             max_action_tokens,
             ent_scale,
         )
+        ts, st, ns = _place_train_runtime(ts, st, ns)
         return ts, st, ns, {**ppo_metrics, **ep_metrics}
 
     def _run_named_opponent(opponent_id: str, ts, st, ns, key, ent_scale):

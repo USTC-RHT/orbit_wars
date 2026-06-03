@@ -9,6 +9,7 @@
 seed: 42
 run_name: "2p_improve_from32700_soft_target_prod"
 device: auto
+multi_device: true
 save_dir: ../kaggle
 checkpoint_every: 100
 log_every: 1

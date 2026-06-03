@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import pickle
 import random
 import sys
 from dataclasses import dataclass
@@ -173,6 +174,111 @@ class NearestJaxEvalOpponent:
         return result
 
 
+class CheckpointJaxEvalOpponent:
+    """直接用 JAX checkpoint 参数作为评估对手，不依赖外部脚本 agent。"""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        metric_prefix: str,
+        checkpoint_path: Path,
+    ) -> None:
+        self.name = name
+        self.metric_prefix = metric_prefix
+        self.checkpoint_path = checkpoint_path.resolve()
+        self._loaded: tuple[Any, Any] | None = None
+
+    def exists(self) -> bool:
+        if self.checkpoint_path.exists():
+            return True
+        print(f"[eval/{self.name}] checkpoint 不存在，跳过: {self.checkpoint_path}")
+        return False
+
+    def metric_fields(self) -> list[str]:
+        return JaxEvalOpponent.metric_fields(self)
+
+    def metric_values(self, result: EvalResult) -> dict[str, float | int]:
+        return JaxEvalOpponent.metric_values(self, result)
+
+    def _load(self, ctx: EvalContext) -> tuple[Any, Any]:
+        if self._loaded is None:
+            with self.checkpoint_path.open("rb") as f:
+                ckpt = pickle.load(f)
+            params = ckpt["params"]
+            expected_leaves, expected_tree = jax.tree_util.tree_flatten(ctx.train_state.params)
+            loaded_leaves, loaded_tree = jax.tree_util.tree_flatten(params)
+            if loaded_tree != expected_tree:
+                raise ValueError(f"Checkpoint param tree does not match current model: {self.checkpoint_path}")
+            mismatches = [
+                (i, getattr(exp, "shape", None), getattr(got, "shape", None))
+                for i, (exp, got) in enumerate(zip(expected_leaves, loaded_leaves, strict=True))
+                if getattr(exp, "shape", None) != getattr(got, "shape", None)
+            ]
+            if mismatches:
+                raise ValueError(
+                    f"Checkpoint param shapes do not match current model: {self.checkpoint_path}; "
+                    f"first mismatches={mismatches[:5]}"
+                )
+            norm_state = ckpt.get("normalizer_state", ctx.normalizer_state)
+            self._loaded = (params, norm_state)
+            print(f"[eval/{self.name}] loaded JAX checkpoint: {self.checkpoint_path}")
+        return self._loaded
+
+    def evaluate(self, ctx: EvalContext) -> EvalResult:
+        params, opponent_norm_state = self._load(ctx)
+        opponent_train_state = ctx.train_state.replace(params=params)
+        _rng, reset_key = jax.random.split(ctx.rng)
+        state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
+        learner_idx = 1 if int(getattr(ctx, "eval_player", 0)) == 1 else 0
+        opponent_idx = 1 - learner_idx
+
+        @jax.jit
+        def learner_infer(st):
+            return ctx.deterministic_policy_actions(
+                ctx.train_state,
+                st,
+                ctx.feat_params,
+                ctx.normalizer_state,
+                ctx.norm_params,
+            )
+
+        @jax.jit
+        def opponent_infer(st):
+            return ctx.deterministic_policy_actions(
+                opponent_train_state,
+                st,
+                ctx.feat_params,
+                opponent_norm_state,
+                ctx.norm_params,
+            )
+
+        def step_fn(st, _):
+            if learner_idx == 1:
+                learner_st = ctx.flip_state(st)
+                learner_acts = learner_infer(learner_st)
+                learner_acts = ctx.flip_actions(learner_acts)
+                opp_acts = opponent_infer(st)
+                joint = jnp.stack([opp_acts, learner_acts], axis=1)
+            else:
+                learner_acts = learner_infer(st)
+                opp_st = ctx.flip_state(st)
+                opp_acts = opponent_infer(opp_st)
+                opp_acts = ctx.flip_actions(opp_acts)
+                joint = jnp.stack([learner_acts, opp_acts], axis=1)
+            return step_batch(st, joint, ctx.env_params), None
+
+        final_state, _ = jax.lax.scan(step_fn, state, None, length=ctx.env_params.episode_steps)
+        winners = np.array(final_state.winner)
+        wins = int((winners == learner_idx).sum())
+        losses = int((winners == opponent_idx).sum())
+        draws = int((winners == 2).sum())
+        total = max(ctx.num_games, 1)
+        result = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total, "loss_rate": losses / total}
+        print(f"[eval/{self.name}]   p{learner_idx} wins={wins} losses={losses} draws={draws} win_rate={result['win_rate']:.3f}")
+        return result
+
+
 @dataclass(frozen=True)
 class ExternalScriptJaxEvalOpponent:
     """用 Kaggle 环境评估当前 JAX learner 对外部脚本 agent 的胜率。"""
@@ -257,7 +363,7 @@ class ExternalScriptJaxEvalOpponent:
         return result
 
 
-def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpponent]:
+def default_eval_opponents(root: Path, *, enabled_names=None, init_checkpoint_path: Path | None = None) -> list[JaxEvalOpponent]:
     """根据配置创建默认评估对手列表。"""
 
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
@@ -287,13 +393,15 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=agents_root / "mine" / "jax-pool-0514-resume-ckpt900",
             seed_offset=31337,
         ))
-    if "init_ckpt32700" in enabled:
-        opponents.append(ExternalScriptJaxEvalOpponent(
-            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-vickimar-hybrid",
-            metric_prefix="init_ckpt32700",
-            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-vickimar-hybrid",
-            seed_offset=4000,
-        ))
+    if {"init_checkpoint", "init_ckpt", "init_ckpt32700"} & enabled:
+        if init_checkpoint_path is None:
+            print("[eval/init_checkpoint] init_from_checkpoint 未配置，跳过")
+        else:
+            opponents.append(CheckpointJaxEvalOpponent(
+                name="init_checkpoint",
+                metric_prefix="init_checkpoint",
+                checkpoint_path=init_checkpoint_path,
+            ))
     return opponents
 
 

@@ -552,6 +552,7 @@ def main() -> None:
         return auto_deterministic_policy_actions(ts, model, st, fp, ns, np)
 
     start_update = 1
+    init_ckpt_path: Path | None = None
 
     def _resolve_config_path(path_value: str) -> Path:
         path = Path(path_value)
@@ -581,6 +582,7 @@ def main() -> None:
     init_ckpt = getattr(cfg, "init_from_checkpoint", None)
     if init_ckpt:
         ckpt, ckpt_path = _load_checkpoint(init_ckpt)
+        init_ckpt_path = ckpt_path
         ckpt_params = ckpt["params"]
         _assert_param_compatible(ckpt_params, ckpt_path)
         train_state = train_state.replace(params=ckpt_params)
@@ -600,6 +602,7 @@ def main() -> None:
     eval_opponents = default_eval_opponents(
         REPO_ROOT,
         enabled_names=getattr(cfg.eval, "opponents", None),
+        init_checkpoint_path=init_ckpt_path,
     )
     eval_metric_fields = build_eval_metric_fields(eval_opponents)
     with metrics_path.open("w", newline="", encoding="utf-8") as f:

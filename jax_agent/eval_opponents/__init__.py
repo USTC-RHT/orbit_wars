@@ -1,6 +1,7 @@
 """JAX 训练与评估对手适配器。"""
 
 from .opponents import (
+    CheckpointJaxEvalOpponent,
     EvalContext,
     ExternalScriptJaxEvalOpponent,
     JaxEvalOpponent,
@@ -10,6 +11,7 @@ from .opponents import (
 )
 
 __all__ = [
+    "CheckpointJaxEvalOpponent",
     "EvalContext",
     "ExternalScriptJaxEvalOpponent",
     "JaxEvalOpponent",

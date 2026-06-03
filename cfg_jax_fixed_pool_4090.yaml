@@ -99,7 +99,7 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["sigma", "tamrazov", "pool_ckpt900", "init_ckpt32700"]
+  opponents: ["sigma", "tamrazov", "pool_ckpt900", "init_checkpoint"]
 
 wandb:
   enabled: true

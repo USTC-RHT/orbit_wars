@@ -220,7 +220,8 @@ class CheckpointJaxEvalOpponent:
                     f"Checkpoint param shapes do not match current model: {self.checkpoint_path}; "
                     f"first mismatches={mismatches[:5]}"
                 )
-            norm_state = ckpt.get("normalizer_state", ctx.normalizer_state)
+            params = jax.tree_util.tree_map(jnp.asarray, params)
+            norm_state = jax.tree_util.tree_map(jnp.asarray, ckpt.get("normalizer_state", ctx.normalizer_state))
             self._loaded = (params, norm_state)
             print(f"[eval/{self.name}] loaded JAX checkpoint: {self.checkpoint_path}")
         return self._loaded

@@ -443,11 +443,17 @@ class AutoregressiveActorCritic(nn.Module):
         transformer_planet_features = self._planet_features_with_noop(planet_features)
         planet_h = MLP(hidden)(transformer_planet_features)
         if fleet_features is None:
-            fleet_features = jnp.zeros((batch_size, source_count, self.max_fleet_tokens, self.fleet_dim), dtype=planet_h.dtype)
+            shared_fleet_features = jnp.zeros((batch_size, self.max_fleet_tokens, self.fleet_dim), dtype=planet_h.dtype)
+        elif fleet_features.ndim == 4:
+            shared_fleet_features = fleet_features[:, 0]
+        else:
+            shared_fleet_features = fleet_features
         if fleet_mask is None:
-            fleet_mask = jnp.zeros((batch_size, source_count, self.max_fleet_tokens), dtype=bool)
-        shared_fleet_features = fleet_features[:, 0]
-        shared_fleet_mask = fleet_mask[:, 0]
+            shared_fleet_mask = jnp.zeros((batch_size, self.max_fleet_tokens), dtype=bool)
+        elif fleet_mask.ndim == 3:
+            shared_fleet_mask = fleet_mask[:, 0]
+        else:
+            shared_fleet_mask = fleet_mask
         fleet_h = MLP(hidden)(shared_fleet_features)
         cls = self.param("cls_token", nn.initializers.normal(0.02), (1, 1, hidden))
         cls = jnp.broadcast_to(cls, (batch_size, 1, hidden))

@@ -854,6 +854,7 @@ def main() -> None:
     pool_phase = int(getattr(cfg, "pool_start_phase", 1)) if phased_pool else 1
     pool_include_nearest = bool(getattr(cfg, "pool_include_nearest", True)) if pfsp_pool else False
     pool_lag_interval = int(getattr(cfg, "pool_lag_interval", 50)) if lagged_pool else 0
+    fixed_pool_current_ratio = float(getattr(cfg, "fixed_pool_current_ratio", 0.5)) if fixed_pool else 0.0
     snapshot_interval = int(getattr(cfg, "snapshot_interval", 200)) if snapshot_pool else 0
     snapshot_current_ratio = float(getattr(cfg, "snapshot_current_ratio", 0.2)) if snapshot_pool else 0.0
     pool_max_size = int(getattr(cfg, "pool_max_size", 4)) if pfsp_pool else 0
@@ -867,7 +868,10 @@ def main() -> None:
         elif lag_checkpoint_pool:
             print(f"opponent=pool lag_checkpoint (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
         elif fixed_pool:
-            print(f"opponent=pool fixed_pool (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
+            print(
+                f"opponent=pool fixed_pool (start_phase={pool_phase}, lag_interval={pool_lag_interval}, "
+                f"current_ratio={fixed_pool_current_ratio:.0%}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})"
+            )
         elif snapshot_pool:
             print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
         else:
@@ -1071,9 +1075,17 @@ def main() -> None:
                     candidates = current_opponents
                 elif lag_checkpoint_pool:
                     candidates = lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents
+                elif fixed_pool and pool_phase == 2:
+                    candidates = fixed_phase2_opponents
+                    selected_pool_id = pool_rng.choices(
+                        candidates,
+                        weights=[fixed_pool_current_ratio, 1.0 - fixed_pool_current_ratio],
+                        k=1,
+                    )[0]
                 else:
                     candidates = fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents
-                selected_pool_id = pool_rng.choice(candidates)
+                if not selected_pool_id:
+                    selected_pool_id = pool_rng.choice(candidates)
                 train_state, state, normalizer_state, metrics = _run_named_opponent(
                     selected_pool_id,
                     train_state,
@@ -1157,8 +1169,9 @@ def main() -> None:
 
         if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
             if fixed_pool:
-                lagged_params = _copy_params(train_state.params)
-                print(f"[pool] update={update} 同步 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
+                lagged_params = _copy_params(lag_snapshot_params)
+                lag_snapshot_params = _copy_params(train_state.params)
+                print(f"[pool] update={update} 发布 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
             elif lag_checkpoint_pool:
                 lagged_params = _copy_params(lag_snapshot_params)
                 lag_snapshot_params = _copy_params(train_state.params)
@@ -1408,8 +1421,8 @@ def collect_rollout_auto(
             encoded.relative_features,
             encoded.global_features,
             encoded.map_features,
-            encoded.fleet_features,
-            encoded.fleet_mask,
+            encoded.fleet_features[:, 0],
+            encoded.fleet_mask[:, 0],
             encoded.candidate_mask,
             encoded.amount_mask,
             encoded.source_mask,

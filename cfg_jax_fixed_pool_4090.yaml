@@ -74,9 +74,10 @@ ppo:
   target_kl: 0.02
 
 self_play_update_interval: 50
-pool_mode: snapshot
-snapshot_interval: 100
-snapshot_current_ratio: 0.25
+pool_mode: fixed_pool
+pool_start_phase: 2
+pool_lag_interval: 100
+fixed_pool_current_ratio: 0.75
 
 eval:
   enabled: true
@@ -96,6 +97,6 @@ wandb:
   tags:
     - autoregressive
     - v1
-    - snapshot_pool
+    - fixed_pool
     - rtx4090
     - 4gpu

@@ -115,6 +115,7 @@ class PPOConfig:
     lr_schedule: str = "auto"
     warmup_updates: int = 0
     min_lr_ratio: float = 0.0
+    weight_decay: float = 0.0
     max_grad_norm: float = 0.5
     anneal_lr: bool = True
     norm_adv: bool = True

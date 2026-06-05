@@ -125,6 +125,7 @@ def make_auto_train_state(
     total_steps: int = 0,
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.0,
+    weight_decay: float = 0.0,
 ) -> TrainState:
     """初始化自回归模型参数和优化器状态。"""
     b = sample_batch.planet_features.shape[0]
@@ -148,7 +149,8 @@ def make_auto_train_state(
         fleet_mask=sample_batch.fleet_mask,
     )
     lr_schedule = make_lr_schedule(lr, total_steps, lr_schedule, warmup_steps, min_lr_ratio)
-    tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.adam(lr_schedule))
+    optimizer = optax.adamw(lr_schedule, weight_decay=weight_decay) if weight_decay > 0.0 else optax.adam(lr_schedule)
+    tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), optimizer)
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
 
@@ -212,8 +214,7 @@ def compute_gae_state(rewards, dones, values, last_values, params: PPOParams):
     return compute_gae(rewards, dones, values, last_values, params)
 
 
-@partial(jax.jit, static_argnames=("params", "max_action_tokens"))
-def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, advantages, params: PPOParams, rng, max_action_tokens: int, ent_scale=1.0):
+def _ppo_update_auto_impl(train_state: TrainState, rollout: AutoRollout, returns, advantages, params: PPOParams, rng, max_action_tokens: int, ent_scale=1.0):
     """对自回归 rollout 执行一次 PPO 更新。
 
     一个 update 内包含多个 epoch，每个 epoch 随机打乱状态样本并切 minibatch。
@@ -283,6 +284,57 @@ def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, adva
     metrics = {k: metrics_acc[k] / denom for k in metrics_acc}
     metrics["n_epochs_run"] = completed.astype(jnp.float32)
     return train_state, metrics
+
+
+ppo_update_auto = partial(jax.jit, static_argnames=("params", "max_action_tokens"))(_ppo_update_auto_impl)
+
+
+def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, replicated_sharding, rollout_sharding):
+    """Create a PPO update JIT with explicit data-parallel shardings.
+
+    ``rollout_sharding`` is expected to shard [T, B, ...] arrays on B. The
+    parameter/optimizer state stays replicated; global reductions in the PPO
+    loss then trigger the required cross-device collectives.
+    """
+    if replicated_sharding is None or rollout_sharding is None:
+        def update(train_state, rollout, returns, advantages, rng, ent_scale=1.0):
+            return ppo_update_auto(
+                train_state,
+                rollout,
+                returns,
+                advantages,
+                params,
+                rng,
+                max_action_tokens,
+                ent_scale,
+            )
+
+        return update
+
+    def update(train_state, rollout, returns, advantages, rng, ent_scale=1.0):
+        return _ppo_update_auto_impl(
+            train_state,
+            rollout,
+            returns,
+            advantages,
+            params,
+            rng,
+            max_action_tokens,
+            ent_scale,
+        )
+
+    return jax.jit(
+        update,
+        in_shardings=(
+            replicated_sharding,
+            rollout_sharding,
+            rollout_sharding,
+            rollout_sharding,
+            replicated_sharding,
+            None,
+        ),
+        out_shardings=(replicated_sharding, replicated_sharding),
+    )
 
 
 def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray], params: PPOParams, ent_scale=1.0):
@@ -403,9 +455,14 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
 
 
 def flatten_auto_rollout(rollout: AutoRollout, returns, advantages):
-    """把 [T, B, ...] rollout 展平成 [T*B, ...]，便于 minibatch 采样。"""
+    """把 [T, B, ...] rollout 展平成 [B*T, ...]，便于 minibatch 采样。
+
+    环境 batch 维 B 是训练时的天然数据并行维度。先交换到 [B, T, ...]
+    再展平，可以让多设备 sharding 沿 env 维保持局部性，减少 reshape 时的跨卡搬运。
+    单卡训练下只改变样本顺序，不改变 PPO 语义。
+    """
     def flat(x):
-        return x.reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
+        return jnp.swapaxes(x, 0, 1).reshape((-1,) + x.shape[2:]) if x.ndim >= 2 else x.reshape((-1,))
 
     return {
         "planet_features": flat(rollout.planet_features),

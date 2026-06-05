@@ -60,7 +60,7 @@ from .ppo_jax import (
     compute_gae,
     compute_gae_state,
     make_auto_train_state,
-    ppo_update_auto,
+    make_sharded_ppo_update_auto,
     safe_logits,
 )  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
@@ -104,10 +104,10 @@ def _make_train_shardings(cfg):
     }
     devices = jax.local_devices()
     if not requested:
-        return None, None, devices
+        return None, None, None, devices
     if len(devices) < 2:
         print("[multi-device] requested but only one local JAX device is visible; using single-device jit")
-        return None, None, devices
+        return None, None, None, devices
     if cfg.ppo.num_envs % len(devices) != 0:
         raise ValueError(
             f"multi_device requires ppo.num_envs ({cfg.ppo.num_envs}) to be divisible by "
@@ -115,12 +115,28 @@ def _make_train_shardings(cfg):
         )
     mesh = Mesh(np.asarray(devices), ("data",))
     data_sharding = NamedSharding(mesh, P("data"))
+    rollout_sharding = NamedSharding(mesh, P(None, "data"))
     replicated_sharding = NamedSharding(mesh, P())
     print(
         f"[multi-device] enabled devices={len(devices)} "
         f"envs_per_device={cfg.ppo.num_envs // len(devices)} devices={devices}"
     )
-    return data_sharding, replicated_sharding, devices
+    return data_sharding, rollout_sharding, replicated_sharding, devices
+
+
+def _collect_rollout_out_shardings(data_sharding, rollout_sharding, replicated_sharding):
+    if data_sharding is None:
+        return None
+    return (
+        replicated_sharding,  # train_state
+        data_sharding,        # EnvState [B, ...]
+        replicated_sharding,  # normalizer_state
+        rollout_sharding,     # AutoRollout [T, B, ...]
+        rollout_sharding,     # returns [T, B]
+        rollout_sharding,     # advantages [T, B]
+        replicated_sharding,  # rng
+        replicated_sharding,  # metrics dict
+    )
 
 
 def _resolve_lr_schedule(cfg) -> str:
@@ -600,6 +616,7 @@ def main() -> None:
         lr_schedule=lr_schedule_name,
         warmup_steps=warmup_steps,
         min_lr_ratio=getattr(cfg.ppo, "min_lr_ratio", 0.0),
+        weight_decay=getattr(cfg.ppo, "weight_decay", 0.0),
     )
     normalizer_state = init_normalizer()
 
@@ -652,7 +669,7 @@ def main() -> None:
             "optimizer state is freshly initialized"
         )
 
-    data_sharding, replicated_sharding, _train_devices = _make_train_shardings(cfg)
+    data_sharding, rollout_sharding, replicated_sharding, _train_devices = _make_train_shardings(cfg)
 
     def _place_train_runtime(ts, st, ns):
         if data_sharding is None:
@@ -726,6 +743,7 @@ def main() -> None:
                 "lr_schedule": lr_schedule_name,
                 "warmup_updates": getattr(cfg.ppo, "warmup_updates", 0),
                 "min_lr_ratio": getattr(cfg.ppo, "min_lr_ratio", 0.0),
+                "weight_decay": getattr(cfg.ppo, "weight_decay", 0.0),
                 "max_grad_norm": cfg.ppo.max_grad_norm,
                 "epochs": cfg.ppo.epochs,
                 "hidden_size": cfg.model.hidden_size,
@@ -889,19 +907,36 @@ def main() -> None:
 
     # JIT 编译的 autoregressive 训练步（JAX-native 对手），供 pool 模式按需调用。
     max_action_tokens = int(getattr(cfg.model, "max_action_tokens", 16))
+    collect_in_shardings = None
+    collect_out_shardings = _collect_rollout_out_shardings(data_sharding, rollout_sharding, replicated_sharding)
+    if data_sharding is not None:
+        collect_in_shardings = (
+            replicated_sharding,  # train_state
+            replicated_sharding,  # opponent params
+            replicated_sharding,  # opponent normalizer
+            data_sharding,        # EnvState [B, ...]
+            replicated_sharding,  # normalizer_state
+            replicated_sharding,  # rng
+        )
+    ppo_update_fn = make_sharded_ppo_update_auto(ppo_params, max_action_tokens, replicated_sharding, rollout_sharding)
+
     _jit_nearest = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
             ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "nearest",
             max_action_tokens=max_action_tokens,
-        )
+        ),
+        in_shardings=collect_in_shardings,
+        out_shardings=collect_out_shardings,
     )
     _jit_selfplay = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
             ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
             max_action_tokens=max_action_tokens,
-        )
+        ),
+        in_shardings=collect_in_shardings,
+        out_shardings=collect_out_shardings,
     )
     _jit_step = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
@@ -909,20 +944,20 @@ def main() -> None:
             reward_params, ppo_params, model, cfg.ppo.rollout_steps,
             "selfplay" if self_play else "nearest",
             max_action_tokens=max_action_tokens,
-        )
+        ),
+        in_shardings=collect_in_shardings,
+        out_shardings=collect_out_shardings,
     )
 
     def _run_step(jit_fn, ts, opp_p, opp_ns, st, ns, key, ent_scale):
         """JIT 收集 rollout，然后在 Python 层执行 PPO 更新（含 KL 早停）。"""
         ts, st, ns, rollout, returns, advantages, ppo_rng, ep_metrics = jit_fn(ts, opp_p, opp_ns, st, ns, key)
-        ts, ppo_metrics = ppo_update_auto(
+        ts, ppo_metrics = ppo_update_fn(
             ts,
             rollout,
             returns,
             advantages,
-            ppo_params,
             ppo_rng,
-            max_action_tokens,
             ent_scale,
         )
         ts, st, ns = _place_train_runtime(ts, st, ns)

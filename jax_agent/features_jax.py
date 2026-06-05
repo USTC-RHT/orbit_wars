@@ -549,11 +549,46 @@ def compute_defense_pressure(planets: jnp.ndarray, inbound: jnp.ndarray) -> jnp.
 
 
 def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """构建单局 top-K 舰队 token，用于 Transformer 编码。"""
+    """构建单局 top-K 舰队 token，用于 Transformer 编码。
+
+    top-K 不只看舰队大小，而是优先保留会影响当前决策的舰队：
+    敌方打我方星球的威胁、我方打敌方/中立的机会、ETA 紧迫度、船数和目标价值。
+    """
     fleets = state.fleets
     alive = state.fleet_alive
+    owner_all = fleets[:, 1].astype(jnp.int32)
+    fleet_target_all, fleet_target_valid_all, fleet_target_t_all = predict_fleet_targets(state)
+    safe_target_all = jnp.clip(fleet_target_all, 0, state.planets.shape[0] - 1)
+    target_planets_all = state.planets[safe_target_all]
+    target_owner_all = target_planets_all[:, 1].astype(jnp.int32)
+    target_valid_all = alive & fleet_target_valid_all
+    target_is_mine_all = target_valid_all & (target_owner_all == 0)
+    target_is_enemy_all = target_valid_all & (target_owner_all == 1)
+    target_is_neutral_all = target_valid_all & (target_owner_all == -1)
+    is_my_fleet_all = owner_all == 0
+    is_enemy_fleet_all = owner_all == 1
+    eta_norm_all = jnp.clip(fleet_target_t_all / INBOUND_HORIZON, 0.0, 1.0)
+    urgency = jnp.where(target_valid_all, 1.0 - eta_norm_all, 0.0)
+    ships_norm = clip01(fleets[:, 6] / params.max_ships)
+    target_prod_norm = jnp.where(target_valid_all, target_planets_all[:, 6] / params.max_production, 0.0)
+    target_ships_norm = jnp.where(target_valid_all, clip01(target_planets_all[:, 5] / params.max_ships), 0.0)
+
+    enemy_to_my = is_enemy_fleet_all & target_is_mine_all
+    my_to_attack = is_my_fleet_all & (target_is_enemy_all | target_is_neutral_all)
+    enemy_to_neutral = is_enemy_fleet_all & target_is_neutral_all
+    my_reinforce = is_my_fleet_all & target_is_mine_all
+    importance = (
+        3.0 * enemy_to_my.astype(jnp.float32)
+        + 1.6 * my_to_attack.astype(jnp.float32)
+        + 0.8 * enemy_to_neutral.astype(jnp.float32)
+        + 0.7 * my_reinforce.astype(jnp.float32)
+        + 1.2 * urgency
+        + 1.0 * ships_norm
+        + 0.8 * target_prod_norm
+        + 0.4 * target_ships_norm
+    )
     dist_center = jnp.sqrt((fleets[:, 2] - CENTER) ** 2 + (fleets[:, 3] - CENTER) ** 2)
-    score = jnp.where(alive, -fleets[:, 6] + 0.01 * dist_center, jnp.inf)
+    score = jnp.where(alive, -importance + 1.0e-4 * dist_center / BOARD_SIZE, jnp.inf)
     order = jnp.argsort(score)[: params.max_fleet_tokens]
     sel = fleets[order]
     sel_alive = alive[order]
@@ -564,15 +599,14 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
     has_from = planet_match.any(axis=0)
     from_planets = state.planets[from_slot]
     speed = fleet_speed(jnp.maximum(sel[:, 6], 1.0))
-    fleet_target, fleet_target_valid, fleet_target_t = predict_fleet_targets(state)
-    target_idx = fleet_target[order]
-    target_valid = sel_alive & fleet_target_valid[order]
+    target_idx = fleet_target_all[order]
+    target_valid = sel_alive & fleet_target_valid_all[order]
     target_planets = state.planets[target_idx]
     target_owner = target_planets[:, 1].astype(jnp.int32)
     target_dx = target_planets[:, 2] - sel[:, 2]
     target_dy = target_planets[:, 3] - sel[:, 3]
     target_dist = jnp.sqrt(target_dx * target_dx + target_dy * target_dy)
-    target_eta = fleet_target_t[order] / INBOUND_HORIZON
+    target_eta = fleet_target_t_all[order] / INBOUND_HORIZON
 
     planet_owner = state.planets[:, 1].astype(jnp.int32)
     planet_alive = state.planet_alive

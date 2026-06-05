@@ -26,7 +26,7 @@ def _assert_all_finite(name: str, value):
         if not bool(is_ok):
             raise FloatingPointError(f"non-finite value detected in {name}")
 
-    jax.debug.callback(_check, ok, ordered=True)
+    jax.debug.callback(_check, ok)
     return value
 
 

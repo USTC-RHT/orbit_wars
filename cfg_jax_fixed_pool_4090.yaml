@@ -54,7 +54,7 @@ ppo:
   num_envs: 512
   total_updates: 50000
   epochs: 4
-  minibatch_size: 4096
+  minibatch_size: 1024
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.2

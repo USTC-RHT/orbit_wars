@@ -94,6 +94,35 @@ def _put_leading_axis_tree(tree, sharding, leading_size: int):
     return jax.tree_util.tree_map(place, tree)
 
 
+def _tree_to_jax(tree):
+    return jax.tree_util.tree_map(lambda x: jnp.asarray(x) if _is_array_leaf(x) else x, tree)
+
+
+def _assert_tree_compatible(name: str, expected, loaded, ckpt_path: Path) -> None:
+    expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+    loaded_leaves, loaded_tree = jax.tree_util.tree_flatten(loaded)
+    if loaded_tree != expected_tree:
+        raise ValueError(f"{name} tree does not match current training state: {ckpt_path}")
+    mismatches = [
+        (i, getattr(exp, "shape", None), getattr(got, "shape", None))
+        for i, (exp, got) in enumerate(zip(expected_leaves, loaded_leaves, strict=True))
+        if getattr(exp, "shape", None) != getattr(got, "shape", None)
+    ]
+    if mismatches:
+        raise ValueError(
+            f"{name} shapes do not match current training state: {ckpt_path}; "
+            f"first mismatches={mismatches[:5]}"
+        )
+
+
+def _checkpoint_train_state_payload(train_state):
+    return {
+        "step": jax.device_get(train_state.step),
+        "params": jax.device_get(train_state.params),
+        "opt_state": jax.device_get(train_state.opt_state),
+    }
+
+
 def _make_train_shardings(cfg):
     requested = bool(getattr(cfg, "multi_device", False)) or str(getattr(cfg, "device", "auto")).lower() in {
         "all",
@@ -625,6 +654,8 @@ def main() -> None:
 
     start_update = 1
     init_ckpt_path: Path | None = None
+    resume_runtime_state: dict | None = None
+    resumed_full_state = False
 
     def _resolve_config_path(path_value: str) -> Path:
         path = Path(path_value)
@@ -635,38 +666,59 @@ def main() -> None:
         with ckpt_path.open("rb") as f:
             return pickle.load(f), ckpt_path
 
-    def _assert_param_compatible(ckpt_params, ckpt_path: Path) -> None:
-        expected_leaves, expected_tree = jax.tree_util.tree_flatten(train_state.params)
-        loaded_leaves, loaded_tree = jax.tree_util.tree_flatten(ckpt_params)
-        if loaded_tree != expected_tree:
-            raise ValueError(f"Checkpoint param tree does not match current model: {ckpt_path}")
-        mismatches = [
-            (i, getattr(exp, "shape", None), getattr(got, "shape", None))
-            for i, (exp, got) in enumerate(zip(expected_leaves, loaded_leaves, strict=True))
-            if getattr(exp, "shape", None) != getattr(got, "shape", None)
-        ]
-        if mismatches:
-            raise ValueError(
-                f"Checkpoint param shapes do not match current model: {ckpt_path}; "
-                f"first mismatches={mismatches[:5]}"
-            )
+    def _restore_train_state_from_checkpoint(ckpt: dict, ckpt_path: Path):
+        nonlocal train_state
+        saved_train_state = ckpt.get("train_state")
+        if saved_train_state is None:
+            ckpt_params = ckpt["params"]
+            _assert_tree_compatible("Checkpoint params", train_state.params, ckpt_params, ckpt_path)
+            train_state = train_state.replace(params=_tree_to_jax(ckpt_params))
+            return False
+
+        if isinstance(saved_train_state, dict):
+            ckpt_params = saved_train_state["params"]
+            ckpt_opt_state = saved_train_state.get("opt_state")
+            ckpt_step = saved_train_state.get("step", train_state.step)
+        else:
+            ckpt_params = saved_train_state.params
+            ckpt_opt_state = saved_train_state.opt_state
+            ckpt_step = saved_train_state.step
+
+        _assert_tree_compatible("Checkpoint params", train_state.params, ckpt_params, ckpt_path)
+        if ckpt_opt_state is None:
+            train_state = train_state.replace(params=_tree_to_jax(ckpt_params), step=jnp.asarray(ckpt_step))
+            return False
+        _assert_tree_compatible("Checkpoint optimizer state", train_state.opt_state, ckpt_opt_state, ckpt_path)
+        train_state = train_state.replace(
+            step=jnp.asarray(ckpt_step),
+            params=_tree_to_jax(ckpt_params),
+            opt_state=_tree_to_jax(ckpt_opt_state),
+        )
+        return True
 
     init_ckpt = getattr(cfg, "init_from_checkpoint", None)
     if init_ckpt:
         ckpt, ckpt_path = _load_checkpoint(init_ckpt)
         init_ckpt_path = ckpt_path
-        ckpt_params = ckpt["params"]
-        _assert_param_compatible(ckpt_params, ckpt_path)
-        ckpt_params = jax.tree_util.tree_map(jnp.asarray, ckpt_params)
-        train_state = train_state.replace(params=ckpt_params)
+        resumed_full_state = _restore_train_state_from_checkpoint(ckpt, ckpt_path)
         if "normalizer_state" in ckpt:
-            normalizer_state = jax.tree_util.tree_map(jnp.asarray, ckpt["normalizer_state"])
+            _assert_tree_compatible("Checkpoint normalizer state", normalizer_state, ckpt["normalizer_state"], ckpt_path)
+            normalizer_state = _tree_to_jax(ckpt["normalizer_state"])
+        if resumed_full_state and "training_state" in ckpt:
+            runtime_state = ckpt["training_state"]
+            if "env_state" in runtime_state:
+                _assert_tree_compatible("Checkpoint env state", state, runtime_state["env_state"], ckpt_path)
+                state = _tree_to_jax(runtime_state["env_state"])
+            if "rng" in runtime_state:
+                rng = _tree_to_jax(runtime_state["rng"])
+            resume_runtime_state = runtime_state
         if getattr(cfg, "start_update_from_checkpoint", True):
             start_update = int(ckpt.get("update", 0)) + 1
+        resume_mode = "full training state" if resumed_full_state and resume_runtime_state is not None else "params/init state"
         print(
             f"[init] loaded checkpoint {ckpt_path} "
             f"(ckpt_update={ckpt.get('update', 'unknown')}, start_update={start_update}); "
-            "optimizer state is freshly initialized"
+            f"resume_mode={resume_mode}"
         )
 
     data_sharding, rollout_sharding, replicated_sharding, _train_devices = _make_train_shardings(cfg)
@@ -692,30 +744,32 @@ def main() -> None:
         init_checkpoint_path=init_ckpt_path,
     )
     eval_metric_fields = build_eval_metric_fields(eval_opponents)
-    with metrics_path.open("w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([
-            "update",
-            "sps",
-            "episode_reward",
-            "win_rate",
-            "mean_return",
-            "episodes_per_rollout",
-            "loss",
-            "policy_loss",
-            "value_loss",
-            "entropy",
-            "entropy_end",
-            "entropy_src",
-            "entropy_tgt",
-            "entropy_amt",
-            "approx_kl",
-            "clipfrac",
-            "max_abs_log_ratio",
-            "n_epochs_run",
-            "lr",
-            "ent_scale",
-            *eval_metric_fields,
-        ])
+    append_metrics = resumed_full_state and metrics_path.exists() and start_update > 1
+    with metrics_path.open("a" if append_metrics else "w", newline="", encoding="utf-8") as f:
+        if not append_metrics:
+            csv.writer(f).writerow([
+                "update",
+                "sps",
+                "episode_reward",
+                "win_rate",
+                "mean_return",
+                "episodes_per_rollout",
+                "loss",
+                "policy_loss",
+                "value_loss",
+                "entropy",
+                "entropy_end",
+                "entropy_src",
+                "entropy_tgt",
+                "entropy_amt",
+                "approx_kl",
+                "clipfrac",
+                "max_abs_log_ratio",
+                "n_epochs_run",
+                "lr",
+                "ent_scale",
+                *eval_metric_fields,
+            ])
     print(f"JAX trainer run_dir={run_dir} envs={cfg.ppo.num_envs} rollout_steps={cfg.ppo.rollout_steps} device={jax.devices()}")
 
     # 初始化 wandb（仅当配置开启且库可用时）
@@ -848,6 +902,31 @@ def main() -> None:
 
     def _copy_params(params):
         return jax.tree_util.tree_map(lambda x: x, params)
+
+    def _place_replicated_runtime_tree(value):
+        return _put_array_tree(_tree_to_jax(value), replicated_sharding)
+
+    if resume_runtime_state is not None:
+        if "opponent_params" in resume_runtime_state:
+            opponent_params = _place_replicated_runtime_tree(resume_runtime_state["opponent_params"])
+        if "lag_snapshot_params" in resume_runtime_state:
+            lag_snapshot_params = _place_replicated_runtime_tree(resume_runtime_state["lag_snapshot_params"])
+        if "lagged_params" in resume_runtime_state:
+            lagged_params = _place_replicated_runtime_tree(resume_runtime_state["lagged_params"])
+        if "snapshot_pool_entries" in resume_runtime_state:
+            snapshot_pool_entries = _place_replicated_runtime_tree(resume_runtime_state["snapshot_pool_entries"])
+        if "pool_entries" in resume_runtime_state:
+            pool_entries = _place_replicated_runtime_tree(resume_runtime_state["pool_entries"])
+        if "pool_phase" in resume_runtime_state:
+            pool_phase = int(resume_runtime_state["pool_phase"])
+        if "recent_nearest_win_rates" in resume_runtime_state:
+            recent_nearest_win_rates = list(resume_runtime_state["recent_nearest_win_rates"])
+        if "pool_rng_state" in resume_runtime_state:
+            pool_rng.setstate(resume_runtime_state["pool_rng_state"])
+        print(
+            f"[resume] restored runtime state: pool_phase={pool_phase} "
+            f"pool_entries={len(pool_entries)} snapshots={len(snapshot_pool_entries)}"
+        )
 
     def _pfsp_sample(entries: list[dict]) -> dict:
         weights = [(1.0 - float(entry["winrate"]) + 0.1) ** 2 for entry in entries]
@@ -1238,10 +1317,28 @@ def main() -> None:
         # ── 定期保存 checkpoint ───────────────────────────────────
         if update % checkpoint_every == 0:
             ckpt_path = run_dir / f"ckpt_{update:06d}.pkl"
+            params_host = jax.device_get(train_state.params)
+            normalizer_host = jax.device_get(normalizer_state)
+            training_state = {
+                "rng": jax.device_get(rng),
+                "env_state": jax.device_get(state),
+                "opponent_params": jax.device_get(opponent_params),
+                "lag_snapshot_params": jax.device_get(lag_snapshot_params),
+                "lagged_params": jax.device_get(lagged_params),
+                "snapshot_pool_entries": jax.device_get(snapshot_pool_entries),
+                "pool_entries": jax.device_get(pool_entries),
+                "pool_phase": int(pool_phase),
+                "recent_nearest_win_rates": list(recent_nearest_win_rates),
+                "pool_rng_state": pool_rng.getstate(),
+            }
             with open(ckpt_path, "wb") as f:
                 pickle.dump({
-                    "params": jax.device_get(train_state.params),
-                    "normalizer_state": jax.device_get(normalizer_state),
+                    "checkpoint_version": 2,
+                    # Legacy fields are kept for eval/export scripts and old init workflows.
+                    "params": params_host,
+                    "normalizer_state": normalizer_host,
+                    "train_state": _checkpoint_train_state_payload(train_state),
+                    "training_state": training_state,
                     "update": update,
                     "cfg": cfg,
                 }, f)

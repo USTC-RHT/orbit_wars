@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import pickle
 import random
 import sys
@@ -123,6 +124,45 @@ def _checkpoint_train_state_payload(train_state):
     }
 
 
+def _format_bytes(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024.0 or unit == units[-1]:
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{amount:.1f} TiB"
+
+
+def _check_nccl_shared_memory(device_count: int) -> None:
+    """Fail early for the common Docker /dev/shm limit that breaks NCCL."""
+    if device_count < 2:
+        return
+    if os.environ.get("NCCL_SHM_DISABLE", "").strip() == "1":
+        print("[multi-device] NCCL_SHM_DISABLE=1 is set; NCCL shared memory is disabled and multi-GPU may be slower")
+        return
+
+    shm_path = Path("/dev/shm")
+    if not shm_path.exists():
+        return
+
+    stats = os.statvfs(shm_path)
+    total = stats.f_frsize * stats.f_blocks
+    free = stats.f_frsize * stats.f_bavail
+    min_total = max(512 * 1024 * 1024, device_count * 256 * 1024 * 1024)
+    min_free = max(256 * 1024 * 1024, device_count * 128 * 1024 * 1024)
+    if total >= min_total and free >= min_free:
+        return
+
+    raise RuntimeError(
+        "Multi-GPU NCCL needs more /dev/shm space. "
+        f"Detected /dev/shm total={_format_bytes(total)}, free={_format_bytes(free)}, "
+        f"devices={device_count}. Start the container with a larger shared-memory mount, for example "
+        "`docker run --gpus all --ipc=host ...` or `docker run --gpus all --shm-size=16g ...`. "
+        "If you cannot change the container, set `NCCL_SHM_DISABLE=1` as a slower workaround."
+    )
+
+
 def _make_train_shardings(cfg):
     requested = bool(getattr(cfg, "multi_device", False)) or str(getattr(cfg, "device", "auto")).lower() in {
         "all",
@@ -142,6 +182,7 @@ def _make_train_shardings(cfg):
             f"multi_device requires ppo.num_envs ({cfg.ppo.num_envs}) to be divisible by "
             f"local device count ({len(devices)})."
         )
+    _check_nccl_shared_memory(len(devices))
     mesh = Mesh(np.asarray(devices), ("data",))
     data_sharding = NamedSharding(mesh, P("data"))
     rollout_sharding = NamedSharding(mesh, P(None, "data"))

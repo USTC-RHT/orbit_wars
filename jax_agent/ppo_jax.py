@@ -214,7 +214,17 @@ def compute_gae_state(rewards, dones, values, last_values, params: PPOParams):
     return compute_gae(rewards, dones, values, last_values, params)
 
 
-def _ppo_update_auto_impl(train_state: TrainState, rollout: AutoRollout, returns, advantages, params: PPOParams, rng, max_action_tokens: int, ent_scale=1.0):
+def _ppo_update_auto_impl(
+    train_state: TrainState,
+    rollout: AutoRollout,
+    returns,
+    advantages,
+    params: PPOParams,
+    rng,
+    max_action_tokens: int,
+    ent_scale=1.0,
+    local_shuffle_devices: int = 1,
+):
     """对自回归 rollout 执行一次 PPO 更新。
 
     一个 update 内包含多个 epoch，每个 epoch 随机打乱状态样本并切 minibatch。
@@ -224,6 +234,11 @@ def _ppo_update_auto_impl(train_state: TrainState, rollout: AutoRollout, returns
     size = flat["source_mask"].shape[0]
     states_per_minibatch = min(max(params.minibatch_size, 1), size)
     num_minibatches = max(size // states_per_minibatch, 1)
+    use_local_shuffle = (
+        local_shuffle_devices > 1
+        and size % local_shuffle_devices == 0
+        and states_per_minibatch % local_shuffle_devices == 0
+    )
     keys = [
         "loss",
         "policy_loss",
@@ -245,21 +260,49 @@ def _ppo_update_auto_impl(train_state: TrainState, rollout: AutoRollout, returns
         "seq_len_mean",
     ]
 
-    def run_epoch(ts, rng_in):
-        rng_in, rng_perm = jax.random.split(rng_in)
-        order = jax.random.permutation(rng_perm, size)
+    if use_local_shuffle:
+        local_size = size // local_shuffle_devices
+        local_states_per_minibatch = states_per_minibatch // local_shuffle_devices
 
-        def mb_body(i, mb_carry):
-            ts2, acc = mb_carry
-            idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
-            batch = {k: v[idx] for k, v in flat.items()}
-            ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
-            return ts2, {k: acc[k] + metrics[k] for k in acc}
+        def run_epoch(ts, rng_in):
+            rng_in, rng_perm = jax.random.split(rng_in)
+            perm_keys = jax.random.split(rng_perm, local_shuffle_devices)
+            local_order = jax.vmap(lambda k: jax.random.permutation(k, local_size))(perm_keys)
+            offsets = jnp.arange(local_shuffle_devices, dtype=local_order.dtype)[:, None] * local_size
+            order = local_order + offsets
 
-        init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
-        ts, sums = jax.lax.fori_loop(0, num_minibatches, mb_body, (ts, init_acc))
-        means = {k: sums[k] / num_minibatches for k in sums}
-        return ts, rng_in, means
+            def mb_body(i, mb_carry):
+                ts2, acc = mb_carry
+                local_idx = jax.lax.dynamic_slice(
+                    order,
+                    (0, i * local_states_per_minibatch),
+                    (local_shuffle_devices, local_states_per_minibatch),
+                )
+                idx = local_idx.reshape((states_per_minibatch,))
+                batch = {k: v[idx] for k, v in flat.items()}
+                ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
+                return ts2, {k: acc[k] + metrics[k] for k in acc}
+
+            init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
+            ts, sums = jax.lax.fori_loop(0, num_minibatches, mb_body, (ts, init_acc))
+            means = {k: sums[k] / num_minibatches for k in sums}
+            return ts, rng_in, means
+    else:
+        def run_epoch(ts, rng_in):
+            rng_in, rng_perm = jax.random.split(rng_in)
+            order = jax.random.permutation(rng_perm, size)
+
+            def mb_body(i, mb_carry):
+                ts2, acc = mb_carry
+                idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
+                batch = {k: v[idx] for k, v in flat.items()}
+                ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
+                return ts2, {k: acc[k] + metrics[k] for k in acc}
+
+            init_acc = {k: jnp.array(0.0, dtype=jnp.float32) for k in keys}
+            ts, sums = jax.lax.fori_loop(0, num_minibatches, mb_body, (ts, init_acc))
+            means = {k: sums[k] / num_minibatches for k in sums}
+            return ts, rng_in, means
 
     def cond_fn(carry):
         completed, _ts, _rng, _acc, last_kl = carry
@@ -286,7 +329,7 @@ def _ppo_update_auto_impl(train_state: TrainState, rollout: AutoRollout, returns
     return train_state, metrics
 
 
-ppo_update_auto = partial(jax.jit, static_argnames=("params", "max_action_tokens"))(_ppo_update_auto_impl)
+ppo_update_auto = partial(jax.jit, static_argnames=("params", "max_action_tokens", "local_shuffle_devices"))(_ppo_update_auto_impl)
 
 
 def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, replicated_sharding, rollout_sharding):
@@ -307,9 +350,12 @@ def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, repl
                 rng,
                 max_action_tokens,
                 ent_scale,
+                1,
             )
 
         return update
+
+    local_shuffle_devices = int(rollout_sharding.mesh.shape["data"])
 
     def update(train_state, rollout, returns, advantages, rng, ent_scale=1.0):
         return _ppo_update_auto_impl(
@@ -321,6 +367,7 @@ def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, repl
             rng,
             max_action_tokens,
             ent_scale,
+            local_shuffle_devices,
         )
 
     return jax.jit(

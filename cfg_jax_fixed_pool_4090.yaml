@@ -1,5 +1,5 @@
 seed: 42
-run_name: "jax_fixed_pool_with_mask-0605"
+run_name: "jax_fixed_pool_with_mask-0608"
 device: multi_gpu
 multi_device: true
 save_dir: ../kaggle
@@ -51,7 +51,7 @@ state_norm:
 
 ppo:
   rollout_steps: 128
-  num_envs: 128
+  num_envs: 512
   total_updates: 50000
   epochs: 4
   minibatch_size: 1024

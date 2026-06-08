@@ -34,6 +34,11 @@ def _load_model(ckpt_path: Path):
         max_planets=cfg.env.max_planets,
     ).max_fleets
     max_fleet_tokens = int(getattr(cfg.model, "max_fleet_tokens", 16))
+    num_transformer_layers = (
+        int(getattr(cfg.model, "num_transformer_layers", 2))
+        if bool(getattr(cfg.model, "use_transformer", False))
+        else 0
+    )
     model = AutoregressiveActorCritic(
         planet_dim=PLANET_DIM,
         relative_dim=RELATIVE_DIM,
@@ -44,7 +49,7 @@ def _load_model(ckpt_path: Path):
         use_cnn=cfg.model.use_cnn,
         fleet_dim=FLEET_DIM,
         max_fleet_tokens=max_fleet_tokens,
-        num_transformer_layers=int(getattr(cfg.model, "num_transformer_layers", 2)),
+        num_transformer_layers=num_transformer_layers,
         num_heads=int(getattr(cfg.model, "num_heads", 4)),
         max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
         end_bias_init=float(getattr(cfg.model, "end_bias_init", -2.0)),
@@ -63,7 +68,8 @@ def _load_model(ckpt_path: Path):
         "hidden_size": int(cfg.model.hidden_size),
         "use_cnn": bool(cfg.model.use_cnn),
         "max_fleet_tokens": max_fleet_tokens,
-        "num_transformer_layers": int(getattr(cfg.model, "num_transformer_layers", 2)),
+        "use_transformer": bool(getattr(cfg.model, "use_transformer", False)),
+        "num_transformer_layers": num_transformer_layers,
         "num_heads": int(getattr(cfg.model, "num_heads", 4)),
         "max_action_tokens": int(getattr(cfg.model, "max_action_tokens", 16)),
         "end_bias_init": float(getattr(cfg.model, "end_bias_init", -2.0)),

@@ -6,7 +6,7 @@
 - neutral_capture: 掌控中立星球奖励，较近且较早时加成。
 - enemy_capture: 占领敌方星球奖励。
 - lose_planet: 失去己方星球惩罚。
-- wasted_attack: 攻击己方星球惩罚。
+- wasted_attack: 己方舰队抵达非友方星球但未占领时的消耗惩罚。
 - shaped: 船/生产力/星球数增量奖励。
 """
 
@@ -33,7 +33,7 @@ class RewardParams:
     neutral_capture_early_steps: int = 150    # 早期加成步数界限
     enemy_capture_weight: float = 0.0         # 占领敌方星球奖励系数
     lose_planet_penalty: float = 0.0          # 失去星球惩罚系数
-    wasted_attack_penalty: float = 0.0        # 攻击己方惩罚系数
+    wasted_attack_penalty: float = 0.0        # 无效进攻惩罚系数
     step_clip: float = 0.0                    # 单步塑形奖励幅度剪裁
     failed_capture_penalty: float = 0.0       # 发射后 N 步内目标未变我方的惩罚
     failed_capture_window: int = 50           # 检测窗口（步数）
@@ -167,7 +167,7 @@ def lose_planet_reward(prev: EnvState, cur: EnvState, params: RewardParams) -> j
 
 
 def wasted_attack_reward(prev: EnvState, cur: EnvState, params: RewardParams) -> jnp.ndarray:
-    """攻击己方星球惩罚：己方舰队消失且父星球已属己等情况。"""
+    """惩罚己方舰队抵达非友方星球但未成功占领的消耗。"""
     if params.wasted_attack_penalty <= 0.0:
         return jnp.zeros_like(prev.step, dtype=jnp.float32)
     prev_owner = prev.fleets[..., 1].astype(jnp.int32)
@@ -175,7 +175,7 @@ def wasted_attack_reward(prev: EnvState, cur: EnvState, params: RewardParams) ->
     still_alive = (prev.fleets[..., 0, None] == cur_ids[:, None, :]).any(axis=-1)  # 己方舰队存活状态
     disappeared = prev.fleet_alive & (prev_owner == 0) & (~still_alive)
     target_owner = estimate_hit_owner(prev.fleets, cur.planets, cur.planet_alive)
-    wasted = disappeared & (target_owner != 0) & (target_owner != -999)  # 撤退/打击己方
+    wasted = disappeared & (target_owner != 0) & (target_owner != -999)
     return -jnp.where(wasted, params.wasted_attack_penalty * prev.fleets[..., 6], 0.0).sum(axis=-1)
 
 

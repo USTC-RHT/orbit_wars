@@ -45,6 +45,7 @@ class PPOParams:
     epochs: int = 4            # 每次 rollout 训练轮数
     minibatch_size: int = 4096 # 单个 minibatch 大小
     norm_adv: bool = True      # 是否对 advantage 做 batch 内平均方差归一化
+    clip_vloss: bool = True    # 是否使用 PPO value clipping
     target_kl: float = 0.05    # KL 早停阈值；epoch 平均 approx_kl > 1.5*target_kl 时停止剩余 epoch
 
 
@@ -465,7 +466,10 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         policy_loss = (l_end + l_src + l_tgt + l_amt) / 4.0
 
         value = _assert_all_finite("ppo_auto/value", outputs.value)
-        value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
+        if params.clip_vloss:
+            value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
+        else:
+            value_pred = value
         value_loss = jnp.square(batch["returns"] - value_pred).mean()
 
         ent_end = _fire_entropy(outputs.end_logits)

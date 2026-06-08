@@ -39,7 +39,7 @@ Expected output should include a CUDA/GPU device and `gpu` backend.
 ## Start Current Training
 
 ```bash
-python -m jax_agent.train_jax --config cfg_jax_fixed_pool_0522.yaml
+python -m jax_agent.train_jax --config cfg_jax_fixed_pool_4090.yaml
 ```
 
 For wandb online logging:
@@ -53,7 +53,9 @@ If the cloud platform cannot access wandb, change `wandb.mode` in the config to
 
 ## Notes
 
-- `cfg_jax_fixed_pool_0522.yaml` is currently set to `total_updates: 50000`.
+- `cfg_jax_fixed_pool_4090.yaml` is currently set to `total_updates: 50000`
+  and targets multi-GPU training. For a smaller local run, use
+  `cfg_jax_fixed_pool_0525.yaml`.
 - The config evaluates against `nearest`, `sigma`, `tamrazov`, and
   `pool_ckpt900`; bundled external opponents live under `rl-agent/agents/...`.
 - The requirements pin the Kaggle environment by Git commit to reduce mismatch

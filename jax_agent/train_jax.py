@@ -604,7 +604,7 @@ def auto_opponent_policy_actions(
 def main() -> None:
     """训练入口：解析参数、加载配置、初始化环境/模型/状态，循环执行 collect_and_update。"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="cfg_jax_default.yaml")
+    parser.add_argument("--config", default="cfg_jax_fixed_pool_4090.yaml")
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)
@@ -645,6 +645,7 @@ def main() -> None:
         epochs=cfg.ppo.epochs,
         minibatch_size=min(cfg.ppo.minibatch_size, cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets),
         norm_adv=cfg.ppo.norm_adv,
+        clip_vloss=cfg.ppo.clip_vloss,
         target_kl=getattr(cfg.ppo, "target_kl", 0.05),
     )
     bank_path = Path(args.bank)
@@ -674,7 +675,11 @@ def main() -> None:
         use_cnn=cfg.model.use_cnn,
         fleet_dim=FLEET_DIM,
         max_fleet_tokens=feat_params.max_fleet_tokens,
-        num_transformer_layers=getattr(cfg.model, "num_transformer_layers", 2),
+        num_transformer_layers=(
+            int(getattr(cfg.model, "num_transformer_layers", 2))
+            if bool(getattr(cfg.model, "use_transformer", False))
+            else 0
+        ),
         num_heads=getattr(cfg.model, "num_heads", 4),
         max_action_tokens=int(getattr(cfg.model, "max_action_tokens", 16)),
         end_bias_init=float(getattr(cfg.model, "end_bias_init", -2.0)),
@@ -932,12 +937,15 @@ def main() -> None:
     log_every = int(getattr(cfg, "log_every", 1))
     checkpoint_every = getattr(cfg, "checkpoint_every", 100)
 
-    # 冻结对手权重（初始与学习器相同，每 opponent_update_freq 步同步一次）
+    # 冻结对手策略（权重 + 输入归一化统计量，每 opponent_update_freq 步同步一次）。
     opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    opponent_normalizer_state = jax.tree_util.tree_map(lambda x: x, normalizer_state)
     # lag_snapshot 保存“上一个 interval 起点的策略”；新 lag_checkpoint/PFSP 接口到下一个
     # interval 时才发布，因此 lag 对手是真正间隔 pool_lag_interval 的 checkpoint。
     lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    lag_snapshot_normalizer_state = jax.tree_util.tree_map(lambda x: x, normalizer_state)
     lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    lagged_normalizer_state = jax.tree_util.tree_map(lambda x: x, normalizer_state)
     snapshot_pool_entries: list[dict] = []  # snapshot pool 快照列表
     pool_entries: list[dict] = []
     if use_pool and pfsp_pool:
@@ -954,10 +962,16 @@ def main() -> None:
     if resume_runtime_state is not None:
         if "opponent_params" in resume_runtime_state:
             opponent_params = _place_replicated_runtime_tree(resume_runtime_state["opponent_params"])
+        if "opponent_normalizer_state" in resume_runtime_state:
+            opponent_normalizer_state = _place_replicated_runtime_tree(resume_runtime_state["opponent_normalizer_state"])
         if "lag_snapshot_params" in resume_runtime_state:
             lag_snapshot_params = _place_replicated_runtime_tree(resume_runtime_state["lag_snapshot_params"])
+        if "lag_snapshot_normalizer_state" in resume_runtime_state:
+            lag_snapshot_normalizer_state = _place_replicated_runtime_tree(resume_runtime_state["lag_snapshot_normalizer_state"])
         if "lagged_params" in resume_runtime_state:
             lagged_params = _place_replicated_runtime_tree(resume_runtime_state["lagged_params"])
+        if "lagged_normalizer_state" in resume_runtime_state:
+            lagged_normalizer_state = _place_replicated_runtime_tree(resume_runtime_state["lagged_normalizer_state"])
         if "snapshot_pool_entries" in resume_runtime_state:
             snapshot_pool_entries = _place_replicated_runtime_tree(resume_runtime_state["snapshot_pool_entries"])
         if "pool_entries" in resume_runtime_state:
@@ -972,6 +986,21 @@ def main() -> None:
             f"[resume] restored runtime state: pool_phase={pool_phase} "
             f"pool_entries={len(pool_entries)} snapshots={len(snapshot_pool_entries)}"
         )
+        missing_runtime_normalizer = any(
+            params_key in resume_runtime_state and normalizer_key not in resume_runtime_state
+            for params_key, normalizer_key in (
+                ("opponent_params", "opponent_normalizer_state"),
+                ("lag_snapshot_params", "lag_snapshot_normalizer_state"),
+                ("lagged_params", "lagged_normalizer_state"),
+            )
+        )
+        if missing_runtime_normalizer:
+            print("[resume] warning: old checkpoint lacks frozen opponent normalizer state; using current normalizer fallback")
+        restored_entries = list(snapshot_pool_entries) + list(pool_entries)
+        if any(entry.get("type") == "lag" and "normalizer_state" not in entry for entry in restored_entries):
+            print("[resume] warning: old lag pool entries do not contain frozen normalizer_state; using current normalizer fallback")
+        if any("params" in entry and entry.get("params") is not None and "normalizer_state" not in entry for entry in snapshot_pool_entries):
+            print("[resume] warning: old snapshot entries do not contain frozen normalizer_state; using current normalizer fallback")
 
     def _pfsp_sample(entries: list[dict]) -> dict:
         weights = [(1.0 - float(entry["winrate"]) + 0.1) ** 2 for entry in entries]
@@ -980,11 +1009,15 @@ def main() -> None:
     def _pool_summary(entries: list[dict]) -> str:
         return ", ".join(f"{entry['id']}:{float(entry['winrate']):.2f}" for entry in entries)
 
-    def _add_lag_to_pool(update_idx: int, params) -> None:
+    def _entry_normalizer_state(entry: dict, fallback):
+        return entry.get("normalizer_state", fallback)
+
+    def _add_lag_to_pool(update_idx: int, params, normalizer) -> None:
         pool_entries.append({
             "id": f"selfplay-lag-{max(update_idx - pool_lag_interval, 0):06d}",
             "type": "lag",
             "params": _copy_params(params),
+            "normalizer_state": _copy_params(normalizer),
             "winrate": 0.5,
         })
         print(f"[pool] update={update_idx} 加入 50 步前 checkpoint，对手池: {_pool_summary(pool_entries)}")
@@ -1089,11 +1122,11 @@ def main() -> None:
 
     def _run_named_opponent(opponent_id: str, ts, st, ns, key, ent_scale):
         if opponent_id == "nearest":
-            return _run_step(_jit_nearest, ts, opponent_params, ns, st, ns, key, ent_scale)
+            return _run_step(_jit_nearest, ts, opponent_params, opponent_normalizer_state, st, ns, key, ent_scale)
         if opponent_id == "selfplay-current":
-            return _run_step(_jit_selfplay, ts, opponent_params, ns, st, ns, key, ent_scale)
+            return _run_step(_jit_selfplay, ts, opponent_params, opponent_normalizer_state, st, ns, key, ent_scale)
         if opponent_id == "selfplay-lag":
-            return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
+            return _run_step(_jit_selfplay, ts, lagged_params, lagged_normalizer_state, st, ns, key, ent_scale)
         raise ValueError(f"Unknown training opponent: {opponent_id}")
 
     for update in range(start_update, cfg.ppo.total_updates + 1):
@@ -1103,6 +1136,7 @@ def main() -> None:
         # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
         if (use_pool and current_pool) or ((update - 1) % max(opponent_update_freq, 1) == 0):
             opponent_params = _copy_params(train_state.params)
+            opponent_normalizer_state = _copy_params(normalizer_state)
             if self_play or use_pool:
                 print(f"[pool] update={update} 同步 selfplay-current 对手权重")
 
@@ -1141,28 +1175,35 @@ def main() -> None:
                     snap = pool_rng.choice(snapshot_pool_entries)
                     selected_pool_id = snap["id"]
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, snap["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay, train_state, snap["params"],
+                        _entry_normalizer_state(snap, normalizer_state),
+                        state, normalizer_state, step_key, ent_scale)
                 else:
                     selected_pool_id = "selfplay-current"
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay, train_state, opponent_params,
+                        opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
             else:
                 selected_pool_entry = _pfsp_sample(pool_entries)
                 selected_pool_id = str(selected_pool_entry["id"])
                 if selected_pool_entry["type"] == "nearest":
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_nearest, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_nearest, train_state, opponent_params,
+                        opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
                 elif selected_pool_entry["type"] == "current":
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay, train_state, opponent_params,
+                        opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
                 else:
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, selected_pool_entry["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay, train_state, selected_pool_entry["params"],
+                        _entry_normalizer_state(selected_pool_entry, normalizer_state),
+                        state, normalizer_state, step_key, ent_scale)
         else:
             if self_play and update % opponent_update_freq == 1:
                 pass  # 上面已经同步过 current 对手。
             train_state, state, normalizer_state, metrics = _run_step(
-                _jit_step, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
+                _jit_step, train_state, opponent_params, opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
         metrics = jax.device_get(metrics)
         current_lr = _current_lr(cfg, int(jax.device_get(train_state.step)), total_optimizer_steps, warmup_steps)
         metrics["lr"] = current_lr
@@ -1205,21 +1246,30 @@ def main() -> None:
         # snapshot pool：每 snapshot_interval 步存一个快照
         if use_pool and snapshot_pool and snapshot_interval > 0 and update % snapshot_interval == 0:
             snap_id = f"snap-{update:06d}"
-            snapshot_pool_entries.append({"id": snap_id, "params": _copy_params(train_state.params)})
+            snapshot_pool_entries.append({
+                "id": snap_id,
+                "params": _copy_params(train_state.params),
+                "normalizer_state": _copy_params(normalizer_state),
+            })
             print(f"[pool] update={update} 存入快照 {snap_id}，快照池大小={len(snapshot_pool_entries)}")
 
         if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
             if fixed_pool:
                 lagged_params = _copy_params(lag_snapshot_params)
+                lagged_normalizer_state = _copy_params(lag_snapshot_normalizer_state)
                 lag_snapshot_params = _copy_params(train_state.params)
+                lag_snapshot_normalizer_state = _copy_params(normalizer_state)
                 print(f"[pool] update={update} 发布 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
             elif lag_checkpoint_pool:
                 lagged_params = _copy_params(lag_snapshot_params)
+                lagged_normalizer_state = _copy_params(lag_snapshot_normalizer_state)
                 lag_snapshot_params = _copy_params(train_state.params)
+                lag_snapshot_normalizer_state = _copy_params(normalizer_state)
                 print(f"[pool] update={update} 发布 lag_checkpoint 对手权重 (lag={pool_lag_interval})")
             elif pfsp_pool:
-                _add_lag_to_pool(update, lag_snapshot_params)
+                _add_lag_to_pool(update, lag_snapshot_params, lag_snapshot_normalizer_state)
                 lag_snapshot_params = _copy_params(train_state.params)
+                lag_snapshot_normalizer_state = _copy_params(normalizer_state)
 
         eval_metrics = {field: "" for field in eval_metric_fields}
         _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
@@ -1377,8 +1427,11 @@ def main() -> None:
                 "rng": jax.device_get(rng),
                 "env_state": jax.device_get(state),
                 "opponent_params": jax.device_get(opponent_params),
+                "opponent_normalizer_state": jax.device_get(opponent_normalizer_state),
                 "lag_snapshot_params": jax.device_get(lag_snapshot_params),
+                "lag_snapshot_normalizer_state": jax.device_get(lag_snapshot_normalizer_state),
                 "lagged_params": jax.device_get(lagged_params),
+                "lagged_normalizer_state": jax.device_get(lagged_normalizer_state),
                 "snapshot_pool_entries": jax.device_get(snapshot_pool_entries),
                 "pool_entries": jax.device_get(pool_entries),
                 "pool_phase": int(pool_phase),
@@ -1387,7 +1440,7 @@ def main() -> None:
             }
             with open(ckpt_path, "wb") as f:
                 pickle.dump({
-                    "checkpoint_version": 2,
+                    "checkpoint_version": 3,
                     # Legacy fields are kept for eval/export scripts and old init workflows.
                     "params": params_host,
                     "normalizer_state": normalizer_host,
@@ -1443,7 +1496,7 @@ def collect_rollout_auto(
                 opponent_params,
                 model,
                 feat_params,
-                ns,
+                opponent_normalizer_state,
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,

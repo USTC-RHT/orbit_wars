@@ -1101,18 +1101,14 @@ def main() -> None:
             for entry, prob in ranked[:6]
         )
 
-    def _wandb_metric_name_part(value) -> str:
-        raw = str(value)
-        cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
-        return cleaned or "unknown"
-
     def _openai_five_quality_wandb_metrics() -> dict[str, float]:
         if not (use_pool and openai_five_pool and snapshot_pool_entries):
             return {}
         log_dict = {}
-        for entry in snapshot_pool_entries:
-            opponent_id = _wandb_metric_name_part(entry.get("id", "unknown"))
-            log_dict[f"pool_quality/{opponent_id}"] = float(entry.get("quality", 0.0))
+        max_slots = openai_five_max_past_opponents if openai_five_max_past_opponents > 0 else len(snapshot_pool_entries)
+        for slot, entry in enumerate(snapshot_pool_entries[:max_slots]):
+            slot_name = f"slot_{slot:02d}"
+            log_dict[f"pool_quality/{slot_name}"] = float(entry.get("quality", 0.0))
         return log_dict
 
     def _add_openai_five_snapshot(update_idx: int) -> None:
@@ -1618,7 +1614,8 @@ def main() -> None:
                 if openai_five_pool:
                     pool_log["pool/past_size"] = float(len(snapshot_pool_entries))
                     pool_log["pool/current_ratio"] = float(openai_five_current_ratio)
-                    pool_log.update(_openai_five_quality_wandb_metrics())
+                    if openai_five_snapshot_interval > 0 and update % openai_five_snapshot_interval == 0:
+                        pool_log.update(_openai_five_quality_wandb_metrics())
                 _wandb.log(pool_log, step=update)
 
         # ── 定期保存 checkpoint ───────────────────────────────────

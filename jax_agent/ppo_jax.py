@@ -224,6 +224,7 @@ def _ppo_update_auto_impl(
     max_action_tokens: int,
     ent_scale=1.0,
     local_shuffle_devices: int = 1,
+    batch_sharding=None,
 ):
     """对自回归 rollout 执行一次 PPO 更新。
 
@@ -279,7 +280,14 @@ def _ppo_update_auto_impl(
                     (local_shuffle_devices, local_states_per_minibatch),
                 )
                 idx = local_idx.reshape((states_per_minibatch,))
+                if batch_sharding is not None:
+                    idx = jax.lax.with_sharding_constraint(idx, batch_sharding)
                 batch = {k: v[idx] for k, v in flat.items()}
+                if batch_sharding is not None:
+                    batch = jax.tree_util.tree_map(
+                        lambda x: jax.lax.with_sharding_constraint(x, batch_sharding),
+                        batch,
+                    )
                 ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
                 return ts2, {k: acc[k] + metrics[k] for k in acc}
 
@@ -295,7 +303,14 @@ def _ppo_update_auto_impl(
             def mb_body(i, mb_carry):
                 ts2, acc = mb_carry
                 idx = jax.lax.dynamic_slice(order, (i * states_per_minibatch,), (states_per_minibatch,))
+                if batch_sharding is not None:
+                    idx = jax.lax.with_sharding_constraint(idx, batch_sharding)
                 batch = {k: v[idx] for k, v in flat.items()}
+                if batch_sharding is not None:
+                    batch = jax.tree_util.tree_map(
+                        lambda x: jax.lax.with_sharding_constraint(x, batch_sharding),
+                        batch,
+                    )
                 ts2, metrics = update_auto_minibatch(ts2, batch, params, ent_scale)
                 return ts2, {k: acc[k] + metrics[k] for k in acc}
 
@@ -329,7 +344,10 @@ def _ppo_update_auto_impl(
     return train_state, metrics
 
 
-ppo_update_auto = partial(jax.jit, static_argnames=("params", "max_action_tokens", "local_shuffle_devices"))(_ppo_update_auto_impl)
+ppo_update_auto = partial(
+    jax.jit,
+    static_argnames=("params", "max_action_tokens", "local_shuffle_devices", "batch_sharding"),
+)(_ppo_update_auto_impl)
 
 
 def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, replicated_sharding, rollout_sharding):
@@ -351,11 +369,13 @@ def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, repl
                 max_action_tokens,
                 ent_scale,
                 1,
+                None,
             )
 
         return update
 
     local_shuffle_devices = int(rollout_sharding.mesh.shape["data"])
+    batch_sharding = type(rollout_sharding)(rollout_sharding.mesh, jax.sharding.PartitionSpec("data"))
 
     def update(train_state, rollout, returns, advantages, rng, ent_scale=1.0):
         return _ppo_update_auto_impl(
@@ -368,6 +388,7 @@ def make_sharded_ppo_update_auto(params: PPOParams, max_action_tokens: int, repl
             max_action_tokens,
             ent_scale,
             local_shuffle_devices,
+            batch_sharding,
         )
 
     return jax.jit(

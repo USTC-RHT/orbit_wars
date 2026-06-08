@@ -1,0 +1,11 @@
+name: BC Agent
+description: Replay behavior cloning agent using the local JAX autoregressive Transformer.
+author: local
+license: Apache 2.0
+tags:
+  - mine
+  - imitation-learning
+  - replay-bc
+  - transformer
+  - experimental
+disabled: false

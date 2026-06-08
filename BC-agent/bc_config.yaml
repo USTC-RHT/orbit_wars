@@ -1,0 +1,47 @@
+seed: 7
+run_name: "bc_agent"
+device: cpu
+multi_device: false
+save_dir: checkpoints
+checkpoint_every: 1
+log_every: 1
+opponent: "replay_bc"
+
+env:
+  board_size: 100.0
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: false
+  attack_top_k: 15
+  defense_top_k: 8
+
+model:
+  actor_type: autoregressive
+  hidden_size: 64
+  use_cnn: false
+  use_transformer: true
+  num_transformer_layers: 1
+  num_heads: 4
+  max_fleet_tokens: 24
+  max_action_tokens: 12
+  end_bias_init: -2.0
+
+state_norm:
+  enabled: false
+  clip: 5.0
+  eps: 1.0e-8
+
+ppo:
+  lr: 3.0e-4
+  max_grad_norm: 1.0
+  minibatch_size: 64
+  epochs: 1
+  total_updates: 1
+  rollout_steps: 1
+  num_envs: 1
+
+wandb:
+  enabled: false

@@ -854,6 +854,10 @@ def main() -> None:
                 "max_fleet_tokens": feat_params.max_fleet_tokens,
                 "max_planets": cfg.env.max_planets,
                 "opponent": getattr(cfg, "opponent", "nearest"),
+                "pool_mode": getattr(cfg, "pool_mode", "pfsp"),
+                "openai_five_current_ratio": getattr(cfg, "openai_five_current_ratio", 0.8),
+                "openai_five_snapshot_interval": getattr(cfg, "openai_five_snapshot_interval", 100),
+                "openai_five_max_past_opponents": getattr(cfg, "openai_five_max_past_opponents", 24),
             },
             mode=getattr(cfg.wandb, "mode", "online"),
             group=getattr(cfg.wandb, "group", None) or None,
@@ -874,6 +878,7 @@ def main() -> None:
     # - lag_checkpoint: 全程/分阶段对 pool_lag_interval 步前 checkpoint。
     # - fixed_pool: 旧版固定池，Phase 1 nearest/current/lag，Phase 2 current/lag。
     # - pfsp: 胜率加权采样，优先训练当前打不过的对手。
+    # - openai_five: 80% 对最新参数，20% 对历史快照；历史对手按 softmax quality 采样。
     raw_pool_mode = str(getattr(cfg, "pool_mode", "pfsp") or "pfsp").lower()
     pool_mode_aliases = {
         "current": "current",
@@ -883,11 +888,14 @@ def main() -> None:
         "fixed_pool": "fixed_pool",
         "pfsp": "pfsp",
         "snapshot": "snapshot",
+        "openai_five": "openai_five",
+        "openai-five": "openai_five",
+        "oai_five": "openai_five",
     }
     if raw_pool_mode not in pool_mode_aliases:
         raise ValueError(
             f"Unknown pool_mode={raw_pool_mode!r}; expected one of "
-            "current, lag_checkpoint, fixed_pool, pfsp, snapshot"
+            "current, lag_checkpoint, fixed_pool, pfsp, snapshot, openai_five"
         )
     pool_mode = pool_mode_aliases[raw_pool_mode]
     current_pool = pool_mode == "current"
@@ -895,6 +903,7 @@ def main() -> None:
     fixed_pool = pool_mode == "fixed_pool"
     pfsp_pool = pool_mode == "pfsp"
     snapshot_pool = pool_mode == "snapshot"
+    openai_five_pool = pool_mode == "openai_five"
     phased_pool = lag_checkpoint_pool or fixed_pool
     lagged_pool = lag_checkpoint_pool or fixed_pool or pfsp_pool
     pool_phase = int(getattr(cfg, "pool_start_phase", 1)) if phased_pool else 1
@@ -904,6 +913,30 @@ def main() -> None:
     snapshot_interval = int(getattr(cfg, "snapshot_interval", 200)) if snapshot_pool else 0
     snapshot_current_ratio = float(getattr(cfg, "snapshot_current_ratio", 0.2)) if snapshot_pool else 0.0
     pool_max_size = int(getattr(cfg, "pool_max_size", 4)) if pfsp_pool else 0
+    openai_five_current_ratio = (
+        min(max(float(getattr(cfg, "openai_five_current_ratio", 0.8)), 0.0), 1.0)
+        if openai_five_pool else 0.0
+    )
+    openai_five_snapshot_interval = (
+        max(int(getattr(cfg, "openai_five_snapshot_interval", 100)), 0)
+        if openai_five_pool else 0
+    )
+    openai_five_quality_lr = (
+        max(float(getattr(cfg, "openai_five_quality_lr", 0.01)), 0.0)
+        if openai_five_pool else 0.0
+    )
+    openai_five_temperature = (
+        max(float(getattr(cfg, "openai_five_temperature", 1.0)), 1.0e-6)
+        if openai_five_pool else 1.0
+    )
+    openai_five_max_past_opponents = (
+        max(int(getattr(cfg, "openai_five_max_past_opponents", 24)), 0)
+        if openai_five_pool else 0
+    )
+    openai_five_include_nearest = (
+        bool(getattr(cfg, "openai_five_include_nearest", True))
+        if openai_five_pool else False
+    )
     promote_nearest_win_rate = float(getattr(cfg, "promote_nearest_win_rate", 0.8)) if phased_pool else 0.0
     promote_consecutive_evals = int(getattr(cfg, "promote_consecutive_evals", 3)) if phased_pool else 0
     recent_nearest_win_rates: list[float] = []
@@ -920,6 +953,17 @@ def main() -> None:
             )
         elif snapshot_pool:
             print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
+        elif openai_five_pool:
+            print(
+                "opponent=pool openai_five "
+                f"(current_ratio={openai_five_current_ratio:.0%}, "
+                f"past_ratio={1.0 - openai_five_current_ratio:.0%}, "
+                f"snapshot_interval={openai_five_snapshot_interval}, "
+                f"max_past={openai_five_max_past_opponents}, "
+                f"include_nearest={openai_five_include_nearest}, "
+                f"quality_lr={openai_five_quality_lr:.4f}, "
+                f"temperature={openai_five_temperature:.3f})"
+            )
         else:
             print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size}, "
                   f"include_nearest={pool_include_nearest})")
@@ -1011,6 +1055,118 @@ def main() -> None:
 
     def _entry_normalizer_state(entry: dict, fallback):
         return entry.get("normalizer_state", fallback)
+
+    def _ensure_openai_five_nearest_entry() -> None:
+        if not (use_pool and openai_five_pool and openai_five_include_nearest):
+            return
+        if any(entry.get("type") == "nearest" or entry.get("id") == "nearest" for entry in snapshot_pool_entries):
+            return
+        snapshot_pool_entries.insert(0, {
+            "id": "nearest",
+            "type": "nearest",
+            "quality": 0.0,
+            "games": 0.0,
+            "current_win_rate": 0.5,
+        })
+
+    def _openai_five_past_probs(entries: list[dict]) -> list[float]:
+        if not entries:
+            return []
+        qualities = [float(entry.get("quality", 0.0)) for entry in entries]
+        max_quality = max(qualities)
+        weights = [
+            math.exp((quality - max_quality) / openai_five_temperature)
+            for quality in qualities
+        ]
+        total = sum(weights)
+        if total <= 0.0 or not math.isfinite(total):
+            return [1.0 / len(entries)] * len(entries)
+        return [weight / total for weight in weights]
+
+    def _openai_five_sample_past(entries: list[dict]) -> tuple[dict, float]:
+        probs = _openai_five_past_probs(entries)
+        if not probs:
+            raise ValueError("OpenAI Five opponent pool has no past opponents to sample")
+        idx = pool_rng.choices(range(len(entries)), weights=probs, k=1)[0]
+        return entries[idx], float(probs[idx])
+
+    def _openai_five_pool_summary(entries: list[dict]) -> str:
+        if not entries:
+            return "empty"
+        probs = _openai_five_past_probs(entries)
+        items = zip(entries, probs, strict=True)
+        ranked = sorted(items, key=lambda item: float(item[0].get("quality", 0.0)), reverse=True)
+        return ", ".join(
+            f"{entry['id']}:q={float(entry.get('quality', 0.0)):.3f}/p={prob:.3f}"
+            for entry, prob in ranked[:6]
+        )
+
+    def _wandb_metric_name_part(value) -> str:
+        raw = str(value)
+        cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+        return cleaned or "unknown"
+
+    def _openai_five_quality_wandb_metrics() -> dict[str, float]:
+        if not (use_pool and openai_five_pool and snapshot_pool_entries):
+            return {}
+        log_dict = {}
+        for entry in snapshot_pool_entries:
+            opponent_id = _wandb_metric_name_part(entry.get("id", "unknown"))
+            log_dict[f"pool_quality/{opponent_id}"] = float(entry.get("quality", 0.0))
+        return log_dict
+
+    def _add_openai_five_snapshot(update_idx: int) -> None:
+        max_quality = max(
+            (float(entry.get("quality", 0.0)) for entry in snapshot_pool_entries),
+            default=0.0,
+        )
+        snapshot_pool_entries.append({
+            "id": f"oai5-past-{update_idx:06d}",
+            "params": _copy_params(train_state.params),
+            "normalizer_state": _copy_params(normalizer_state),
+            "quality": max_quality,
+            "games": 0.0,
+            "current_win_rate": 0.5,
+        })
+        print(
+            f"[pool] update={update_idx} OpenAI Five 历史池加入当前快照，"
+            f"past_size={len(snapshot_pool_entries)}，分布: "
+            f"{_openai_five_pool_summary(snapshot_pool_entries)}"
+        )
+        _prune_openai_five_pool(update_idx)
+
+    def _prune_openai_five_pool(update_idx: int) -> None:
+        if openai_five_max_past_opponents <= 0:
+            return
+        while len(snapshot_pool_entries) > openai_five_max_past_opponents:
+            victim = min(
+                snapshot_pool_entries,
+                key=lambda entry: (float(entry.get("quality", 0.0)), str(entry.get("id", ""))),
+            )
+            snapshot_pool_entries.remove(victim)
+            print(
+                f"[pool] update={update_idx} OpenAI Five 历史池超出 "
+                f"{openai_five_max_past_opponents}，移除 {victim['id']} "
+                f"(quality={float(victim.get('quality', 0.0)):.3f})"
+            )
+
+    def _update_openai_five_quality(entry: dict, selected_prob: float, metrics: dict) -> None:
+        episodes = float(metrics.get("episodes_per_rollout", 0.0))
+        if episodes <= 0.0 or selected_prob <= 0.0 or not snapshot_pool_entries:
+            return
+        current_win_rate = float(metrics["win_rate"])
+        n = max(len(snapshot_pool_entries), 1)
+        old_quality = float(entry.get("quality", 0.0))
+        delta = openai_five_quality_lr * current_win_rate / max(n * selected_prob, 1.0e-8)
+        entry["quality"] = old_quality - delta
+        entry["games"] = float(entry.get("games", 0.0)) + episodes
+        old_wr = float(entry.get("current_win_rate", 0.5))
+        entry["current_win_rate"] = 0.95 * old_wr + 0.05 * current_win_rate
+        metrics["pool_selected_quality"] = float(entry["quality"])
+        metrics["pool_selected_probability"] = float(selected_prob)
+
+    _ensure_openai_five_nearest_entry()
+    _prune_openai_five_pool(start_update - 1)
 
     def _add_lag_to_pool(update_idx: int, params, normalizer) -> None:
         pool_entries.append({
@@ -1132,9 +1288,10 @@ def main() -> None:
     for update in range(start_update, cfg.ppo.total_updates + 1):
         selected_pool_entry = None
         selected_pool_id = ""
+        selected_pool_probability = 0.0
 
         # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
-        if (use_pool and current_pool) or ((update - 1) % max(opponent_update_freq, 1) == 0):
+        if (use_pool and (current_pool or openai_five_pool)) or ((update - 1) % max(opponent_update_freq, 1) == 0):
             opponent_params = _copy_params(train_state.params)
             opponent_normalizer_state = _copy_params(normalizer_state)
             if self_play or use_pool:
@@ -1169,6 +1326,25 @@ def main() -> None:
                     step_key,
                     ent_scale,
                 )
+            elif openai_five_pool:
+                use_past = snapshot_pool_entries and pool_rng.random() >= openai_five_current_ratio
+                if use_past:
+                    selected_pool_entry, selected_pool_probability = _openai_five_sample_past(snapshot_pool_entries)
+                    selected_pool_id = str(selected_pool_entry["id"])
+                    if selected_pool_entry.get("type") == "nearest":
+                        train_state, state, normalizer_state, metrics = _run_step(
+                            _jit_nearest, train_state, opponent_params,
+                            opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
+                    else:
+                        train_state, state, normalizer_state, metrics = _run_step(
+                            _jit_selfplay, train_state, selected_pool_entry["params"],
+                            _entry_normalizer_state(selected_pool_entry, normalizer_state),
+                            state, normalizer_state, step_key, ent_scale)
+                else:
+                    selected_pool_id = "selfplay-current"
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay, train_state, opponent_params,
+                        opponent_normalizer_state, state, normalizer_state, step_key, ent_scale)
             elif snapshot_pool:
                 # 20% 打当前策略，80% 打历史快照；若快照池为空则全打当前
                 if snapshot_pool_entries and pool_rng.random() >= snapshot_current_ratio:
@@ -1212,6 +1388,8 @@ def main() -> None:
             old_wr = float(selected_pool_entry["winrate"])
             selected_pool_entry["winrate"] = 0.95 * old_wr + 0.05 * float(metrics["win_rate"])
             metrics["pool_selected_winrate"] = selected_pool_entry["winrate"]
+        if use_pool and openai_five_pool and selected_pool_entry is not None:
+            _update_openai_five_quality(selected_pool_entry, selected_pool_probability, metrics)
         elapsed = time.perf_counter() - start
         samples = cfg.ppo.num_envs * cfg.ppo.rollout_steps
         sps = samples / max(elapsed, 1e-9)
@@ -1228,6 +1406,13 @@ def main() -> None:
             if pfsp_pool:
                 selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
                 line += f" opp={selected_pool_id} opp_wr={selected_wr:.3f}"
+            elif openai_five_pool:
+                line += f" opp={selected_pool_id}"
+                if selected_pool_entry is not None:
+                    line += (
+                        f" opp_q={float(selected_pool_entry.get('quality', 0.0)):.3f}"
+                        f" opp_p={selected_pool_probability:.3f}"
+                    )
             else:
                 line += f" opp={selected_pool_id}"
         line += (
@@ -1252,6 +1437,14 @@ def main() -> None:
                 "normalizer_state": _copy_params(normalizer_state),
             })
             print(f"[pool] update={update} 存入快照 {snap_id}，快照池大小={len(snapshot_pool_entries)}")
+
+        if (
+            use_pool
+            and openai_five_pool
+            and openai_five_snapshot_interval > 0
+            and update % openai_five_snapshot_interval == 0
+        ):
+            _add_openai_five_snapshot(update)
 
         if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
             if fixed_pool:
@@ -1337,11 +1530,15 @@ def main() -> None:
                         fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
                     elif fixed_pool:
                         fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                    elif openai_five_pool:
+                        fixed_size = len(snapshot_pool_entries) + 1
                     else:
                         fixed_size = len(pool_entries)
                     if phased_pool:
                         log_dict["pool/phase"] = float(pool_phase)
                     log_dict["pool/size"] = float(len(pool_entries) if pfsp_pool else fixed_size)
+                    if openai_five_pool:
+                        log_dict["pool/past_size"] = float(len(snapshot_pool_entries))
                     if phased_pool and recent_nearest_win_rates:
                         log_dict["pool/recent_nearest_win_rate"] = float(np.mean(recent_nearest_win_rates))
                 _wandb.log(log_dict, step=update)
@@ -1410,12 +1607,18 @@ def main() -> None:
                     fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
                 elif fixed_pool:
                     fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                elif openai_five_pool:
+                    fixed_size = len(snapshot_pool_entries) + 1
                 else:
                     fixed_size = len(pool_entries)
                 pool_log = {"pool/size": float(len(pool_entries) if pfsp_pool else fixed_size)}
                 if pfsp_pool:
                     selected_wr = float(selected_pool_entry["winrate"]) if selected_pool_entry is not None else 0.0
                     pool_log["pool/selected_win_rate"] = selected_wr
+                if openai_five_pool:
+                    pool_log["pool/past_size"] = float(len(snapshot_pool_entries))
+                    pool_log["pool/current_ratio"] = float(openai_five_current_ratio)
+                    pool_log.update(_openai_five_quality_wandb_metrics())
                 _wandb.log(pool_log, step=update)
 
         # ── 定期保存 checkpoint ───────────────────────────────────

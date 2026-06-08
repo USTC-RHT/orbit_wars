@@ -166,6 +166,14 @@ class TrainConfig:
     pool_max_size: int = 4
     promote_nearest_win_rate: float = 0.8
     promote_consecutive_evals: int = 3
+    # OpenAI Five 风格对手管理：80% 打最新策略，20% 打历史快照；
+    # 历史快照按 softmax(quality / temperature) 动态采样。
+    openai_five_current_ratio: float = 0.8
+    openai_five_snapshot_interval: int = 100
+    openai_five_quality_lr: float = 0.01
+    openai_five_temperature: float = 1.0
+    openai_five_max_past_opponents: int = 24
+    openai_five_include_nearest: bool = True
     # 快照池：每 snapshot_interval 存一个快照，按 snapshot_current_ratio 概率选当前策略
     snapshot_interval: int = 200
     snapshot_current_ratio: float = 0.2

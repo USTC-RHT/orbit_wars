@@ -1,5 +1,5 @@
 seed: 42
-run_name: "jax_fixed_pool_with_mask-0608"
+run_name: "jax_openai_five_pool_with_mask-0608"
 device: multi_gpu
 multi_device: true
 save_dir: ../kaggle
@@ -50,10 +50,10 @@ state_norm:
   eps: 1.0e-8
 
 ppo:
-  rollout_steps: 128
+  rollout_steps: 32
   num_envs: 512
   total_updates: 50000
-  epochs: 4
+  epochs: 2
   minibatch_size: 1024
   gamma: 0.99
   gae_lambda: 0.95
@@ -73,21 +73,27 @@ ppo:
   clip_vloss: true
   target_kl: 0.02
 
-self_play_update_interval: 50
-pool_mode: fixed_pool
+self_play_update_interval: 1
+pool_mode: openai_five
+openai_five_current_ratio: 0.80
+openai_five_snapshot_interval: 100
+openai_five_quality_lr: 0.01
+openai_five_temperature: 1.0
+openai_five_max_past_opponents: 24
+openai_five_include_nearest: true
 pool_start_phase: 2
 pool_lag_interval: 100
 fixed_pool_current_ratio: 0.75
 
 eval:
   enabled: true
-  every: 1000
+  every: 300
   nearest_every: 50
-  slow_every: 1000
+  slow_every: 300
   games: 20
   seed: 200000
   player: 1
-  opponents: ["sigma", "tamrazov", "pool_ckpt900"]
+  opponents: ["tamrazov", "pool_ckpt900"]
 
 wandb:
   enabled: true
@@ -97,6 +103,6 @@ wandb:
   tags:
     - autoregressive
     - v1
-    - fixed_pool
+    - openai_five_pool
     - rtx4090
     - 4gpu

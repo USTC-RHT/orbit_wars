@@ -158,6 +158,8 @@ class TrainConfig:
     pool_mode: str = "pfsp"
     pool_start_phase: int = 1
     pool_include_nearest: bool = True
+    fixed_pool_phase1_opponents: list[str] = field(default_factory=lambda: ["nearest", "selfplay-current", "selfplay-lag"])
+    fixed_pool_phase2_opponents: list[str] = field(default_factory=lambda: ["selfplay-current", "selfplay-lag"])
     pool_lag_checkpoint_phase1_opponents: list[str] = field(default_factory=lambda: ["selfplay-lag"])
     pool_lag_checkpoint_phase2_opponents: list[str] = field(default_factory=lambda: ["selfplay-current", "selfplay-lag"])
     pool_lag_interval: int = 50

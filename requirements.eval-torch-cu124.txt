@@ -1,0 +1,9 @@
+# Minimal dependency patch for torch-backed eval opponents on CUDA 12.4 drivers.
+#
+# Use this inside an existing JAX training environment when eval fails with:
+#   ModuleNotFoundError: No module named 'torch'
+# or when a newer torch wheel such as cu130 cannot initialize CUDA on a 12.4
+# driver.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124

@@ -1,6 +1,9 @@
 # Cloud GPU training environment for the current JAX autoregressive PPO stack.
 # Python: 3.12
 # Recommended GPU stack: NVIDIA driver with CUDA 12 support.
+#
+# Existing env only missing torch for external eval? Prefer:
+#   python -m pip install -r requirements.eval-torch-cu124.txt
 
 absl-py==2.4.0
 chex==0.1.91
@@ -21,6 +24,12 @@ scipy==1.17.1
 seaborn==0.13.2
 tqdm==4.67.3
 wandb==0.26.1
+
+# Needed by agents/external/slawekbiel-producer during eval.
+# Kaggle/local driver in this workspace reports CUDA driver 12.4, so avoid the
+# default PyPI torch wheel that currently resolves to CUDA 13.0.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
 
 # Kaggle Orbit Wars environment. This pins the exact source currently installed
 # in the local training env rather than relying on PyPI drift.

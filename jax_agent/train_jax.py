@@ -63,7 +63,13 @@ from .ppo_jax import (
     safe_logits,
 )  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
-from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
+from .train_opponents import nearest_opponent_actions, producer_opponent_actions, selfplay_policy_actions  # noqa: E402
+from .train_opponents.producer_jax import (  # noqa: E402
+    empty_producer_memory_for_state,
+    producer_opponent_plan_with_memory,
+    reset_producer_memory_done,
+    update_batched_producer_memory_after_step_jax,
+)
 
 NEG_INF = -1.0e9
 
@@ -797,12 +803,30 @@ def main() -> None:
         print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除{reason}，"
               f"对手池: {_pool_summary(pool_entries)}")
 
-    fixed_phase1_opponents = ["nearest", "selfplay-current", "selfplay-lag"]
-    fixed_phase2_opponents = ["selfplay-current", "selfplay-lag"]
+    fixed_phase1_opponents = list(getattr(
+        cfg,
+        "fixed_pool_phase1_opponents",
+        ["nearest", "selfplay-current", "selfplay-lag"],
+    ))
+    fixed_phase2_opponents = list(getattr(
+        cfg,
+        "fixed_pool_phase2_opponents",
+        ["selfplay-current", "selfplay-lag"],
+    ))
     current_opponents = ["selfplay-current"]
     lag_checkpoint_phase1_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase1_opponents", ["selfplay-lag"]))
     lag_checkpoint_phase2_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase2_opponents", ["selfplay-current", "selfplay-lag"]))
-    valid_fixed_opponents = {"nearest", "selfplay-current", "selfplay-lag"}
+    valid_fixed_opponents = {"nearest", "producer-jax", "selfplay-current", "selfplay-lag"}
+    if fixed_pool:
+        for phase_name, phase_opponents in (
+            ("fixed_pool_phase1_opponents", fixed_phase1_opponents),
+            ("fixed_pool_phase2_opponents", fixed_phase2_opponents),
+        ):
+            if not phase_opponents:
+                raise ValueError(f"{phase_name} must contain at least one opponent")
+            invalid = sorted(set(phase_opponents) - valid_fixed_opponents)
+            if invalid:
+                raise ValueError(f"{phase_name} contains unknown opponents: {invalid}")
     if lag_checkpoint_pool:
         for phase_name, phase_opponents in (
             ("pool_lag_checkpoint_phase1_opponents", lag_checkpoint_phase1_opponents),
@@ -827,6 +851,13 @@ def main() -> None:
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
             ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
+            max_action_tokens=max_action_tokens,
+        )
+    )
+    _jit_producer = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            reward_params, ppo_params, model, cfg.ppo.rollout_steps, "producer-jax",
             max_action_tokens=max_action_tokens,
         )
     )
@@ -861,6 +892,8 @@ def main() -> None:
             return _run_step(_jit_selfplay, ts, opponent_params, ns, st, ns, key, ent_scale)
         if opponent_id == "selfplay-lag":
             return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
+        if opponent_id == "producer-jax":
+            return _run_step(_jit_producer, ts, opponent_params, ns, st, ns, key, ent_scale)
         raise ValueError(f"Unknown training opponent: {opponent_id}")
 
     for update in range(start_update, cfg.ppo.total_updates + 1):
@@ -1169,14 +1202,17 @@ def collect_rollout_auto(
     支持 nearest 规则对手，以及自回归 self-play / pool 对手。
     """
     rng, rollout_key = jax.random.split(rng)
+    producer_memory0 = empty_producer_memory_for_state(state, player_count=2)
 
     def body(carry, _):
-        ts, st, ns, key = carry
+        ts, st, ns, key, producer_memory = carry
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
+        producer_memory_next = producer_memory
+        producer_entries = None
         if opponent_kind == "selfplay":
             opponent_actions = auto_opponent_policy_actions(
                 st,
@@ -1189,6 +1225,12 @@ def collect_rollout_auto(
                 flip_state_fn=flip_state,
                 rng=opp_key,
             )
+        elif opponent_kind == "producer-jax":
+            opponent_actions, producer_entries = producer_opponent_plan_with_memory(
+                st,
+                producer_memory,
+                max_actions=env_params.max_actions,
+            )
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
         joint = jnp.stack([learner_actions, opponent_actions], axis=1)
@@ -1197,6 +1239,14 @@ def collect_rollout_auto(
         done = next_state.done
         reset_state = reset_from_bank(bank, reset_key, st.planets.shape[0])
         next_state = replace_done(next_state, reset_state)
+        if opponent_kind == "producer-jax":
+            producer_memory_next = update_batched_producer_memory_after_step_jax(
+                producer_memory,
+                producer_entries,
+                st,
+                next_state,
+            )
+        producer_memory_next = reset_producer_memory_done(producer_memory_next, done)
         row = AutoRollout(
             encoded.planet_features,
             encoded.relative_features,
@@ -1223,11 +1273,11 @@ def collect_rollout_auto(
             reward_env,
             done,
         )
-        return (ts, next_state, ns, key), row
+        return (ts, next_state, ns, key, producer_memory_next), row
 
-    (train_state, state, normalizer_state, rng), rollout = jax.lax.scan(
+    (train_state, state, normalizer_state, rng, _producer_memory), rollout = jax.lax.scan(
         body,
-        (train_state, state, normalizer_state, rollout_key),
+        (train_state, state, normalizer_state, rollout_key, producer_memory0),
         None,
         length=rollout_steps,
     )

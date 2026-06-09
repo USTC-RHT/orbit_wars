@@ -48,6 +48,7 @@ model:
   num_transformer_layers: 2
   num_heads: 4
   max_fleet_tokens: 40
+  fleet_selection: impact
   max_action_tokens: 12
   end_bias_init: -3.0
 

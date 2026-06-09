@@ -60,6 +60,7 @@ class FeatureParams:
     attack_top_k: int = 6         # 最多保留 K 个进攻候选
     defense_top_k: int = 3        # 最多保留 K 个防守/输送候选
     max_fleet_tokens: int = MAX_FLEET_TOKENS
+    fleet_selection: str = "size"  # size=大舰队优先；impact=2P-Improve 威胁/机会优先
 
     @classmethod
     def from_train_config(cls, cfg) -> "FeatureParams":
@@ -74,6 +75,7 @@ class FeatureParams:
             attack_top_k=int(cfg.env.attack_top_k),
             defense_top_k=int(cfg.env.defense_top_k),
             max_fleet_tokens=int(getattr(model_cfg, "max_fleet_tokens", MAX_FLEET_TOKENS)),
+            fleet_selection=str(getattr(model_cfg, "fleet_selection", "size")),
         )
 
 
@@ -552,8 +554,12 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
     """构建单局 top-K 舰队 token，用于 Transformer 编码。"""
     fleets = state.fleets
     alive = state.fleet_alive
+    fleet_target, fleet_target_valid, fleet_target_t = predict_fleet_targets(state)
     dist_center = jnp.sqrt((fleets[:, 2] - CENTER) ** 2 + (fleets[:, 3] - CENTER) ** 2)
-    score = jnp.where(alive, -fleets[:, 6] + 0.01 * dist_center, jnp.inf)
+    if params.fleet_selection == "impact":
+        score = fleet_impact_score(state, params, fleet_target, fleet_target_valid, fleet_target_t, dist_center)
+    else:
+        score = jnp.where(alive, -fleets[:, 6] + 0.01 * dist_center, jnp.inf)
     order = jnp.argsort(score)[: params.max_fleet_tokens]
     sel = fleets[order]
     sel_alive = alive[order]
@@ -564,7 +570,6 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
     has_from = planet_match.any(axis=0)
     from_planets = state.planets[from_slot]
     speed = fleet_speed(jnp.maximum(sel[:, 6], 1.0))
-    fleet_target, fleet_target_valid, fleet_target_t = predict_fleet_targets(state)
     target_idx = fleet_target[order]
     target_valid = sel_alive & fleet_target_valid[order]
     target_planets = state.planets[target_idx]
@@ -621,6 +626,53 @@ def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.nd
         axis=-1,
     )
     return jnp.where(sel_alive[:, None], features, 0.0), sel_alive
+
+
+def fleet_impact_score(
+    state: EnvState,
+    params: FeatureParams,
+    fleet_target: jnp.ndarray,
+    fleet_target_valid: jnp.ndarray,
+    fleet_target_t: jnp.ndarray,
+    dist_center: jnp.ndarray,
+) -> jnp.ndarray:
+    """2P-Improve fleet top-K：优先保留威胁、进攻机会、紧迫 ETA 和高价值目标。"""
+
+    fleets = state.fleets
+    alive = state.fleet_alive
+    owner = fleets[:, 1].astype(jnp.int32)
+    safe_target = jnp.clip(fleet_target, 0, state.planets.shape[0] - 1)
+    target_planets = state.planets[safe_target]
+    target_owner = target_planets[:, 1].astype(jnp.int32)
+    target_valid = alive & fleet_target_valid
+
+    target_is_mine = target_valid & (target_owner == 0)
+    target_is_enemy = target_valid & (target_owner == 1)
+    target_is_neutral = target_valid & (target_owner == -1)
+    is_my_fleet = owner == 0
+    is_enemy_fleet = owner == 1
+
+    eta_norm = jnp.clip(fleet_target_t / INBOUND_HORIZON, 0.0, 1.0)
+    urgency = jnp.where(target_valid, 1.0 - eta_norm, 0.0)
+    ships_norm = clip01(fleets[:, 6] / params.max_ships)
+    target_prod_norm = jnp.where(target_valid, target_planets[:, 6] / params.max_production, 0.0)
+    target_ships_norm = jnp.where(target_valid, clip01(target_planets[:, 5] / params.max_ships), 0.0)
+
+    enemy_to_my = is_enemy_fleet & target_is_mine
+    my_to_attack = is_my_fleet & (target_is_enemy | target_is_neutral)
+    enemy_to_neutral = is_enemy_fleet & target_is_neutral
+    my_reinforce = is_my_fleet & target_is_mine
+    importance = (
+        3.0 * enemy_to_my.astype(jnp.float32)
+        + 1.6 * my_to_attack.astype(jnp.float32)
+        + 0.8 * enemy_to_neutral.astype(jnp.float32)
+        + 0.7 * my_reinforce.astype(jnp.float32)
+        + 1.2 * urgency
+        + 1.0 * ships_norm
+        + 0.8 * target_prod_norm
+        + 0.4 * target_ships_norm
+    )
+    return jnp.where(alive, -importance + 1.0e-4 * dist_center / BOARD_SIZE, jnp.inf)
 
 
 def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:

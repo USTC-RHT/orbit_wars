@@ -97,7 +97,7 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["nearest", "slawekbiel-producer", "tamrazov", "pool_ckpt900"]
+  opponents: ["slawekbiel-producer", "tamrazov", "pool_ckpt900"]
 
 wandb:
   enabled: true

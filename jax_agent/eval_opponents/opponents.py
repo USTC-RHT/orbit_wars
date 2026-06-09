@@ -92,8 +92,12 @@ class ExternalScriptOpponent:
         module = importlib.util.module_from_spec(spec)
         old_path = list(sys.path)
         try:
+            sys.modules[module_name] = module
             sys.path.insert(0, str(self.agent_dir))
             spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         finally:
             sys.path = old_path
         agent = getattr(module, "agent", None)
@@ -272,6 +276,13 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             metric_prefix="sigma",
             agent_dir=external_root / "sigmaborov-reinforce",
             seed_offset=7919,
+        ))
+    if "producer" in enabled or "slawekbiel-producer" in enabled:
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="slawekbiel-producer",
+            metric_prefix="producer",
+            agent_dir=external_root / "slawekbiel-producer",
+            seed_offset=15485863,
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:
         opponents.append(ExternalScriptJaxEvalOpponent(

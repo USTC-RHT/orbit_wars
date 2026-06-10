@@ -599,9 +599,9 @@ def main() -> None:
         ckpt, ckpt_path = _load_checkpoint(init_ckpt)
         ckpt_params = ckpt["params"]
         _assert_param_compatible(ckpt_params, ckpt_path)
-        train_state = train_state.replace(params=ckpt_params)
+        train_state = train_state.replace(params=jax.tree_util.tree_map(jnp.asarray, ckpt_params))
         if "normalizer_state" in ckpt:
-            normalizer_state = ckpt["normalizer_state"]
+            normalizer_state = jax.tree_util.tree_map(jnp.asarray, ckpt["normalizer_state"])
         if getattr(cfg, "start_update_from_checkpoint", True):
             start_update = int(ckpt.get("update", 0)) + 1
         print(

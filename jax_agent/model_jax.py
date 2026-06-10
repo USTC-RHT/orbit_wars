@@ -387,7 +387,9 @@ class AutoregressiveActorCritic(nn.Module):
         tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
         src_h = planet_out[batch_idx, src_safe]
         tgt_h = planet_out[batch_idx, tgt_safe]
-        raw = src_h + tgt_h + amount_emb[jnp.clip(amt_t, 0, self.ship_bucket_count - 1)] + step_emb[step_i]
+        amount_tok = jnp.take(jnp.asarray(amount_emb), jnp.clip(amt_t, 0, self.ship_bucket_count - 1), axis=0)
+        step_tok = jnp.take(jnp.asarray(step_emb), step_i, axis=0)
+        raw = src_h + tgt_h + amount_tok + step_tok
         raw = raw / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(raw), axis=-1, keepdims=True), 1e-12))
         return jnp.where(
             end_t[:, None],

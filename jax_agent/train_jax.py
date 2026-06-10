@@ -31,8 +31,10 @@ from .state import parse_observation  # noqa: E402
 try:
     import wandb as _wandb
     _WANDB_AVAILABLE = True
-except ImportError:
+    _WANDB_IMPORT_ERROR = None
+except ImportError as exc:
     _WANDB_AVAILABLE = False
+    _WANDB_IMPORT_ERROR = exc
 
 from .build_initial_state_bank import build_bank  # noqa: E402
 from .eval_opponents import EvalContext, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
@@ -676,8 +678,10 @@ def main() -> None:
             dir=str(run_dir),
         )
         print(f"wandb run: {_wandb.run.url}")
+    elif not _WANDB_AVAILABLE:
+        print(f"wandb unavailable: {_WANDB_IMPORT_ERROR} (install wandb in the training environment to enable logging)")
     else:
-        print("wandb disabled (set wandb.enabled: true in config to enable)")
+        print("wandb disabled by config (set wandb.enabled: true to enable)")
 
     opponent_name = getattr(cfg, "opponent", "nearest")
     self_play = opponent_name == "self"

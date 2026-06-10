@@ -2,8 +2,8 @@
 # - 基于 4090 单卡配置，保持 target-mask / autoregressive / impact fleet token 选择逻辑。
 # - 仍然使用 fixed_pool 的两阶段训练：phase 1 先打 nearest、当前策略、lag 策略。
 # - phase 2 的 fixed_pool 在当前策略、lag 策略、producer-jax 之间等概率抽取。
-# - producer-jax 是原版 producer 的 JAX 复刻训练对手；外部原版 producer 仍作为 eval 对手使用。
-# - 评估对手包含外部原版 producer、tamrazov、pool_ckpt900。
+# - producer-jax 是原版 producer 的 JAX 复刻训练对手；eval 对手使用 sigma。
+# - 评估对手包含 sigma、tamrazov、pool_ckpt900。
 #
 # Launch:
 #   python -m jax_agent.train_jax --config cfg_jax_RL_3.yaml
@@ -104,7 +104,7 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["slawekbiel-producer", "tamrazov", "pool_ckpt900"]
+  opponents: ["sigma", "tamrazov", "pool_ckpt900"]
 
 wandb:
   enabled: true

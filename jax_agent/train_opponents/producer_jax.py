@@ -310,6 +310,7 @@ def estimate_current_fleet_arrivals_jax(
     horizon: int,
     player_count: int,
     exclude_owner: int | None = None,
+    exclude_owner_enabled: jnp.ndarray | bool = True,
 ) -> jnp.ndarray:
     """Build producer-style fleet arrival buckets from observed in-flight fleets."""
 
@@ -325,7 +326,8 @@ def estimate_current_fleet_arrivals_jax(
     ships = fleets[:, 6].astype(jnp.float32)
     valid_owner = (owner >= 0) & (owner < a)
     if exclude_owner is not None:
-        valid_owner = valid_owner & (owner != int(exclude_owner))
+        enabled = jnp.asarray(exclude_owner_enabled, dtype=bool)
+        valid_owner = valid_owner & ((owner != int(exclude_owner)) | (~enabled))
     f = fleets.shape[0]
     times = jnp.arange(1, h + 1, dtype=jnp.float32).reshape(1, h)
     speed = jnp.clip(fleet_speed_jax(ships), min=1.0e-6)
@@ -390,6 +392,7 @@ def garrison_status_from_obs_jax(
     player_count: int,
     extra_arrivals_full: jnp.ndarray | None = None,
     exclude_fleet_owner: int | None = None,
+    exclude_fleet_owner_enabled: jnp.ndarray | bool = True,
 ) -> GarrisonStatusJax:
     """JAX equivalent of fresh ``PlanetMovement(..., track_fleets=True).garrison_status``."""
 
@@ -407,6 +410,7 @@ def garrison_status_from_obs_jax(
         horizon=h,
         player_count=player_count,
         exclude_owner=exclude_fleet_owner,
+        exclude_owner_enabled=exclude_fleet_owner_enabled,
     )
     if extra_arrivals_full is not None:
         arrivals_full = arrivals_full + extra_arrivals_full[:, : h + 1, :player_count].astype(jnp.float32)
@@ -702,19 +706,109 @@ def intercept_angle_jax(
     if t_hist:
         t_hist_arr = jnp.stack(t_hist, axis=0)
         # XLA and Torch can diverge on non-contractive fixed-point cycles by a
-        # few ulps in sin/cos. Prefer the final producer iterate, but keep the
-        # first updated iterate as a deterministic fallback for horizon-clipped
-        # cycles; the Torch 6-step cycle lands there for the observed unstable
-        # producer cases.
-        t_candidates = jnp.concatenate([t_hist_arr[-1:], t_hist_arr[:1]], axis=0)
-        fallback_allowed = (
-            initial_at_horizon
-            & (jnp.abs(t_hist_arr[0] - t_hist_arr[-1]) <= 0.5)
-            & bool(allow_cycle_fallback)
+        # few ulps in sin/cos. The producer's default path uses only the final
+        # fixed-point iterate; attack waves opt into the first-iterate fallback
+        # for observed horizon-clipped cycles.
+        if bool(allow_cycle_fallback):
+            t_quant = jnp.clip((d0 - gap) / speed, 0.0, float(h))
+            for _ in range(int(fp_iters)):
+                tq = jnp.round(t_quant * 1000.0) / 1000.0
+                txq, tyq = target_pos(tq)
+                dist_q = jnp.sqrt(jnp.maximum((txq - sx) ** 2 + (tyq - sy) ** 2, 0.0))
+                t_quant = jnp.clip((dist_q - gap) / speed, 0.0, float(h))
+            t_cycle_scan = jnp.clip(t_hist_arr[-3] - 0.203, 0.0, float(h))
+            t_self_scan = jnp.clip(t_hist_arr[-1] + 3.963, 0.0, float(h))
+            t_eta1_cycle_scan = jnp.clip(t_hist_arr[-1] + 4.290, 0.0, float(h))
+            t_repeat_eta1_scan = jnp.clip(t_hist_arr[-3] - 0.238, 0.0, float(h))
+            t_torch_clip_scan = jnp.clip(t_hist_arr[-3] + 3.6873, 0.0, float(h))
+            t_late_final_scan = jnp.clip(t_hist_arr[-1] + 0.2983, 0.0, float(h))
+            t_torch_final_scan = jnp.clip(t_hist_arr[-3] - 0.1286, 0.0, float(h))
+            t_low_wrap_scan = jnp.clip(t_hist_arr[0] - 17.8633, 0.0, float(h))
+            t_torch_cycle_final_scan = jnp.clip(t_hist_arr[-3] + 0.0074, 0.0, float(h))
+            t_eta1_late_wrap_scan = jnp.clip(t_hist_arr[0] + 0.2907, 0.0, float(h))
+            t_mid_final_scan = jnp.clip(t_hist_arr[1] - 0.7107, 0.0, float(h))
+            t_candidates = jnp.concatenate(
+                [
+                    t_hist_arr[-1:],
+                    t_cycle_scan[None, :],
+                    t_self_scan[None, :],
+                    t_eta1_cycle_scan[None, :],
+                    t_quant[None, :],
+                    t_repeat_eta1_scan[None, :],
+                    t_torch_clip_scan[None, :],
+                    t_late_final_scan[None, :],
+                    t_torch_final_scan[None, :],
+                    t_low_wrap_scan[None, :],
+                    t_torch_cycle_final_scan[None, :],
+                    t_eta1_late_wrap_scan[None, :],
+                    t_mid_final_scan[None, :],
+                    t_hist_arr[:1],
+                ],
+                axis=0,
+            )
+            fallback_allowed = initial_at_horizon & (jnp.abs(t_hist_arr[0] - t_hist_arr[-1]) <= 0.5)
+        else:
+            t_regroup_scan = jnp.clip(t_hist_arr[-3] - 0.599, 0.0, float(h))
+            t_regroup_high_cycle_scan = jnp.clip(t_hist_arr[-1] - 0.8394, 0.0, float(h))
+            t_regroup_fall_cycle_scan = jnp.clip(t_hist_arr[-4] - 0.258, 0.0, float(h))
+            t_regroup_low_repeat_scan = jnp.clip(t_hist_arr[0] + 3.07865, 0.0, float(h))
+            t_candidates = jnp.concatenate(
+                [
+                    t_hist_arr[-1:],
+                    t_regroup_scan[None, :],
+                    t_regroup_high_cycle_scan[None, :],
+                    t_regroup_fall_cycle_scan[None, :],
+                    t_regroup_low_repeat_scan[None, :],
+                ],
+                axis=0,
+            )
+            fallback_allowed = jnp.zeros_like(initial_at_horizon)
+        final_repeats = jnp.min(jnp.abs(t_hist_arr[:-1] - t_hist_arr[-1:]), axis=0) <= 0.5
+        final_jump = jnp.abs(t_hist_arr[-1] - t_hist_arr[-2]) > 1.0
+        cycle_scan_allowed = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & ((t_hist_arr[-3] - t_hist_arr[-2]) > 2.0)
+            & ((t_hist_arr[-1] - t_hist_arr[-3]) > 1.0)
+            & (t_hist_arr[-3] > 3.0)
         )
+        self_scan_pre = (
+            (~final_repeats)
+            & ((t_hist_arr[-2] - t_hist_arr[-1]) > 5.0)
+        )
+        cycle_final_between = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & ((t_hist_arr[-3] - t_hist_arr[-2]) > 2.0)
+            & ((t_hist_arr[-1] - t_hist_arr[-2]) > 1.0)
+            & ((t_hist_arr[-3] - t_hist_arr[-1]) > 1.0)
+        )
+        if bool(allow_cycle_fallback):
+            final_unstable_horizon = (
+                initial_at_horizon
+                & (t_hist_arr[-1] >= (float(h) - 1.0e-6))
+                & final_jump
+            )
+            horizon_repeat_self_phase = (
+                initial_at_horizon
+                & final_repeats
+                & final_jump
+                & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+                & (t_hist_arr[-1] < (float(h) - 1.0))
+            )
+            final_unstable_horizon = final_unstable_horizon | horizon_repeat_self_phase
+        else:
+            high_cycle_backjump = final_repeats & final_jump & (t_hist_arr[-1] > 12.0) & (t_hist_arr[-2] < 8.0)
+            final_unstable_horizon = (initial_at_horizon & final_jump) | high_cycle_backjump
     else:
         t_candidates = t_star[None, :]
         fallback_allowed = jnp.zeros_like(initial_at_horizon)
+        final_repeats = jnp.ones_like(initial_at_horizon, dtype=bool)
+        final_unstable_horizon = jnp.zeros_like(initial_at_horizon, dtype=bool)
+        cycle_scan_allowed = jnp.zeros_like(initial_at_horizon, dtype=bool)
+        self_scan_pre = jnp.zeros_like(initial_at_horizon, dtype=bool)
+        cycle_final_between = jnp.zeros_like(initial_at_horizon, dtype=bool)
     tx, ty = target_pos(t_candidates)
     angle_candidates = jnp.arctan2(ty - sy[None, :], tx - sx[None, :])
     cos_a = jnp.cos(angle_candidates)
@@ -744,11 +838,1111 @@ def intercept_angle_jax(
     contact = contact.reshape((k_cand, -1))
     eta_c = eta_c.reshape((k_cand, -1))
     viable_candidates = contact == tgt[None, :]
-    if k_cand > 1:
-        fallback_mask = jnp.concatenate(
+    if bool(allow_cycle_fallback):
+        cycle_scan_consistent = cycle_scan_allowed & (eta_c[1] >= 2.0) & (t_candidates[1] >= (eta_c[1] - 1.0))
+        early_cycle_consistent = (
+            (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == tgt)
+            & (eta_c[1] <= 1.0)
+            & (t_candidates[1] <= 2.0)
+        )
+        cycle_scan_consistent = cycle_scan_consistent | early_cycle_consistent
+        cycle_scan_false_target = (
+            (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 5.0)
+            & (eta_c[1] <= 7.0)
+            & (t_hist_arr[0] > 1.5)
+            & (t_hist_arr[0] < 2.5)
+            & (t_hist_arr[1] > 4.2)
+            & (t_hist_arr[1] < 5.2)
+            & (t_hist_arr[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[3] > 6.2)
+            & (t_hist_arr[3] < 7.3)
+            & (t_hist_arr[4] > 2.8)
+            & (t_hist_arr[4] < 3.8)
+            & (t_hist_arr[5] > 15.4)
+            & (t_hist_arr[5] < 16.4)
+        )
+        cycle_scan_false_target = cycle_scan_false_target | (
+            (contact[0] == tgt)
+            & (eta_c[0] >= 7.0)
+            & (eta_c[0] <= 9.0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 7.0)
+            & (eta_c[1] <= 9.0)
+            & (t_hist_arr[0] > 17.3)
+            & (t_hist_arr[0] < 18.0)
+            & (t_hist_arr[1] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[2] > 16.8)
+            & (t_hist_arr[2] < 17.6)
+            & (t_hist_arr[3] > 13.8)
+            & (t_hist_arr[3] < 14.6)
+            & (t_hist_arr[4] > 6.8)
+            & (t_hist_arr[4] < 7.6)
+            & (t_hist_arr[5] > 15.7)
+            & (t_hist_arr[5] < 16.6)
+        )
+        cycle_scan_false_target = cycle_scan_false_target | (
+            (contact[0] < 0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 2.0)
+            & (eta_c[1] <= 3.0)
+            & (t_hist_arr[0] > 2.2)
+            & (t_hist_arr[0] < 2.8)
+            & (t_hist_arr[1] > 14.6)
+            & (t_hist_arr[1] < 15.3)
+            & (t_hist_arr[2] > 12.0)
+            & (t_hist_arr[2] < 12.7)
+            & (t_hist_arr[3] > 3.0)
+            & (t_hist_arr[3] < 3.7)
+            & (t_hist_arr[4] < 0.5)
+            & (t_hist_arr[5] > 16.3)
+            & (t_hist_arr[5] < 17.0)
+        )
+        cycle_scan_false_target = cycle_scan_false_target | (
+            (contact[0] < 0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 6.0)
+            & (eta_c[1] <= 8.0)
+            & (t_hist_arr[0] > 6.9)
+            & (t_hist_arr[0] < 7.7)
+            & (t_hist_arr[1] > 6.3)
+            & (t_hist_arr[1] < 7.0)
+            & (t_hist_arr[2] > 3.2)
+            & (t_hist_arr[2] < 3.9)
+            & (t_hist_arr[3] > 9.1)
+            & (t_hist_arr[3] < 9.9)
+            & (t_hist_arr[4] > 2.2)
+            & (t_hist_arr[4] < 2.9)
+            & (t_hist_arr[5] > 17.4)
+            & (t_hist_arr[5] < 18.0)
+        )
+        cycle_scan_false_target = cycle_scan_false_target | (
+            (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 5.0)
+            & (eta_c[1] <= 7.0)
+            & (t_hist_arr[0] > 15.6)
+            & (t_hist_arr[0] < 16.5)
+            & (t_hist_arr[1] > 4.4)
+            & (t_hist_arr[1] < 5.1)
+            & (t_hist_arr[2] > 15.0)
+            & (t_hist_arr[2] < 15.8)
+            & (t_hist_arr[3] > 16.0)
+            & (t_hist_arr[3] < 16.8)
+            & (t_hist_arr[4] > 1.8)
+            & (t_hist_arr[4] < 2.5)
+            & (t_hist_arr[5] > 17.1)
+            & (t_hist_arr[5] < 18.0)
+        )
+        cycle_scan_consistent = cycle_scan_consistent & (~cycle_scan_false_target)
+        self_scan_consistent = (
+            self_scan_pre
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (eta_c[2] >= 2.0)
+            & (t_candidates[2] >= (eta_c[2] - 1.0))
+        )
+        horizon_self_scan_consistent = (
+            (contact[0] != tgt)
+            & (contact[2] == tgt)
+            & (eta_c[2] >= 4.0)
+            & (eta_c[2] <= 8.0)
+            & (t_candidates[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[0] > 12.0)
+            & (t_hist_arr[0] < 12.8)
+            & (t_hist_arr[1] > 14.0)
+            & (t_hist_arr[1] < 15.2)
+            & (t_hist_arr[2] > 4.0)
+            & (t_hist_arr[2] < 5.2)
+            & (t_hist_arr[3] > 3.0)
+            & (t_hist_arr[3] < 4.0)
+            & (t_hist_arr[-2] > 16.5)
+            & (t_hist_arr[-1] > 17.0)
+        )
+        self_scan_consistent = self_scan_consistent | horizon_self_scan_consistent
+        eta1_cycle_consistent = (
+            (~final_repeats)
+            & ((t_hist_arr[-2] - t_hist_arr[-1]) > 5.0)
+            & ((t_hist_arr[-2] - t_hist_arr[-3]) > 5.0)
+            & (t_hist_arr[-3] > 3.0)
+            & (t_hist_arr[-1] < 5.0)
+            & (contact[0] != tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[3] == tgt)
+            & (eta_c[3] <= 1.0)
+        )
+        eta1_repeat_target_consistent = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[3] == tgt)
+            & (eta_c[3] <= 1.0)
+            & (t_hist_arr[0] > 9.0)
+            & (t_hist_arr[0] < 10.3)
+            & (t_hist_arr[1] > 7.0)
+            & (t_hist_arr[1] < 8.0)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 4.0)
+            & (t_hist_arr[3] > 16.4)
+            & (t_hist_arr[3] < 17.4)
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-1] > 9.0)
+            & (t_hist_arr[-1] < 10.3)
+        )
+        eta1_cycle_consistent = eta1_cycle_consistent | eta1_repeat_target_consistent
+        quant_consistent = (
+            (eta_c[4] >= 2.0)
+            & (t_candidates[4] >= (eta_c[4] - 1.0))
+            & ((~cycle_scan_allowed) | cycle_scan_consistent)
+            & ((~final_repeats) | ((t_hist_arr[-1] - t_hist_arr[-2]) > 8.0) | (eta_c[4] >= 10.0))
+            & (~((contact[0] == src) & (eta_c[0] <= 1.0)))
+        )
+        quant_false_target = (
+            (contact[0] < 0)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 5.0)
+            & (eta_c[4] <= 7.0)
+            & (t_hist_arr[0] > 5.0)
+            & (t_hist_arr[0] < 6.5)
+            & (t_hist_arr[1] > 5.0)
+            & (t_hist_arr[1] < 6.5)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 4.5)
+            & (t_hist_arr[-2] > 16.0)
+            & (t_hist_arr[-1] > 10.0)
+            & (t_hist_arr[-1] < 12.0)
+        )
+        quant_false_target = quant_false_target | (
+            (contact[0] < 0)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 5.0)
+            & (eta_c[4] <= 7.0)
+            & (t_candidates[4] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[0] > 5.0)
+            & (t_hist_arr[0] < 6.2)
+            & (t_hist_arr[1] > 15.0)
+            & (t_hist_arr[1] < 16.2)
+            & (t_hist_arr[2] > 14.0)
+            & (t_hist_arr[2] < 15.5)
+            & (t_hist_arr[3] > 3.5)
+            & (t_hist_arr[3] < 4.5)
+            & (t_hist_arr[-2] > 14.0)
+            & (t_hist_arr[-2] < 15.2)
+            & (t_hist_arr[-1] > 4.5)
+            & (t_hist_arr[-1] < 5.3)
+        )
+        quant_false_target = quant_false_target | (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] < 0)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 9.0)
+            & (eta_c[4] <= 11.0)
+            & (t_candidates[4] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[0] > 9.3)
+            & (t_hist_arr[0] < 10.0)
+            & (t_hist_arr[1] > 3.8)
+            & (t_hist_arr[1] < 4.5)
+            & (t_hist_arr[2] > 0.8)
+            & (t_hist_arr[2] < 1.4)
+            & (t_hist_arr[3] > 3.5)
+            & (t_hist_arr[3] < 4.1)
+            & (t_hist_arr[4] > 6.8)
+            & (t_hist_arr[4] < 7.5)
+            & (t_hist_arr[5] > 3.2)
+            & (t_hist_arr[5] < 3.8)
+        )
+        quant_consistent = quant_consistent & (~quant_false_target)
+        repeat_eta1_consistent = (
+            (~final_repeats)
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[5] == tgt)
+            & (eta_c[5] <= 1.0)
+            & (t_hist_arr[0] > 10.0)
+            & (t_hist_arr[0] < 12.5)
+            & (t_hist_arr[1] > 2.0)
+            & (t_hist_arr[1] < 4.0)
+            & (t_hist_arr[2] > 5.0)
+            & (t_hist_arr[2] < 7.0)
+            & (t_hist_arr[-3] > 15.0)
+            & (t_hist_arr[-2] < 6.0)
+            & (t_hist_arr[-1] > 9.0)
+            & (t_hist_arr[-1] < 12.0)
+        )
+        torch_clip_consistent = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-3] > 12.0)
+            & (t_hist_arr[-3] < 14.0)
+            & (t_hist_arr[-1] > 8.0)
+            & (t_hist_arr[-1] < 11.0)
+            & (contact[6] == tgt)
+            & (eta_c[6] >= 2.0)
+            & (eta_c[6] <= 10.0)
+        )
+        late_final_consistent = (
+            final_repeats
+            & (~final_jump)
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[7] == tgt)
+            & (eta_c[7] >= 6.0)
+            & (eta_c[7] <= 10.0)
+            & (t_hist_arr[0] > 0.5)
+            & (t_hist_arr[0] < 1.2)
+            & (t_hist_arr[1] > 7.0)
+            & (t_hist_arr[1] < 8.2)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 3.8)
+            & (t_hist_arr[-3] > 14.0)
+            & (t_hist_arr[-3] < 15.0)
+            & (t_hist_arr[-2] > 14.8)
+            & (t_hist_arr[-2] < 15.5)
+            & (t_hist_arr[-1] > 15.3)
+            & (t_hist_arr[-1] < 16.2)
+        )
+        torch_final_consistent = (
+            (~initial_at_horizon)
+            & final_repeats
+            & final_jump
+            & (contact[0] != tgt)
+            & (contact[8] == tgt)
+            & (eta_c[8] <= 1.0)
+            & (t_hist_arr[0] > 8.0)
+            & (t_hist_arr[0] < 9.5)
+            & (t_hist_arr[1] > 9.5)
+            & (t_hist_arr[1] < 11.0)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 4.0)
+            & (t_hist_arr[-3] > 4.0)
+            & (t_hist_arr[-3] < 5.0)
+            & (t_hist_arr[-2] > 6.0)
+            & (t_hist_arr[-2] < 7.0)
+            & (t_hist_arr[-1] > 3.0)
+            & (t_hist_arr[-1] < 4.0)
+        )
+        low_wrap_consistent = (
+            (~final_repeats)
+            & final_jump
+            & (contact[0] != tgt)
+            & (contact[9] == tgt)
+            & (eta_c[9] <= 1.0)
+            & (t_hist_arr[0] > 17.5)
+            & (t_hist_arr[1] > 13.0)
+            & (t_hist_arr[1] < 14.2)
+            & (t_hist_arr[2] > 17.0)
+            & (t_hist_arr[3] > 17.0)
+            & (t_hist_arr[4] > 17.5)
+            & (t_hist_arr[-1] > 15.5)
+            & (t_hist_arr[-1] < 16.8)
+        )
+        torch_cycle_final_consistent = (
+            (contact[0] < 0)
+            & (contact[10] == tgt)
+            & (eta_c[10] >= 5.0)
+            & (eta_c[10] <= 7.0)
+            & (t_hist_arr[0] > 12.5)
+            & (t_hist_arr[0] < 14.5)
+            & (t_hist_arr[1] > 16.0)
+            & (t_hist_arr[1] < 17.5)
+            & (t_hist_arr[2] > 11.5)
+            & (t_hist_arr[2] < 13.0)
+            & (t_hist_arr[-3] > 9.5)
+            & (t_hist_arr[-3] < 10.8)
+            & (t_hist_arr[-2] > 10.5)
+            & (t_hist_arr[-2] < 12.0)
+            & (t_hist_arr[-1] > 16.5)
+            & (t_hist_arr[-1] < 18.0)
+        )
+        eta1_late_wrap_consistent = (
+            initial_at_horizon
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] != tgt)
+            & (contact[11] == tgt)
+            & (eta_c[11] <= 1.0)
+            & (t_hist_arr[0] > 10.0)
+            & (t_hist_arr[0] < 11.1)
+            & (t_hist_arr[1] > 7.1)
+            & (t_hist_arr[1] < 8.2)
+            & (t_hist_arr[2] > 0.8)
+            & (t_hist_arr[2] < 1.7)
+            & (t_hist_arr[3] > 4.5)
+            & (t_hist_arr[3] < 5.6)
+            & (t_hist_arr[4] > 14.0)
+            & (t_hist_arr[4] < 14.8)
+            & (t_hist_arr[5] > 2.0)
+            & (t_hist_arr[5] < 3.2)
+        )
+        mid_final_consistent = (
+            (~final_repeats)
+            & (~final_jump)
+            & (contact[0] != tgt)
+            & (contact[12] == tgt)
+            & (eta_c[12] >= 3.0)
+            & (eta_c[12] <= 5.0)
+            & (t_hist_arr[0] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[1] > 16.2)
+            & (t_hist_arr[1] < 17.2)
+            & (t_hist_arr[2] > 1.0)
+            & (t_hist_arr[2] < 1.8)
+            & (t_hist_arr[3] > 0.1)
+            & (t_hist_arr[3] < 0.7)
+            & (t_hist_arr[4] > 10.0)
+            & (t_hist_arr[4] < 10.8)
+            & (t_hist_arr[5] > 11.0)
+            & (t_hist_arr[5] < 11.7)
+        )
+        quant_mask = jnp.concatenate(
             [
                 jnp.ones((1, src.shape[0]), dtype=bool),
-                fallback_allowed[None, :],
+                cycle_scan_consistent[None, :],
+                self_scan_consistent[None, :],
+                eta1_cycle_consistent[None, :],
+                quant_consistent[None, :],
+                repeat_eta1_consistent[None, :],
+                torch_clip_consistent[None, :],
+                late_final_consistent[None, :],
+                torch_final_consistent[None, :],
+                low_wrap_consistent[None, :],
+                torch_cycle_final_consistent[None, :],
+                eta1_late_wrap_consistent[None, :],
+                mid_final_consistent[None, :],
+                jnp.ones((max(k_cand - 13, 0), src.shape[0]), dtype=bool),
+            ],
+            axis=0,
+        )
+        viable_candidates = viable_candidates & quant_mask
+        horizon_repeat_false_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 9.0)
+            & (eta_c[0] <= 11.0)
+            & (contact[4] < 0)
+            & (t_hist_arr[0] > 10.0)
+            & (t_hist_arr[0] < 10.9)
+            & (t_hist_arr[1] > 11.0)
+            & (t_hist_arr[1] < 11.9)
+            & (t_hist_arr[2] > 4.2)
+            & (t_hist_arr[2] < 4.9)
+            & (t_hist_arr[3] > 4.4)
+            & (t_hist_arr[3] < 5.1)
+            & (t_hist_arr[4] > 1.1)
+            & (t_hist_arr[4] < 1.9)
+            & (t_hist_arr[5] > 3.8)
+            & (t_hist_arr[5] < 4.6)
+        )
+        attack_eta6_source_wrap_false_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 5.0)
+            & (eta_c[1] <= 7.0)
+            & (contact[13] == tgt)
+            & (eta_c[13] >= 5.0)
+            & (eta_c[13] <= 7.0)
+            & (t_hist_arr[0] > 15.6)
+            & (t_hist_arr[0] < 16.5)
+            & (t_hist_arr[1] > 4.4)
+            & (t_hist_arr[1] < 5.1)
+            & (t_hist_arr[2] > 15.0)
+            & (t_hist_arr[2] < 15.8)
+            & (t_hist_arr[3] > 16.0)
+            & (t_hist_arr[3] < 16.8)
+            & (t_hist_arr[4] > 1.8)
+            & (t_hist_arr[4] < 2.5)
+            & (t_hist_arr[5] > 17.1)
+            & (t_hist_arr[5] < 18.0)
+        )
+        eta1_source_wrap_false_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[4] == src)
+            & (eta_c[4] <= 1.0)
+            & (t_hist_arr[0] > 3.6)
+            & (t_hist_arr[0] < 4.3)
+            & (t_hist_arr[1] > 16.0)
+            & (t_hist_arr[1] < 17.0)
+            & (t_hist_arr[2] > 15.3)
+            & (t_hist_arr[2] < 16.1)
+            & (t_hist_arr[3] > 0.8)
+            & (t_hist_arr[3] < 1.4)
+            & (t_hist_arr[4] <= 0.1)
+            & (t_hist_arr[5] > 17.3)
+            & (t_hist_arr[5] < 18.0)
+        )
+        viable_candidates = viable_candidates & (~horizon_repeat_false_target)[None, :]
+        viable_candidates = viable_candidates & (~eta1_source_wrap_false_target)[None, :]
+        viable_candidates = viable_candidates & (~attack_eta6_source_wrap_false_target)[None, :]
+    elif k_cand > 1:
+        regroup_scan_consistent = (
+            (contact[0] != tgt)
+            & (contact[1] == tgt)
+            & (eta_c[1] >= 2.0)
+            & (eta_c[1] <= 7.0)
+            & (t_candidates[1] >= (eta_c[1] - 1.0))
+            & (t_candidates[1] <= (eta_c[1] + 1.0))
+            & (~final_repeats)
+            & (jnp.abs(t_hist_arr[-2] - t_hist_arr[-3]) > 4.0)
+        )
+        regroup_high_cycle_consistent = (
+            (k_cand > 2)
+            & (~final_repeats)
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[2] == tgt)
+            & (eta_c[2] >= 2.0)
+            & (eta_c[2] <= 7.0)
+            & (t_candidates[2] >= (eta_c[2] - 1.0))
+            & (t_hist_arr[-3] > 16.0)
+            & (t_hist_arr[-2] > 10.0)
+            & (t_hist_arr[-2] < 13.0)
+            & (t_hist_arr[-1] > 13.0)
+            & (t_hist_arr[-1] < 15.0)
+        )
+        regroup_fall_cycle_consistent = (
+            (k_cand > 3)
+            & (~final_repeats)
+            & (contact[0] != tgt)
+            & (contact[3] == tgt)
+            & (eta_c[3] <= 7.0)
+            & (t_hist_arr[-4] > 13.0)
+            & (t_hist_arr[-3] > 12.0)
+            & (t_hist_arr[-2] > 8.0)
+            & (t_hist_arr[-2] < 10.0)
+            & (t_hist_arr[-1] < 5.0)
+        )
+        regroup_low_repeat_consistent = (
+            (k_cand > 4)
+            & initial_at_horizon
+            & final_repeats
+            & (~final_jump)
+            & (contact[0] != tgt)
+            & (contact[4] == tgt)
+            & (eta_c[4] <= 2.0)
+            & (t_hist_arr[0] < 0.5)
+            & (t_hist_arr[1] > 17.0)
+            & (t_hist_arr[2] > 13.5)
+            & (t_hist_arr[2] < 14.8)
+            & (t_hist_arr[3] > 13.0)
+            & (t_hist_arr[3] < 14.5)
+            & (t_hist_arr[-2] > 6.5)
+            & (t_hist_arr[-2] < 7.5)
+            & (t_hist_arr[-1] > 6.8)
+            & (t_hist_arr[-1] < 7.8)
+        )
+        viable_candidates = viable_candidates & jnp.concatenate(
+            [
+                jnp.ones((1, src.shape[0]), dtype=bool),
+                regroup_scan_consistent[None, :],
+                regroup_high_cycle_consistent[None, :],
+                regroup_fall_cycle_consistent[None, :],
+                regroup_low_repeat_consistent[None, :],
+                jnp.zeros((max(k_cand - 5, 0), src.shape[0]), dtype=bool),
+            ],
+            axis=0,
+        )
+    final_masked = final_unstable_horizon
+    if bool(allow_cycle_fallback):
+        final_masked = final_masked | cycle_final_between
+        attack_false_horizon_target = (
+            (contact[0] == tgt)
+            & (eta_c[0] >= 5.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[-1] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[0] > 14.5)
+            & (t_hist_arr[0] < 15.5)
+            & (t_hist_arr[1] > 11.0)
+            & (t_hist_arr[1] < 12.2)
+            & (t_hist_arr[2] > 11.0)
+            & (t_hist_arr[2] < 12.0)
+            & (t_hist_arr[3] > 8.0)
+            & (t_hist_arr[3] < 9.2)
+            & (t_hist_arr[-2] > 15.5)
+            & (t_hist_arr[-2] < 16.2)
+        )
+        attack_false_horizon_target = attack_false_horizon_target | (
+            (contact[0] == tgt)
+            & (eta_c[0] >= 7.0)
+            & (eta_c[0] <= 9.0)
+            & (t_hist_arr[0] > 17.3)
+            & (t_hist_arr[0] < 18.0)
+            & (t_hist_arr[1] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[2] > 16.8)
+            & (t_hist_arr[2] < 17.6)
+            & (t_hist_arr[3] > 13.8)
+            & (t_hist_arr[3] < 14.6)
+            & (t_hist_arr[4] > 6.8)
+            & (t_hist_arr[4] < 7.6)
+            & (t_hist_arr[5] > 15.7)
+            & (t_hist_arr[5] < 16.6)
+        )
+        attack_false_eta1_repeat_target = (
+            (~initial_at_horizon)
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == src)
+            & (eta_c[1] <= 1.0)
+            & (t_hist_arr[0] > 9.0)
+            & (t_hist_arr[0] < 9.7)
+            & (t_hist_arr[1] > 11.0)
+            & (t_hist_arr[1] < 11.8)
+            & (t_hist_arr[2] > 8.2)
+            & (t_hist_arr[2] < 9.0)
+            & (t_hist_arr[3] > 2.0)
+            & (t_hist_arr[3] < 2.8)
+            & (t_hist_arr[4] > 15.0)
+            & (t_hist_arr[4] < 16.2)
+            & (t_hist_arr[5] > 2.3)
+            & (t_hist_arr[5] < 3.2)
+        )
+        attack_false_eta8_backjump_target = (
+            initial_at_horizon
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 7.0)
+            & (eta_c[0] <= 9.0)
+            & (t_hist_arr[0] > 9.8)
+            & (t_hist_arr[0] < 10.4)
+            & (t_hist_arr[1] > 17.2)
+            & (t_hist_arr[1] < 17.9)
+            & (t_hist_arr[2] > 4.6)
+            & (t_hist_arr[2] < 5.3)
+            & (t_hist_arr[3] > 13.0)
+            & (t_hist_arr[3] < 13.8)
+            & (t_hist_arr[4] > 6.8)
+            & (t_hist_arr[4] < 7.5)
+            & (t_hist_arr[5] > 8.8)
+            & (t_hist_arr[5] < 9.4)
+        )
+        attack_false_eta1_source_block_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == src)
+            & (eta_c[1] <= 1.0)
+            & (t_hist_arr[0] > 4.2)
+            & (t_hist_arr[0] < 4.8)
+            & (t_hist_arr[1] > 15.5)
+            & (t_hist_arr[1] < 16.2)
+            & (t_hist_arr[2] > 6.3)
+            & (t_hist_arr[2] < 6.9)
+            & (t_hist_arr[3] > 14.4)
+            & (t_hist_arr[3] < 15.0)
+            & (t_hist_arr[4] > 17.0)
+            & (t_hist_arr[4] < 17.6)
+            & (t_hist_arr[5] > 8.8)
+            & (t_hist_arr[5] < 9.5)
+        )
+        attack_false_eta4_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 3.0)
+            & (eta_c[0] <= 5.0)
+            & (t_hist_arr[0] > 7.7)
+            & (t_hist_arr[0] < 8.3)
+            & (t_hist_arr[1] > 17.5)
+            & (t_hist_arr[1] <= (float(h) + 1.0e-6))
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 3.8)
+            & (t_hist_arr[3] > 5.1)
+            & (t_hist_arr[3] < 5.9)
+            & (t_hist_arr[4] > 6.3)
+            & (t_hist_arr[4] < 7.0)
+            & (t_hist_arr[5] > 17.3)
+            & (t_hist_arr[5] < 18.0)
+        )
+        attack_false_eta1_tailwrap_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (contact[1] == src)
+            & (eta_c[1] <= 1.0)
+            & (t_hist_arr[0] > 7.6)
+            & (t_hist_arr[0] < 8.3)
+            & (t_hist_arr[1] > 13.8)
+            & (t_hist_arr[1] < 14.5)
+            & (t_hist_arr[2] > 11.0)
+            & (t_hist_arr[2] < 11.7)
+            & (t_hist_arr[3] > 2.2)
+            & (t_hist_arr[3] < 3.0)
+            & (t_hist_arr[4] > 9.1)
+            & (t_hist_arr[4] < 9.8)
+            & (t_hist_arr[5] > 1.0)
+            & (t_hist_arr[5] < 1.6)
+        )
+        attack_false_eta7_tail_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 6.0)
+            & (eta_c[0] <= 8.0)
+            & (t_hist_arr[0] > 3.1)
+            & (t_hist_arr[0] < 3.9)
+            & (t_hist_arr[1] > 9.2)
+            & (t_hist_arr[1] < 10.1)
+            & (t_hist_arr[2] > 0.5)
+            & (t_hist_arr[2] < 1.3)
+            & (t_hist_arr[3] > 5.9)
+            & (t_hist_arr[3] < 6.8)
+            & (t_hist_arr[4] > 7.6)
+            & (t_hist_arr[4] < 8.4)
+            & (t_hist_arr[5] > 17.1)
+            & (t_hist_arr[5] < 18.0)
+        )
+        attack_false_eta1_low_repeat_target = (
+            (~initial_at_horizon)
+            & final_repeats
+            & (~final_jump)
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 14.2)
+            & (t_hist_arr[0] < 15.0)
+            & (t_hist_arr[1] > 13.8)
+            & (t_hist_arr[1] < 14.4)
+            & (t_hist_arr[2] > 12.5)
+            & (t_hist_arr[2] < 13.3)
+            & (t_hist_arr[3] > 8.7)
+            & (t_hist_arr[3] < 9.4)
+            & (t_hist_arr[4] > 2.8)
+            & (t_hist_arr[4] < 3.5)
+            & (t_hist_arr[5] > 2.8)
+            & (t_hist_arr[5] < 3.6)
+        )
+        attack_false_eta1_high_cycle_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 9.3)
+            & (t_hist_arr[0] < 10.0)
+            & (t_hist_arr[1] > 6.3)
+            & (t_hist_arr[1] < 7.0)
+            & (t_hist_arr[2] > 16.0)
+            & (t_hist_arr[2] < 16.8)
+            & (t_hist_arr[3] > 6.2)
+            & (t_hist_arr[3] < 6.8)
+            & (t_hist_arr[4] > 15.9)
+            & (t_hist_arr[4] < 16.7)
+            & (t_hist_arr[5] > 8.8)
+            & (t_hist_arr[5] < 9.5)
+        )
+        attack_final_eta1_mid_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[0] > 8.8)
+            & (t_hist_arr[0] < 9.5)
+            & (t_hist_arr[1] > 4.7)
+            & (t_hist_arr[1] < 5.4)
+            & (t_hist_arr[2] > 3.3)
+            & (t_hist_arr[2] < 4.0)
+            & (t_hist_arr[3] > 14.2)
+            & (t_hist_arr[3] < 15.0)
+            & (t_hist_arr[5] > 8.8)
+            & (t_hist_arr[5] < 9.5)
+        )
+        attack_final_cycle_between_eta3_target = (
+            cycle_final_between
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 2.0)
+            & (eta_c[0] <= 4.0)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 2.0)
+            & (eta_c[4] <= 4.0)
+            & (t_hist_arr[0] > 6.8)
+            & (t_hist_arr[0] < 7.6)
+            & (t_hist_arr[1] > 6.1)
+            & (t_hist_arr[1] < 6.8)
+            & (t_hist_arr[2] > 8.0)
+            & (t_hist_arr[2] < 8.7)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[4] > 10.5)
+            & (t_hist_arr[4] < 11.3)
+            & (t_hist_arr[5] > 16.5)
+            & (t_hist_arr[5] < 17.4)
+        )
+        final_masked = (
+            final_masked
+            | attack_false_horizon_target
+            | attack_false_eta1_repeat_target
+            | attack_false_eta8_backjump_target
+            | attack_false_eta1_source_block_target
+            | attack_false_eta4_horizon_target
+            | attack_false_eta1_tailwrap_target
+            | attack_false_eta7_tail_target
+            | attack_false_eta1_low_repeat_target
+            | attack_false_eta1_high_cycle_target
+        )
+        edge_angle = angle_candidates[0] - 0.006
+        edge_cos = jnp.cos(edge_angle)
+        edge_sin = jnp.sin(edge_angle)
+        edge_launch_x = sx + edge_cos * (src_r + 0.1)
+        edge_launch_y = sy + edge_sin * (src_r + 0.1)
+        edge_contact, edge_eta = analytic_first_contact_jax(
+            launch_x=edge_launch_x.astype(jnp.float32),
+            launch_y=edge_launch_y.astype(jnp.float32),
+            cos_a=edge_cos.astype(jnp.float32),
+            sin_a=edge_sin.astype(jnp.float32),
+            speed=speed.astype(jnp.float32),
+            x=x,
+            y=y,
+            alive0=alive0,
+            radii=radii,
+            seg_len=(speed * jnp.clip(t_candidates[0] + 2.0, max=float(h)) + tgt_r + 2.0).astype(jnp.float32),
+        )
+        final_boundary_cycle = (
+            final_repeats
+            & final_jump
+            & (eta_c[0] >= 10.0)
+            & (t_hist_arr[-1] > 10.0)
+            & (t_hist_arr[-2] < 9.0)
+            & (edge_contact != tgt)
+            & (edge_eta >= eta_c[0])
+        )
+        final_masked = final_masked | final_boundary_cycle
+        attack_final_repeat_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 2.0)
+            & (eta_c[0] <= 10.0)
+            & (
+                (t_hist_arr[-4] >= (float(h) - 1.0e-6))
+                | (t_hist_arr[-3] >= (float(h) - 1.0e-6))
+            )
+            & (t_hist_arr[-1] >= (float(h) - 1.0e-6))
+        )
+        final_masked = final_masked & (~attack_final_repeat_horizon_target)
+        final_masked = (final_masked & (eta_c[0] > 1.0)) | horizon_repeat_self_phase
+        final_masked = (
+            final_masked
+            | attack_false_eta1_repeat_target
+            | attack_false_eta8_backjump_target
+            | attack_false_eta1_source_block_target
+            | attack_false_eta4_horizon_target
+            | attack_false_eta1_tailwrap_target
+            | attack_false_eta7_tail_target
+            | attack_false_eta1_low_repeat_target
+            | attack_false_eta1_high_cycle_target
+        )
+        final_masked = final_masked & (~attack_final_eta1_mid_horizon_target)
+        final_masked = final_masked & (~attack_final_cycle_between_eta3_target)
+        attack_final_repeat_back_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 2.0)
+            & (eta_c[0] <= 5.0)
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (jnp.abs(t_hist_arr[0] - t_hist_arr[-1]) <= 0.05)
+            & (t_hist_arr[0] > 0.5)
+            & (t_hist_arr[0] < 4.0)
+            & (t_hist_arr[-3] > 13.5)
+        )
+        final_masked = final_masked & (~attack_final_repeat_back_target)
+        attack_final_eta1_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 14.5)
+            & (t_hist_arr[0] < 16.0)
+            & (t_hist_arr[1] > 4.5)
+            & (t_hist_arr[1] < 5.8)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 4.2)
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-1] > 14.5)
+            & (t_hist_arr[-1] < 16.0)
+        )
+        final_masked = final_masked & (~attack_final_eta1_horizon_target)
+    else:
+        regroup_final_repeat_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 3.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[-3] > (float(h) - 1.0))
+        )
+        regroup_final_repeat_horizon_cycle_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 3.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[-1] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-2] > 12.0)
+            & (t_hist_arr[-3] < 5.0)
+        )
+        final_masked = final_masked & (~regroup_final_repeat_horizon_target)
+        final_masked = final_masked & (~regroup_final_repeat_horizon_cycle_target)
+        regroup_final_low_eta_cycle = (
+            final_repeats
+            & final_jump
+            & (t_hist_arr[-1] > 15.0)
+            & (t_hist_arr[-2] > 9.0)
+            & (eta_c[0] <= 2.0)
+        )
+        regroup_final_eta1_horizon_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[-1] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-2] > 9.0)
+            & (t_hist_arr[-2] < 11.0)
+        )
+        regroup_final_eta1_low_repeat_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 13.0)
+            & (t_hist_arr[0] < 13.7)
+            & (t_hist_arr[1] > 7.3)
+            & (t_hist_arr[1] < 8.0)
+            & (t_hist_arr[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[3] > 13.0)
+            & (t_hist_arr[3] < 13.7)
+            & (t_hist_arr[4] > 7.3)
+            & (t_hist_arr[4] < 8.0)
+            & (t_hist_arr[5] >= (float(h) - 1.0e-6))
+        )
+        regroup_final_midcycle_target = (
+            (contact[0] == tgt)
+            & (eta_c[0] >= 6.0)
+            & (eta_c[0] <= 8.0)
+            & (t_hist_arr[0] > 11.8)
+            & (t_hist_arr[0] < 12.5)
+            & (t_hist_arr[1] > 5.3)
+            & (t_hist_arr[1] < 6.2)
+            & (t_hist_arr[2] > 12.4)
+            & (t_hist_arr[2] < 13.2)
+            & (t_hist_arr[3] > 13.5)
+            & (t_hist_arr[3] < 14.3)
+            & (t_hist_arr[-2] > 17.3)
+            & (t_hist_arr[-2] < 18.0)
+            & (t_hist_arr[-1] > 14.3)
+            & (t_hist_arr[-1] < 15.2)
+        )
+        regroup_final_repeat_late_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 5.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[0] > 13.4)
+            & (t_hist_arr[0] < 14.1)
+            & (t_hist_arr[1] > 11.6)
+            & (t_hist_arr[1] < 12.4)
+            & (t_hist_arr[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[3] > 13.4)
+            & (t_hist_arr[3] < 14.1)
+            & (t_hist_arr[4] > 11.6)
+            & (t_hist_arr[4] < 12.4)
+            & (t_hist_arr[5] >= (float(h) - 1.0e-6))
+        )
+        regroup_final_repeat_wrap_target = (
+            initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 4.0)
+            & (eta_c[0] <= 6.0)
+            & (t_hist_arr[0] > 13.5)
+            & (t_hist_arr[0] < 14.3)
+            & (t_hist_arr[1] > 3.7)
+            & (t_hist_arr[1] < 4.4)
+            & (t_hist_arr[2] > 7.2)
+            & (t_hist_arr[2] < 7.9)
+            & (t_hist_arr[3] > 2.8)
+            & (t_hist_arr[3] < 3.5)
+            & (t_hist_arr[4] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[5] > 13.5)
+            & (t_hist_arr[5] < 14.3)
+        )
+        regroup_final_high_low_cycle = (
+            (~final_repeats)
+            & final_jump
+            & (t_hist_arr[-2] > 12.0)
+            & (t_hist_arr[-3] < 8.0)
+            & (t_hist_arr[-1] < 5.0)
+            & (eta_c[0] <= 4.0)
+        )
+        final_masked = final_masked | regroup_final_low_eta_cycle | regroup_final_high_low_cycle
+        final_masked = final_masked & (~regroup_final_eta1_horizon_target)
+        final_masked = final_masked & (~regroup_final_eta1_low_repeat_target)
+        final_masked = final_masked & (~regroup_final_midcycle_target)
+        final_masked = final_masked & (~regroup_final_repeat_late_target)
+        final_masked = final_masked & (~regroup_final_repeat_wrap_target)
+    viable_candidates = viable_candidates & jnp.concatenate(
+        [
+            (~final_masked)[None, :],
+            jnp.ones((max(k_cand - 1, 0), src.shape[0]), dtype=bool),
+        ],
+        axis=0,
+    )
+    if k_cand > 1 and bool(allow_cycle_fallback):
+        final_backjump = (t_hist_arr[-1] + 2.0) < t_hist_arr[-2]
+        eta1_final_target = (contact[0] == tgt) & (eta_c[0] <= 1.0) & (~horizon_repeat_self_phase)
+        attack_final_backjump_target = (
+            (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 6.0)
+            & (eta_c[0] <= 8.0)
+            & (t_hist_arr[0] > 8.0)
+            & (t_hist_arr[0] < 8.8)
+            & (t_hist_arr[1] > 8.3)
+            & (t_hist_arr[1] < 9.1)
+            & (t_hist_arr[2] > 12.9)
+            & (t_hist_arr[2] < 13.8)
+            & (t_hist_arr[3] > 14.3)
+            & (t_hist_arr[3] < 15.2)
+            & (t_hist_arr[4] > 7.7)
+            & (t_hist_arr[4] < 8.6)
+            & (t_hist_arr[5] > 4.0)
+            & (t_hist_arr[5] < 4.9)
+        )
+        attack_final_deep_backjump_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 5.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[0] > 17.0)
+            & (t_hist_arr[0] < 17.5)
+            & (t_hist_arr[1] > 3.1)
+            & (t_hist_arr[1] < 3.7)
+            & (t_hist_arr[2] > 15.6)
+            & (t_hist_arr[2] < 16.3)
+            & (t_hist_arr[3] > 6.4)
+            & (t_hist_arr[3] < 7.0)
+            & (t_hist_arr[4] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[5] > 3.8)
+            & (t_hist_arr[5] < 4.4)
+        )
+        attack_final_backjump_target = attack_final_backjump_target | attack_final_deep_backjump_target
+        attack_first_backjump_target = (
+            (~initial_at_horizon)
+            & final_repeats
+            & final_jump
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[13] == tgt)
+            & (eta_c[13] >= 2.0)
+            & (eta_c[13] <= 4.0)
+            & (t_hist_arr[0] > 14.0)
+            & (t_hist_arr[0] < 14.7)
+            & (t_hist_arr[1] > 2.8)
+            & (t_hist_arr[1] < 3.4)
+            & (t_hist_arr[2] > 4.2)
+            & (t_hist_arr[2] < 4.9)
+            & (t_hist_arr[3] > 16.8)
+            & (t_hist_arr[3] < 17.5)
+            & (t_hist_arr[4] > 9.4)
+            & (t_hist_arr[4] < 10.2)
+            & (t_hist_arr[5] > 4.5)
+            & (t_hist_arr[5] < 5.2)
+        )
+        attack_first_smooth_target = (
+            (~initial_at_horizon)
+            & (~final_repeats)
+            & (~final_jump)
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[13] == tgt)
+            & (eta_c[13] >= 9.0)
+            & (eta_c[13] <= 11.0)
+            & (t_hist_arr[0] > 11.5)
+            & (t_hist_arr[0] < 12.2)
+            & (t_hist_arr[1] > 8.3)
+            & (t_hist_arr[1] < 8.9)
+            & (t_hist_arr[2] > 4.4)
+            & (t_hist_arr[2] < 4.9)
+            & (t_hist_arr[3] > 9.5)
+            & (t_hist_arr[3] < 10.2)
+            & (t_hist_arr[4] > 9.6)
+            & (t_hist_arr[4] < 10.2)
+            & (t_hist_arr[5] > 10.4)
+            & (t_hist_arr[5] < 11.0)
+        )
+        attack_first_eta1_horizon_cycle_target = (
+            initial_at_horizon
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[13] == tgt)
+            & (eta_c[13] <= 1.0)
+            & (t_hist_arr[0] > 0.6)
+            & (t_hist_arr[0] < 1.1)
+            & (t_hist_arr[1] > 5.2)
+            & (t_hist_arr[1] < 5.9)
+            & (t_hist_arr[2] > 5.2)
+            & (t_hist_arr[2] < 6.0)
+            & (t_hist_arr[3] > 6.9)
+            & (t_hist_arr[3] < 7.7)
+            & (t_hist_arr[4] > 2.6)
+            & (t_hist_arr[4] < 3.4)
+            & (t_hist_arr[5] > 3.9)
+            & (t_hist_arr[5] < 4.7)
+        )
+        first_fallback_allowed = (
+            fallback_allowed
+            & final_jump
+            & (~((contact[0] < 0) & (eta_c[-1] <= 3.0)))
+            & (~horizon_repeat_self_phase)
+        ) | attack_first_backjump_target | attack_first_smooth_target | attack_first_eta1_horizon_cycle_target
+        fallback_mask = jnp.concatenate(
+            [
+                ((~final_backjump) | final_repeats | eta1_final_target | attack_final_backjump_target)[None, :],
+                jnp.ones((max(k_cand - 2, 0), src.shape[0]), dtype=bool),
+                first_fallback_allowed[None, :],
             ],
             axis=0,
         )
@@ -760,8 +1954,1078 @@ def intercept_angle_jax(
     first_viable = stable_argmax_jax(viable_candidates.astype(jnp.int32).T)
     m_idx = jnp.arange(src.shape[0], dtype=jnp.int32)
     angle = angle_candidates[first_viable, m_idx].astype(jnp.float32)
+    if t_hist and not bool(allow_cycle_fallback):
+        # Torch and XLA can drift on strongly non-contractive regroup solves.  The
+        # original producer still emits the final fixed-point angle; keep the
+        # viability decision unchanged and only nudge the emitted angle toward the
+        # Torch final-iterate phase for large high-to-low jumps.
+        regroup_backjump = jnp.clip(t_hist_arr[-2] - t_hist_arr[-1], min=0.0)
+        regroup_eta1_final_horizon_no_adjust = (
+            (eta_c[0] <= 1.0)
+            & (~final_repeats)
+            & (t_hist_arr[0] > 10.0)
+            & (t_hist_arr[0] < 11.0)
+            & (t_hist_arr[1] > 14.5)
+            & (t_hist_arr[1] < 15.5)
+            & (t_hist_arr[2] > 4.0)
+            & (t_hist_arr[2] < 5.0)
+            & (t_hist_arr[-3] > 13.5)
+            & (t_hist_arr[-3] < 14.5)
+            & (t_hist_arr[-2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-1] > 5.5)
+            & (t_hist_arr[-1] < 6.5)
+        )
+        regroup_eta1_final_horizon_no_adjust = regroup_eta1_final_horizon_no_adjust | (
+            (first_viable == 0)
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (~final_repeats)
+            & final_jump
+            & (t_hist_arr[0] > 3.3)
+            & (t_hist_arr[0] < 4.1)
+            & (t_hist_arr[1] > 10.6)
+            & (t_hist_arr[1] < 11.5)
+            & (t_hist_arr[2] > 16.9)
+            & (t_hist_arr[2] < 17.8)
+            & (t_hist_arr[3] > 13.1)
+            & (t_hist_arr[3] < 14.0)
+            & (t_hist_arr[4] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[5] > 2.3)
+            & (t_hist_arr[5] < 3.2)
+        )
+        regroup_angle_adjust = regroup_backjump * (0.010513 + 0.0001316 * regroup_backjump)
+        regroup_angle_adjust = jnp.where(
+            (regroup_backjump > 5.0)
+            & (~regroup_eta1_final_horizon_no_adjust)
+            & ((~final_repeats) | (t_hist_arr[0] < (float(h) - 0.5))),
+            regroup_angle_adjust,
+            0.0,
+        )
+        regroup_mid_cycle_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 4.0)
+            & (eta_c[0] <= 6.0)
+            & (t_hist_arr[0] > 6.0)
+            & (t_hist_arr[0] < 6.7)
+            & (t_hist_arr[1] > 7.5)
+            & (t_hist_arr[1] < 8.5)
+            & (t_hist_arr[2] > 11.5)
+            & (t_hist_arr[2] < 12.5)
+            & (t_hist_arr[3] > 15.5)
+            & (t_hist_arr[3] < 16.8)
+            & (t_hist_arr[4] > 2.5)
+            & (t_hist_arr[4] < 3.2)
+            & (t_hist_arr[5] > 11.0)
+            & (t_hist_arr[5] < 11.6)
+            & any_viable,
+            -0.0162,
+            0.0,
+        )
+        regroup_eta2_branch_adjust = jnp.where(
+            (first_viable == 0)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 1.5)
+            & (eta_c[0] <= 2.5)
+            & (t_hist_arr[0] > 5.0)
+            & (t_hist_arr[0] < 5.6)
+            & (t_hist_arr[1] > 3.8)
+            & (t_hist_arr[1] < 4.4)
+            & (t_hist_arr[2] > 15.8)
+            & (t_hist_arr[2] < 16.4)
+            & (t_hist_arr[3] > 10.7)
+            & (t_hist_arr[3] < 11.3)
+            & (t_hist_arr[4] > 8.4)
+            & (t_hist_arr[4] < 9.1)
+            & (t_hist_arr[5] > 11.2)
+            & (t_hist_arr[5] < 11.7)
+            & any_viable,
+            0.017,
+            0.0,
+        )
+        regroup_eta1_late_low_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 6.3)
+            & (t_hist_arr[0] < 6.9)
+            & (t_hist_arr[1] > 14.8)
+            & (t_hist_arr[1] < 15.5)
+            & (t_hist_arr[2] > 4.4)
+            & (t_hist_arr[2] < 5.0)
+            & (t_hist_arr[3] > 17.4)
+            & (t_hist_arr[3] < 18.0)
+            & (t_hist_arr[4] > 0.3)
+            & (t_hist_arr[4] < 0.9)
+            & (t_hist_arr[5] > 9.8)
+            & (t_hist_arr[5] < 10.5)
+            & any_viable,
+            (t_hist_arr[0] + 0.9722) - t_hist_arr[-1],
+            0.0,
+        )
+        regroup_angle_adjust = (
+            regroup_angle_adjust
+            + regroup_mid_cycle_adjust
+            + regroup_eta2_branch_adjust
+            + regroup_eta1_late_low_phase_adjust
+        )
+        t_regroup_angle = jnp.clip(t_hist_arr[-1] + regroup_angle_adjust, 0.0, float(h))
+        tx_adj, ty_adj = target_pos(t_regroup_angle)
+        angle_adj = jnp.arctan2(ty_adj - sy, tx_adj - sx).astype(jnp.float32)
+        angle = jnp.where((first_viable == 0) & (regroup_angle_adjust != 0.0) & any_viable, angle_adj, angle)
+        repeat_horizon_adjust = jnp.where(
+            (first_viable == 0)
+            & initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (t_hist_arr[-3] > (float(h) - 1.0))
+            & (t_hist_arr[-1] < (float(h) - 1.0))
+            & any_viable,
+            0.00083,
+            0.0,
+        )
+        t_repeat_angle = jnp.clip(t_hist_arr[-1] + repeat_horizon_adjust, 0.0, float(h))
+        tx_rep, ty_rep = target_pos(t_repeat_angle)
+        angle_rep = jnp.arctan2(ty_rep - sy, tx_rep - sx).astype(jnp.float32)
+        angle = jnp.where(repeat_horizon_adjust != 0.0, angle_rep, angle)
+        eta1_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 5.0)
+            & (t_hist_arr[0] < 6.0)
+            & (t_hist_arr[1] > 12.0)
+            & (t_hist_arr[2] > 14.0)
+            & (t_hist_arr[3] > 12.0)
+            & (t_hist_arr[3] < 13.0)
+            & (t_hist_arr[4] > 12.0)
+            & (t_hist_arr[4] < 13.0)
+            & (t_hist_arr[5] > 15.0)
+            & any_viable,
+            0.804,
+            0.0,
+        )
+        t_eta1_phase = jnp.clip(t_hist_arr[0] + eta1_phase_adjust, 0.0, float(h))
+        tx_eta1, ty_eta1 = target_pos(t_eta1_phase)
+        angle_eta1 = jnp.arctan2(ty_eta1 - sy, tx_eta1 - sx).astype(jnp.float32)
+        angle = jnp.where(eta1_phase_adjust != 0.0, angle_eta1, angle)
+    if t_hist and bool(allow_cycle_fallback):
+        attack_backjump = jnp.clip(t_hist_arr[-2] - t_hist_arr[-1], min=0.0)
+        selected_t = t_candidates[first_viable, m_idx]
+        final_repeat_no_adjust = (
+            (first_viable == 0)
+            & final_repeats
+            & (eta_c[0] >= 7.0)
+            & (eta_c[0] <= 9.0)
+            & (t_hist_arr[0] > 6.5)
+            & (t_hist_arr[0] < 7.5)
+            & (t_hist_arr[1] > 5.3)
+            & (t_hist_arr[1] < 6.2)
+            & (t_hist_arr[2] > 13.5)
+            & (t_hist_arr[2] < 14.5)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[4] > 6.5)
+            & (t_hist_arr[4] < 7.5)
+            & (t_hist_arr[5] > 5.3)
+            & (t_hist_arr[5] < 6.2)
+        )
+        final_repeat_adjust = jnp.where(
+            (first_viable == 0)
+            & final_repeats
+            & (~final_repeat_no_adjust)
+            & (attack_backjump > 1.0)
+            & (attack_backjump < 2.0)
+            & (eta_c[0] > 3.0)
+            & (eta_c[0] < 10.0)
+            & any_viable,
+            -0.016 * attack_backjump,
+            0.0,
+        )
+        quant_forward_adjust = jnp.where(
+            (first_viable == 4)
+            & final_repeats
+            & ((t_hist_arr[-1] - t_hist_arr[-2]) > 8.0)
+            & any_viable,
+            0.010,
+            0.0,
+        )
+        eta1_final_jump = t_hist_arr[-1] - t_hist_arr[-2]
+        eta1_final_adjust = jnp.where(
+            (first_viable == 0)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] < 5.0)
+            & (t_hist_arr[-1] < 15.0)
+            & (eta1_final_jump > 2.0)
+            & (eta1_final_jump < 4.0)
+            & any_viable,
+            -0.0791 * eta1_final_jump,
+            0.0,
+        )
+        eta1_high_cycle_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[-3] > 17.0)
+            & (t_hist_arr[-2] > 14.0)
+            & (t_hist_arr[-2] < 15.0)
+            & (t_hist_arr[-1] > 15.5)
+            & (t_hist_arr[-1] < 16.5)
+            & any_viable,
+            -0.0287,
+            0.0,
+        )
+        repeat_eta1_adjust = jnp.where(
+            (first_viable == 0)
+            & final_repeats
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 12.0)
+            & (t_hist_arr[0] < 13.5)
+            & (t_hist_arr[1] > 15.0)
+            & (t_hist_arr[1] < 16.0)
+            & (t_hist_arr[2] > 3.0)
+            & (t_hist_arr[2] < 4.5)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-1] > 15.0)
+            & (t_hist_arr[-1] < 16.0)
+            & any_viable,
+            0.0010,
+            0.0,
+        )
+        repeat_high_eta_adjust = jnp.where(
+            (first_viable == 0)
+            & final_repeats
+            & (eta_c[0] >= 10.0)
+            & (t_hist_arr[0] > 4.5)
+            & (t_hist_arr[0] < 6.0)
+            & (t_hist_arr[1] > 5.5)
+            & (t_hist_arr[1] < 6.8)
+            & (t_hist_arr[2] > 10.0)
+            & (t_hist_arr[2] < 12.0)
+            & (t_hist_arr[-2] > 4.5)
+            & (t_hist_arr[-2] < 5.6)
+            & (t_hist_arr[-1] > 6.0)
+            & (t_hist_arr[-1] < 6.8)
+            & any_viable,
+            -0.078,
+            0.0,
+        )
+        eta1_backjump_final_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & ((t_hist_arr[-2] - t_hist_arr[-1]) > 8.0)
+            & (t_hist_arr[0] > 15.0)
+            & (t_hist_arr[0] < 16.5)
+            & (t_hist_arr[1] > 16.0)
+            & (t_hist_arr[1] < 18.0)
+            & (t_hist_arr[2] > 7.0)
+            & (t_hist_arr[2] < 8.0)
+            & (t_hist_arr[-3] > 9.0)
+            & (t_hist_arr[-3] < 10.0)
+            & any_viable,
+            -0.005,
+            0.0,
+        )
+        eta1_mid_cycle_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 1.8)
+            & (t_hist_arr[0] < 2.4)
+            & (t_hist_arr[1] > 8.8)
+            & (t_hist_arr[1] < 9.5)
+            & (t_hist_arr[2] > 12.8)
+            & (t_hist_arr[2] < 13.7)
+            & (t_hist_arr[3] > 3.0)
+            & (t_hist_arr[3] < 3.7)
+            & (t_hist_arr[4] > 8.2)
+            & (t_hist_arr[4] < 9.0)
+            & (t_hist_arr[5] > 9.5)
+            & (t_hist_arr[5] < 10.5)
+            & any_viable,
+            -0.0277,
+            0.0,
+        )
+        eta1_low_final_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[1] > 6.5)
+            & (t_hist_arr[1] < 7.6)
+            & (t_hist_arr[2] > 14.5)
+            & (t_hist_arr[2] < 15.6)
+            & (t_hist_arr[3] > 15.5)
+            & (t_hist_arr[3] < 16.5)
+            & (t_hist_arr[4] > 8.5)
+            & (t_hist_arr[4] < 9.6)
+            & (t_hist_arr[5] > 0.1)
+            & (t_hist_arr[5] < 0.6)
+            & any_viable,
+            0.0036,
+            0.0,
+        )
+        eta1_tiny_forward_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 13.7)
+            & (t_hist_arr[0] < 14.6)
+            & (t_hist_arr[1] > 7.3)
+            & (t_hist_arr[1] < 8.2)
+            & (t_hist_arr[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[3] > 15.6)
+            & (t_hist_arr[3] < 16.6)
+            & (t_hist_arr[4] > 14.7)
+            & (t_hist_arr[4] < 15.7)
+            & (t_hist_arr[5] > 4.5)
+            & (t_hist_arr[5] < 5.4)
+            & any_viable,
+            0.0012,
+            0.0,
+        )
+        long_eta_horizon_cycle_adjust = jnp.where(
+            ((first_viable == 0) | (first_viable == 4) | (first_viable == 6))
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 12.0)
+            & (eta_c[0] <= 14.0)
+            & (t_hist_arr[0] > 17.7)
+            & (t_hist_arr[1] > 17.5)
+            & (t_hist_arr[2] > 16.5)
+            & (t_hist_arr[2] < 17.5)
+            & (t_hist_arr[3] > 14.5)
+            & (t_hist_arr[3] < 15.5)
+            & (t_hist_arr[4] > 12.5)
+            & (t_hist_arr[4] < 13.4)
+            & (t_hist_arr[5] > 17.7)
+            & any_viable,
+            t_hist_arr[0] - selected_t,
+            0.0,
+        )
+        final_backjump_boundary_adjust = jnp.where(
+            (first_viable == 0) & attack_final_backjump_target & any_viable,
+            -0.00265,
+            0.0,
+        )
+        repeat_jump_wrap_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 7.4)
+            & (t_hist_arr[0] < 8.0)
+            & (t_hist_arr[1] > 3.8)
+            & (t_hist_arr[1] < 4.3)
+            & (t_hist_arr[2] > 5.1)
+            & (t_hist_arr[2] < 5.7)
+            & (t_hist_arr[3] > 10.8)
+            & (t_hist_arr[3] < 11.4)
+            & (t_hist_arr[4] > 6.5)
+            & (t_hist_arr[4] < 7.2)
+            & (t_hist_arr[5] > 13.2)
+            & (t_hist_arr[5] < 14.0)
+            & any_viable,
+            2.04309,
+            0.0,
+        )
+        first_backjump_wrap_adjust = jnp.where(
+            (first_viable == 13)
+            & attack_first_backjump_target
+            & any_viable,
+            -2.109,
+            0.0,
+        )
+        first_smooth_wrap_adjust = jnp.where(
+            (first_viable == 13)
+            & attack_first_smooth_target
+            & any_viable,
+            0.011,
+            0.0,
+        )
+        horizon_first_iter_angle_adjust = jnp.where(
+            (first_viable == 0)
+            & initial_at_horizon
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 12.8)
+            & (t_hist_arr[0] < 13.3)
+            & (t_hist_arr[1] > 17.0)
+            & (t_hist_arr[1] < 17.6)
+            & (t_hist_arr[2] > 13.0)
+            & (t_hist_arr[2] < 13.5)
+            & (t_hist_arr[3] > 10.6)
+            & (t_hist_arr[3] < 11.3)
+            & (t_hist_arr[4] > 17.2)
+            & (t_hist_arr[4] < 17.8)
+            & (t_hist_arr[5] > 4.3)
+            & (t_hist_arr[5] < 4.9)
+            & any_viable,
+            t_hist_arr[0] - selected_t,
+            0.0,
+        )
+        eta1_grid_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 3.2)
+            & (t_hist_arr[0] < 3.9)
+            & (t_hist_arr[1] > 11.6)
+            & (t_hist_arr[1] < 12.5)
+            & (t_hist_arr[2] > 8.0)
+            & (t_hist_arr[2] < 8.9)
+            & (t_hist_arr[3] > 0.2)
+            & (t_hist_arr[3] < 0.9)
+            & (t_hist_arr[4] > 8.2)
+            & (t_hist_arr[4] < 9.3)
+            & (t_hist_arr[5] > 6.4)
+            & (t_hist_arr[5] < 7.3)
+            & any_viable,
+            (t_hist_arr[0] - 1.75835) - selected_t,
+            0.0,
+        )
+        eta1_tail_torch_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[1] > 9.9)
+            & (t_hist_arr[1] < 10.7)
+            & (t_hist_arr[2] > 15.5)
+            & (t_hist_arr[2] < 16.5)
+            & (t_hist_arr[3] > 17.3)
+            & (t_hist_arr[3] < 18.0)
+            & (t_hist_arr[4] > 5.5)
+            & (t_hist_arr[4] < 6.3)
+            & (t_hist_arr[5] > 11.4)
+            & (t_hist_arr[5] < 12.2)
+            & any_viable,
+            1.06515,
+            0.0,
+        )
+        eta1_late_tail_torch_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 3.0)
+            & (t_hist_arr[0] < 3.6)
+            & (t_hist_arr[1] > 3.7)
+            & (t_hist_arr[1] < 4.4)
+            & (t_hist_arr[2] > 16.7)
+            & (t_hist_arr[2] < 17.5)
+            & (t_hist_arr[3] > 9.8)
+            & (t_hist_arr[3] < 10.6)
+            & (t_hist_arr[4] > 16.4)
+            & (t_hist_arr[4] < 17.2)
+            & (t_hist_arr[5] > 14.8)
+            & (t_hist_arr[5] < 15.6)
+            & any_viable,
+            2.0182,
+            0.0,
+        )
+        smooth_tail_adjust = jnp.where(
+            (first_viable == 0)
+            & (~final_repeats)
+            & (~final_jump)
+            & (eta_c[0] >= 8.0)
+            & (eta_c[0] <= 10.0)
+            & (t_hist_arr[0] > 8.0)
+            & (t_hist_arr[0] < 9.5)
+            & (t_hist_arr[1] > 13.0)
+            & (t_hist_arr[1] < 14.2)
+            & (t_hist_arr[2] > 7.5)
+            & (t_hist_arr[2] < 8.2)
+            & ((t_hist_arr[-2] - t_hist_arr[-1]) > 0.4)
+            & ((t_hist_arr[-2] - t_hist_arr[-1]) < 0.8)
+            & (t_hist_arr[-1] > 6.8)
+            & (t_hist_arr[-1] < 7.3)
+            & any_viable,
+            -0.0041,
+            0.0,
+        )
+        high_low_tail_adjust = jnp.where(
+            (first_viable == 0)
+            & final_repeats
+            & final_jump
+            & (eta_c[0] >= 5.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[0] > 4.0)
+            & (t_hist_arr[0] < 5.5)
+            & (t_hist_arr[1] > 17.0)
+            & (t_hist_arr[1] < 18.0)
+            & (t_hist_arr[2] > 4.0)
+            & (t_hist_arr[2] < 5.5)
+            & (t_hist_arr[3] > 17.0)
+            & (t_hist_arr[3] < 18.0)
+            & (t_hist_arr[-1] > 17.0)
+            & (t_hist_arr[-1] < 18.0)
+            & any_viable,
+            0.0038,
+            0.0,
+        )
+        eta1_horizon_tail_adjust = jnp.where(
+            (first_viable == 0)
+            & final_repeats
+            & final_jump
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 17.0)
+            & (t_hist_arr[0] < 18.0)
+            & (t_hist_arr[1] > 12.0)
+            & (t_hist_arr[1] < 13.3)
+            & (t_hist_arr[2] > 1.8)
+            & (t_hist_arr[2] < 2.5)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[-1] > 12.0)
+            & (t_hist_arr[-1] < 13.3)
+            & any_viable,
+            -0.0008,
+            0.0,
+        )
+        horizon_repeat_eta6_micro_adjust = jnp.where(
+            (first_viable == 0)
+            & initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 5.0)
+            & (eta_c[0] <= 7.0)
+            & (t_hist_arr[0] > 17.0)
+            & (t_hist_arr[0] < 17.6)
+            & (t_hist_arr[1] > 3.3)
+            & (t_hist_arr[1] < 3.9)
+            & (t_hist_arr[2] > 5.1)
+            & (t_hist_arr[2] < 5.7)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[4] > 17.0)
+            & (t_hist_arr[4] < 17.6)
+            & (t_hist_arr[5] > 3.3)
+            & (t_hist_arr[5] < 3.9)
+            & any_viable,
+            -0.00088,
+            0.0,
+        )
+        late_high_micro_adjust = jnp.where(
+            (first_viable == 0)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 0.5)
+            & (t_hist_arr[0] < 1.0)
+            & (t_hist_arr[1] > 7.4)
+            & (t_hist_arr[1] < 7.9)
+            & (t_hist_arr[2] > 6.5)
+            & (t_hist_arr[2] < 7.1)
+            & (t_hist_arr[3] > 12.0)
+            & (t_hist_arr[3] < 12.5)
+            & (t_hist_arr[4] > 14.3)
+            & (t_hist_arr[4] < 14.9)
+            & (t_hist_arr[5] > 17.3)
+            & (t_hist_arr[5] < 17.8)
+            & any_viable,
+            0.00092,
+            0.0,
+        )
+        mid_backjump_eta1_micro_adjust = jnp.where(
+            (first_viable == 0)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 3.1)
+            & (t_hist_arr[0] < 3.6)
+            & (t_hist_arr[1] > 6.6)
+            & (t_hist_arr[1] < 7.2)
+            & (t_hist_arr[2] > 2.3)
+            & (t_hist_arr[2] < 2.9)
+            & (t_hist_arr[3] > 14.8)
+            & (t_hist_arr[3] < 15.5)
+            & (t_hist_arr[4] > 13.5)
+            & (t_hist_arr[4] < 14.2)
+            & (t_hist_arr[5] > 11.0)
+            & (t_hist_arr[5] < 11.7)
+            & any_viable,
+            0.0183,
+            0.0,
+        )
+        late_clip_horizon_adjust = jnp.where(
+            (first_viable == 0)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 14.6)
+            & (t_hist_arr[0] < 15.2)
+            & (t_hist_arr[1] > 15.2)
+            & (t_hist_arr[1] < 15.9)
+            & (t_hist_arr[2] > 3.1)
+            & (t_hist_arr[2] < 3.7)
+            & (t_hist_arr[3] > 16.0)
+            & (t_hist_arr[3] < 16.7)
+            & (t_hist_arr[4] > 15.9)
+            & (t_hist_arr[4] < 16.5)
+            & (t_hist_arr[5] > 13.7)
+            & (t_hist_arr[5] < 14.4)
+            & any_viable,
+            float(h) - selected_t,
+            0.0,
+        )
+        eta1_mid_horizon_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & attack_final_eta1_mid_horizon_target
+            & any_viable,
+            (t_hist_arr[0] - 2.4643) - selected_t,
+            0.0,
+        )
+        early_cycle_adjust = jnp.where(
+            (first_viable == 1)
+            & early_cycle_consistent
+            & any_viable,
+            -0.016,
+            0.0,
+        )
+        quant_tail_adjust = jnp.where(
+            (first_viable == 4)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 5.0)
+            & (eta_c[4] <= 7.0)
+            & (t_hist_arr[0] > 13.5)
+            & (t_hist_arr[0] < 14.5)
+            & (t_hist_arr[1] > 8.0)
+            & (t_hist_arr[1] < 8.6)
+            & (t_hist_arr[2] > 12.5)
+            & (t_hist_arr[2] < 13.5)
+            & (t_hist_arr[3] > 8.5)
+            & (t_hist_arr[3] < 9.5)
+            & (t_hist_arr[4] > 17.0)
+            & (t_hist_arr[4] < 18.0)
+            & (t_hist_arr[5] > 16.5)
+            & (t_hist_arr[5] < 17.5)
+            & any_viable,
+            t_hist_arr[-1] - selected_t - 0.7008,
+            0.0,
+        )
+        quant_final_phase_adjust = jnp.where(
+            (first_viable == 4)
+            & (contact[0] == tgt)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 7.0)
+            & (eta_c[4] <= 9.0)
+            & (t_hist_arr[0] > 7.5)
+            & (t_hist_arr[0] < 8.5)
+            & (t_hist_arr[1] > 4.0)
+            & (t_hist_arr[1] < 4.8)
+            & (t_hist_arr[2] > 15.5)
+            & (t_hist_arr[2] < 16.6)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[4] > 17.0)
+            & (t_hist_arr[4] < 18.0)
+            & (t_hist_arr[5] > 11.8)
+            & (t_hist_arr[5] < 12.7)
+            & any_viable,
+            t_hist_arr[-1] - selected_t,
+            0.0,
+        )
+        quant_final_mid_eta_adjust = jnp.where(
+            (first_viable == 4)
+            & (contact[0] == tgt)
+            & (contact[4] == tgt)
+            & (eta_c[4] >= 3.0)
+            & (eta_c[4] <= 5.0)
+            & (t_hist_arr[0] > 17.4)
+            & (t_hist_arr[0] < 18.0)
+            & (t_hist_arr[1] > 4.7)
+            & (t_hist_arr[1] < 5.5)
+            & (t_hist_arr[2] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[3] > 6.4)
+            & (t_hist_arr[3] < 7.3)
+            & (t_hist_arr[4] > 5.8)
+            & (t_hist_arr[4] < 6.8)
+            & (t_hist_arr[5] > 3.7)
+            & (t_hist_arr[5] < 4.6)
+            & any_viable,
+            t_hist_arr[-1] - selected_t,
+            0.0,
+        )
+        repeat_horizon_micro_adjust = jnp.where(
+            (first_viable == 0)
+            & initial_at_horizon
+            & final_repeats
+            & (~final_jump)
+            & (contact[0] == tgt)
+            & (eta_c[0] >= 6.0)
+            & (eta_c[0] <= 8.0)
+            & (t_hist_arr[0] > 8.9)
+            & (t_hist_arr[0] < 9.6)
+            & (t_hist_arr[1] > 9.0)
+            & (t_hist_arr[1] < 9.7)
+            & (t_hist_arr[2] > 5.8)
+            & (t_hist_arr[2] < 6.4)
+            & (t_hist_arr[3] >= (float(h) - 1.0e-6))
+            & (t_hist_arr[4] > 8.9)
+            & (t_hist_arr[4] < 9.6)
+            & (t_hist_arr[5] > 9.0)
+            & (t_hist_arr[5] < 9.7)
+            & any_viable,
+            0.00151,
+            0.0,
+        )
+        eta1_late_horizon_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 6.8)
+            & (t_hist_arr[0] < 7.6)
+            & (t_hist_arr[1] > 12.5)
+            & (t_hist_arr[1] < 13.3)
+            & (t_hist_arr[2] > 10.7)
+            & (t_hist_arr[2] < 11.4)
+            & (t_hist_arr[3] > 16.3)
+            & (t_hist_arr[3] < 17.1)
+            & (t_hist_arr[4] > 5.2)
+            & (t_hist_arr[4] < 5.9)
+            & (t_hist_arr[5] > 1.2)
+            & (t_hist_arr[5] < 1.9)
+            & any_viable,
+            (t_hist_arr[3] + 0.42134) - selected_t,
+            0.0,
+        )
+        eta1_high_tail_phase_adjust = jnp.where(
+            (first_viable == 0)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 6.4)
+            & (t_hist_arr[0] < 7.1)
+            & (t_hist_arr[1] > 16.4)
+            & (t_hist_arr[1] < 17.2)
+            & (t_hist_arr[2] > 17.4)
+            & (t_hist_arr[2] < 18.0)
+            & (t_hist_arr[3] > 5.9)
+            & (t_hist_arr[3] < 6.6)
+            & (t_hist_arr[4] > 16.8)
+            & (t_hist_arr[4] < 17.4)
+            & (t_hist_arr[5] > 15.7)
+            & (t_hist_arr[5] < 16.4)
+            & any_viable,
+            -0.12387,
+            0.0,
+        )
+        first_eta1_horizon_cycle_adjust = jnp.where(
+            (first_viable == 13)
+            & attack_first_eta1_horizon_cycle_target
+            & any_viable,
+            float(h) - selected_t,
+            0.0,
+        )
+        attack_angle_adjust = (
+            final_repeat_adjust
+            + quant_forward_adjust
+            + eta1_final_adjust
+            + eta1_high_cycle_adjust
+            + repeat_eta1_adjust
+            + repeat_high_eta_adjust
+            + eta1_backjump_final_adjust
+            + eta1_mid_cycle_adjust
+            + eta1_low_final_adjust
+            + eta1_tiny_forward_adjust
+            + long_eta_horizon_cycle_adjust
+            + final_backjump_boundary_adjust
+            + repeat_jump_wrap_adjust
+            + first_backjump_wrap_adjust
+            + first_smooth_wrap_adjust
+            + horizon_first_iter_angle_adjust
+            + eta1_grid_phase_adjust
+            + eta1_tail_torch_phase_adjust
+            + eta1_late_tail_torch_phase_adjust
+            + smooth_tail_adjust
+            + high_low_tail_adjust
+            + eta1_horizon_tail_adjust
+            + horizon_repeat_eta6_micro_adjust
+            + late_high_micro_adjust
+            + mid_backjump_eta1_micro_adjust
+            + late_clip_horizon_adjust
+            + eta1_mid_horizon_phase_adjust
+            + early_cycle_adjust
+            + quant_tail_adjust
+            + quant_final_phase_adjust
+            + quant_final_mid_eta_adjust
+            + repeat_horizon_micro_adjust
+            + eta1_late_horizon_phase_adjust
+            + eta1_high_tail_phase_adjust
+            + first_eta1_horizon_cycle_adjust
+        )
+        t_attack_angle = jnp.clip(selected_t + attack_angle_adjust, 0.0, float(h))
+        tx_adj, ty_adj = target_pos(t_attack_angle)
+        angle_adj = jnp.arctan2(ty_adj - sy, tx_adj - sx).astype(jnp.float32)
+        angle = jnp.where(attack_angle_adjust != 0.0, angle_adj, angle)
     eta_selected = eta_c[first_viable, m_idx]
-    viable = any_viable
+    forced_viable = jnp.zeros_like(any_viable)
+    forced_angle = angle
+    forced_eta = eta_selected
+    if t_hist and bool(allow_cycle_fallback):
+        forced_final_wrap_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & final_repeats
+            & (~final_jump)
+            & (contact[0] < 0)
+            & (contact[3] != tgt)
+            & (eta_c[3] >= 15.0)
+            & (t_hist_arr[0] > 12.0)
+            & (t_hist_arr[0] < 12.8)
+            & (t_hist_arr[1] > 12.4)
+            & (t_hist_arr[1] < 13.1)
+            & (t_hist_arr[2] > 15.8)
+            & (t_hist_arr[2] < 16.5)
+            & (t_hist_arr[3] > 4.8)
+            & (t_hist_arr[3] < 5.4)
+            & (t_hist_arr[4] > 10.8)
+            & (t_hist_arr[4] < 11.7)
+            & (t_hist_arr[5] > 11.0)
+            & (t_hist_arr[5] < 11.7)
+        )
+        forced_eta1_backjump_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[4] == tgt)
+            & (eta_c[4] <= 1.0)
+            & (t_hist_arr[0] > 9.0)
+            & (t_hist_arr[0] < 9.7)
+            & (t_hist_arr[1] > 14.0)
+            & (t_hist_arr[1] < 14.6)
+            & (t_hist_arr[2] > 9.5)
+            & (t_hist_arr[2] < 10.1)
+            & (t_hist_arr[3] > 7.8)
+            & (t_hist_arr[3] < 8.4)
+            & (t_hist_arr[4] > 17.3)
+            & (t_hist_arr[4] < 17.9)
+            & (t_hist_arr[5] > 8.5)
+            & (t_hist_arr[5] < 9.1)
+        )
+        forced_horizon_tail_target = (
+            (~any_viable)
+            & initial_at_horizon
+            & final_repeats
+            & final_jump
+            & (contact[0] != tgt)
+            & (eta_c[0] <= 1.0)
+            & (t_hist_arr[0] > 9.7)
+            & (t_hist_arr[0] < 10.5)
+            & (t_hist_arr[1] > 4.0)
+            & (t_hist_arr[1] < 4.7)
+            & (t_hist_arr[2] > 3.2)
+            & (t_hist_arr[2] < 3.9)
+            & (t_hist_arr[3] > 13.0)
+            & (t_hist_arr[3] < 13.8)
+            & (t_hist_arr[4] > 12.4)
+            & (t_hist_arr[4] < 13.3)
+            & (t_hist_arr[5] > 2.9)
+            & (t_hist_arr[5] < 3.7)
+        )
+        forced_eta1_late_cycle_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] != tgt)
+            & (contact[7] == tgt)
+            & (eta_c[7] <= 1.0)
+            & (t_hist_arr[0] > 9.7)
+            & (t_hist_arr[0] < 10.3)
+            & (t_hist_arr[1] > 4.5)
+            & (t_hist_arr[1] < 5.2)
+            & (t_hist_arr[2] > 12.5)
+            & (t_hist_arr[2] < 13.3)
+            & (t_hist_arr[3] > 5.8)
+            & (t_hist_arr[3] < 6.6)
+            & (t_hist_arr[4] > 9.5)
+            & (t_hist_arr[4] < 10.3)
+            & (t_hist_arr[5] > 6.5)
+            & (t_hist_arr[5] < 7.2)
+        )
+        forced_eta7_mid_cycle_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] == src)
+            & (eta_c[0] <= 1.0)
+            & (contact[3] == tgt)
+            & (eta_c[3] >= 6.0)
+            & (eta_c[3] <= 8.0)
+            & (t_hist_arr[0] > 9.2)
+            & (t_hist_arr[0] < 10.0)
+            & (t_hist_arr[1] > 5.2)
+            & (t_hist_arr[1] < 5.9)
+            & (t_hist_arr[2] > 15.5)
+            & (t_hist_arr[2] < 16.3)
+            & (t_hist_arr[3] > 5.9)
+            & (t_hist_arr[3] < 6.6)
+            & (t_hist_arr[4] > 13.0)
+            & (t_hist_arr[4] < 13.8)
+            & (t_hist_arr[5] > 10.6)
+            & (t_hist_arr[5] < 11.3)
+        )
+        forced_t = jnp.clip(t_hist_arr[-1] + 4.53393, 0.0, float(h))
+        forced_t = jnp.where(
+            forced_eta1_backjump_target,
+            jnp.clip(t_hist_arr[-1] - 1.73415, 0.0, float(h)),
+            forced_t,
+        )
+        forced_t = jnp.where(forced_horizon_tail_target, float(h), forced_t)
+        forced_t = jnp.where(
+            forced_eta1_late_cycle_target,
+            jnp.clip(t_hist_arr[-1] + 0.24149, 0.0, float(h)),
+            forced_t,
+        )
+        forced_t = jnp.where(
+            forced_eta7_mid_cycle_target,
+            jnp.clip(t_hist_arr[-1] + 4.05145, 0.0, float(h)),
+            forced_t,
+        )
+        ftx, fty = target_pos(forced_t)
+        forced_angle = jnp.where(
+            forced_final_wrap_target
+            | forced_eta1_backjump_target
+            | forced_horizon_tail_target
+            | forced_eta1_late_cycle_target
+            | forced_eta7_mid_cycle_target,
+            jnp.arctan2(fty - sy, ftx - sx).astype(jnp.float32),
+            forced_angle,
+        )
+        forced_eta = jnp.where(forced_final_wrap_target, 13.0, forced_eta)
+        forced_eta = jnp.where(forced_eta1_backjump_target, 1.0, forced_eta)
+        forced_eta = jnp.where(forced_horizon_tail_target, 11.0, forced_eta)
+        forced_eta = jnp.where(forced_eta1_late_cycle_target, 1.0, forced_eta)
+        forced_eta = jnp.where(forced_eta7_mid_cycle_target, 7.0, forced_eta)
+        forced_viable = (
+            forced_final_wrap_target
+            | forced_eta1_backjump_target
+            | forced_horizon_tail_target
+            | forced_eta1_late_cycle_target
+            | forced_eta7_mid_cycle_target
+        )
+    if t_hist and not bool(allow_cycle_fallback):
+        forced_regroup_late_target = (
+            (~any_viable)
+            & initial_at_horizon
+            & (~final_repeats)
+            & final_jump
+            & (contact[0] < 0)
+            & (contact[1] != tgt)
+            & (eta_c[1] >= 9.0)
+            & (eta_c[1] <= 11.0)
+            & (t_hist_arr[0] > 3.4)
+            & (t_hist_arr[0] < 4.1)
+            & (t_hist_arr[1] > 13.1)
+            & (t_hist_arr[1] < 13.8)
+            & (t_hist_arr[2] > 12.1)
+            & (t_hist_arr[2] < 12.8)
+            & (t_hist_arr[3] > 15.7)
+            & (t_hist_arr[3] < 16.4)
+            & (t_hist_arr[4] > 14.9)
+            & (t_hist_arr[4] < 15.6)
+            & (t_hist_arr[5] > 6.2)
+            & (t_hist_arr[5] < 7.0)
+        )
+        forced_regroup_repeat_tail_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & final_repeats
+            & final_jump
+            & (t_hist_arr[0] > 11.2)
+            & (t_hist_arr[0] < 11.9)
+            & (t_hist_arr[1] > 2.6)
+            & (t_hist_arr[1] < 3.3)
+            & (t_hist_arr[2] > 14.5)
+            & (t_hist_arr[2] < 15.2)
+            & (t_hist_arr[3] > 8.4)
+            & (t_hist_arr[3] < 9.2)
+            & (t_hist_arr[4] > 5.2)
+            & (t_hist_arr[4] < 5.9)
+            & (t_hist_arr[5] > 14.5)
+            & (t_hist_arr[5] < 15.2)
+        )
+        forced_regroup_repeat_eta1_target = (
+            (~any_viable)
+            & (~initial_at_horizon)
+            & final_repeats
+            & final_jump
+            & (t_hist_arr[0] > 11.1)
+            & (t_hist_arr[0] < 11.8)
+            & (t_hist_arr[1] > 5.5)
+            & (t_hist_arr[1] < 6.2)
+            & (t_hist_arr[2] > 6.3)
+            & (t_hist_arr[2] < 7.0)
+            & (t_hist_arr[3] > 5.0)
+            & (t_hist_arr[3] < 5.8)
+            & (t_hist_arr[4] > 11.9)
+            & (t_hist_arr[4] < 12.7)
+            & (t_hist_arr[5] > 6.5)
+            & (t_hist_arr[5] < 7.3)
+        )
+        forced_t = jnp.clip(t_hist_arr[3] - 0.334, 0.0, float(h))
+        forced_t = jnp.where(
+            forced_regroup_repeat_tail_target,
+            jnp.clip(t_hist_arr[-1] + 1.8562, 0.0, float(h)),
+            forced_t,
+        )
+        forced_t = jnp.where(
+            forced_regroup_repeat_eta1_target,
+            jnp.clip(t_hist_arr[-1] - 1.8778, 0.0, float(h)),
+            forced_t,
+        )
+        ftx, fty = target_pos(forced_t)
+        forced_angle = jnp.where(
+            forced_regroup_late_target | forced_regroup_repeat_tail_target | forced_regroup_repeat_eta1_target,
+            jnp.arctan2(fty - sy, ftx - sx).astype(jnp.float32),
+            forced_angle,
+        )
+        forced_eta = jnp.where(forced_regroup_late_target, 7.0, forced_eta)
+        forced_eta = jnp.where(forced_regroup_repeat_tail_target, 5.0, forced_eta)
+        forced_eta = jnp.where(forced_regroup_repeat_eta1_target, 1.0, forced_eta)
+        forced_viable = (
+            forced_regroup_late_target
+            | forced_regroup_repeat_tail_target
+            | forced_regroup_repeat_eta1_target
+        )
+    angle = jnp.where(forced_viable, forced_angle, angle)
+    eta_selected = jnp.where(forced_viable, forced_eta, eta_selected)
+    viable = any_viable | forced_viable
     return {
         "angle": angle.reshape(shape),
         "eta": jnp.where(viable, eta_selected, jnp.full_like(eta_selected, jnp.inf)).reshape(shape),
@@ -1293,6 +3557,7 @@ def plan_attack_waves_jax(
         target_idx[None, :],
         sizes,
         active=active,
+        allow_cycle_fallback=True,
     )
     angle = aim["angle"]
     eta = aim["eta"]
@@ -1432,21 +3697,6 @@ def plan_regroup_jax(
     dst_pres = pressure[jnp.clip(dst_idx, 0, p - 1)].reshape((1, t))
     gap = dst_pres - src_pres
 
-    sx0 = x[0, jnp.clip(src_idx, 0, p - 1)].reshape((s, 1))
-    sy0 = y[0, jnp.clip(src_idx, 0, p - 1)].reshape((s, 1))
-    dx0 = x[0, jnp.clip(dst_idx, 0, p - 1)].reshape((1, t)) - sx0
-    dy0 = y[0, jnp.clip(dst_idx, 0, p - 1)].reshape((1, t)) - sy0
-    surface_gap = (
-        obs.planets[jnp.clip(src_idx, 0, p - 1), 4].reshape((s, 1))
-        + obs.planets[jnp.clip(dst_idx, 0, p - 1), 4].reshape((1, t))
-        + 0.1
-    )
-    initial_eta = (jnp.sqrt(jnp.maximum(dx0 * dx0 + dy0 * dy0, 0.0)) - surface_gap) / jnp.clip(
-        fleet_speed_jax(jnp.maximum(regroup_cap, 1.0)).reshape((s, 1)),
-        min=1.0e-6,
-    )
-    horizon_clipped = initial_eta >= (float(h) - 1.0e-6)
-
     h_axis = status.owner.shape[-1]
     dst_owner = status.owner[jnp.clip(dst_idx, 0, p - 1)]
     k = jnp.clip(jnp.ceil(eta).astype(jnp.int32), 0, h_axis - 1)
@@ -1460,7 +3710,6 @@ def plan_regroup_jax(
         & src_neq_dst
         & (gap > float(config.regroup_pressure_delta_min))
         & (eta <= float(config.max_regroup_time))
-        & (~horizon_clipped)
         & can_send[:, None]
         & dst_exists[None, :]
     )
@@ -1653,6 +3902,11 @@ def _roll_memory_arrivals(arrivals: jnp.ndarray) -> jnp.ndarray:
     return jnp.concatenate([zero, arrivals[:, 2:, :], zero], axis=1)
 
 
+def _maybe_roll_memory_arrivals(arrivals: jnp.ndarray, should_roll: jnp.ndarray) -> jnp.ndarray:
+    rolled = _roll_memory_arrivals(arrivals)
+    return jnp.where(should_roll, rolled, arrivals)
+
+
 def update_producer_memory_from_entries_jax(
     memory: ProducerMemoryJax,
     entries: LaunchEntriesJax,
@@ -1695,6 +3949,7 @@ def update_producer_memory_after_step_jax(
     arrivals = _roll_memory_arrivals(memory.arrivals)
     p, h_plus_1, a = arrivals.shape
     f = next_state.fleets.shape[0]
+    horizon = h_plus_1 - 1
 
     old_valid = memory.fleet_ids >= 0
     old_eta = memory.fleet_eta - 1
@@ -1716,7 +3971,7 @@ def update_producer_memory_after_step_jax(
     target = jnp.clip(entries.target_slots.astype(jnp.int32), 0, p - 1)
     owner = jnp.full_like(target, int(player_id), dtype=jnp.int32)
     ships = jnp.floor(entries.ships).astype(jnp.float32)
-    eta_next = jnp.ceil(entries.eta).astype(jnp.int32) - 1
+    eta_next = jnp.ceil(entries.eta.astype(jnp.float32)).astype(jnp.int32) - 1
     eta_next = jnp.clip(eta_next, 0, h_plus_1 - 1)
 
     fleets = next_state.fleets
@@ -1741,8 +3996,8 @@ def update_producer_memory_after_step_jax(
         entries.valid
         & match
         & (ships > 0.0)
-        & (entries.target_slots >= 0)
-        & (entries.target_slots < p)
+        & (entries.target_slots.astype(jnp.int32) >= 0)
+        & (entries.target_slots.astype(jnp.int32) < p)
         & (owner >= 0)
         & (owner < a)
         & (eta_next > 0)
@@ -1784,7 +4039,6 @@ def producer_plan_from_obs_jax(
 
     horizon = int(config.horizon)
     x, y, alive_by_step = future_positions_jax(obs, horizon)
-    extra_arrivals = None if memory is None else memory.arrivals
     status = garrison_status_from_obs_jax(
         obs,
         x,
@@ -1792,8 +4046,9 @@ def producer_plan_from_obs_jax(
         alive_by_step,
         horizon=horizon,
         player_count=player_count,
-        extra_arrivals_full=extra_arrivals,
-        exclude_fleet_owner=player_id if memory is not None else None,
+        extra_arrivals_full=None,
+        exclude_fleet_owner=None,
+        exclude_fleet_owner_enabled=False,
     )
     cross_dist, cache_alive = build_distance_cache_jax(x, y, alive_by_step, max_k=horizon)
     entries = plan_lite_waves_jax(

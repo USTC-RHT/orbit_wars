@@ -1,9 +1,12 @@
-# Minimal dependency patch for torch-backed eval opponents on CUDA 12.4 drivers.
+# Torch-backed eval opponents need PyTorch, but do not install this file inside
+# the JAX training environment with `pip install -r ...`.
 #
-# Use this inside an existing JAX training environment when eval fails with:
-#   ModuleNotFoundError: No module named 'torch'
-# or when a newer torch wheel such as cu130 cannot initialize CUDA on a 12.4
-# driver.
+# Reason: torch==2.6.0+cu124 depends on nvidia-cudnn-cu12==9.1.0.70, while
+# jax==0.10.0 requires CuDNN 9.8+ at runtime. A normal requirements install can
+# downgrade CuDNN and make JAX fail during import.
+#
+# Use this instead:
+#   bash scripts/install_eval_torch_cu124.sh
 
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.6.0+cu124

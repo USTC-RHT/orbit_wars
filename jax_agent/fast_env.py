@@ -163,7 +163,7 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
         fleet_alive=jnp.asarray(fleet_alive),
         step=jnp.asarray(int(read(observation, "step", 0) or 0), dtype=jnp.int32),
         angular_velocity=jnp.asarray(float(read(observation, "angular_velocity", 0.0) or 0.0), dtype=jnp.float32),
-        next_fleet_id=jnp.asarray(int(read(observation, "next_fleet_id", len(fleets)) or 0), dtype=jnp.int32),
+        next_fleet_id=jnp.asarray(int(read(observation, "next_fleet_id", 0) or 0), dtype=jnp.int32),
         comet_paths=jnp.asarray(comet_paths),
         comet_lengths=jnp.asarray(comet_lengths),
         comet_ships=jnp.asarray(comet_ships),

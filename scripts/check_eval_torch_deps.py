@@ -164,11 +164,10 @@ def main() -> int:
         traceback.print_exc()
         print()
         print("Install/update the eval torch dependency with:")
-        print("  python -m pip uninstall -y torch")
-        print("  python -m pip install -r requirements.eval-torch-cu124.txt")
+        print("  bash scripts/install_eval_torch_cu124.sh")
         print()
-        print("For the CUDA 12.4 wheel only:")
-        print("  python -m pip install --force-reinstall torch==2.6.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124")
+        print("If JAX reports CuDNN 9.1 after installing torch, restore CuDNN with:")
+        print("  python -m pip install --upgrade 'nvidia-cudnn-cu12>=9.8,<10'")
         return 1
 
     pass_line("torch-backed eval dependencies look usable")

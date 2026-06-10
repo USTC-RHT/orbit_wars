@@ -701,7 +701,7 @@ def main() -> None:
     # - lag_checkpoint: 全程/分阶段对 pool_lag_interval 步前 checkpoint。
     # - fixed_pool: 旧版固定池，Phase 1 nearest/current/lag，Phase 2 current/lag。
     # - pfsp: 胜率加权采样，优先训练当前打不过的对手。
-    # - mixed: 按权重在 JAX self-play 和 Python/Kaggle 外部脚本对手间采样。
+    # - mixed: 按权重在 JAX self-play / JAX checkpoint / Python 外部脚本对手间采样。
     raw_pool_mode = str(getattr(cfg, "pool_mode", "pfsp") or "pfsp").lower()
     pool_mode_aliases = {
         "current": "current",
@@ -748,7 +748,7 @@ def main() -> None:
         elif snapshot_pool:
             print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
         elif mixed_pool:
-            print("opponent=pool mixed (JAX self-play + Python external opponents)")
+            print("opponent=pool mixed (JAX self-play/checkpoints + optional Python external opponents)")
         else:
             print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size}, "
                   f"include_nearest={pool_include_nearest})")
@@ -799,7 +799,27 @@ def main() -> None:
                 mixed_entries.append({"id": name, "type": "selfplay-current", "weight": weight})
             elif kind in {"nearest"}:
                 mixed_entries.append({"id": name, "type": "nearest", "weight": weight})
-            elif kind in {"external", "script", "checkpoint", "old", "onnx"}:
+            elif kind in {"jax", "jax_checkpoint", "jax_ckpt", "native", "native_checkpoint"} or (
+                kind in {"checkpoint", "old"} and (entry.get("checkpoint") or entry.get("checkpoint_path"))
+            ):
+                ckpt_value = entry.get("checkpoint") or entry.get("checkpoint_path") or entry.get("path")
+                if not ckpt_value:
+                    raise ValueError(f"opponent_pool[{idx}] jax_checkpoint entry requires checkpoint")
+                ckpt, ckpt_path = _load_checkpoint(str(ckpt_value))
+                ckpt_params = ckpt["params"]
+                _assert_param_compatible(ckpt_params, ckpt_path)
+                mixed_entries.append({
+                    "id": name,
+                    "type": "jax-checkpoint",
+                    "weight": weight,
+                    "params": jax.tree_util.tree_map(jnp.asarray, ckpt_params),
+                    "normalizer_state": jax.tree_util.tree_map(
+                        jnp.asarray,
+                        ckpt.get("normalizer_state", normalizer_state),
+                    ),
+                    "checkpoint": ckpt_path,
+                })
+            elif kind in {"external", "script", "onnx"} or kind in {"checkpoint", "old"}:
                 agent_dir_value = entry.get("agent_dir") or entry.get("path")
                 if not agent_dir_value:
                     raise ValueError(f"opponent_pool[{idx}] external entry requires agent_dir")
@@ -1164,6 +1184,17 @@ def main() -> None:
                     train_state, state, normalizer_state, metrics = _run_external_opponent(
                         selected_pool_entry,
                         train_state,
+                        state,
+                        normalizer_state,
+                        step_key,
+                        ent_scale,
+                    )
+                elif selected_type == "jax-checkpoint":
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay,
+                        train_state,
+                        selected_pool_entry["params"],
+                        selected_pool_entry["normalizer_state"],
                         state,
                         normalizer_state,
                         step_key,

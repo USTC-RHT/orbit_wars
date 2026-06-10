@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import pickle
 import random
 import sys
 from dataclasses import dataclass
@@ -232,6 +233,85 @@ class NearestJaxEvalOpponent:
 
 
 @dataclass(frozen=True)
+class JaxCheckpointEvalOpponent:
+    """完全在 JAX fast_env 内运行的历史 checkpoint 对手。"""
+
+    name: str
+    metric_prefix: str
+    checkpoint_path: Path
+    seed_offset: int = 0
+
+    def exists(self) -> bool:
+        return self.checkpoint_path.exists()
+
+    def metric_fields(self) -> list[str]:
+        return JaxEvalOpponent.metric_fields(self)
+
+    def metric_values(self, result: EvalResult) -> dict[str, float | int]:
+        return JaxEvalOpponent.metric_values(self, result)
+
+    def evaluate(self, ctx: EvalContext) -> EvalResult:
+        with self.checkpoint_path.open("rb") as f:
+            ckpt = pickle.load(f)
+        opp_train_state = ctx.train_state.replace(params=ckpt["params"])
+        opp_normalizer_state = ckpt.get("normalizer_state", ctx.normalizer_state)
+
+        _rng, reset_key = jax.random.split(jax.random.fold_in(ctx.rng, self.seed_offset))
+        state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
+        learner_idx = 1 if int(getattr(ctx, "eval_player", 0)) == 1 else 0
+        opponent_idx = 1 - learner_idx
+
+        def step_fn(st, _):
+            if learner_idx == 1:
+                learner_st = ctx.flip_state(st)
+                learner_acts = ctx.deterministic_policy_actions(
+                    ctx.train_state,
+                    learner_st,
+                    ctx.feat_params,
+                    ctx.normalizer_state,
+                    ctx.norm_params,
+                )
+                learner_acts = ctx.flip_actions(learner_acts)
+                opp_acts = ctx.deterministic_policy_actions(
+                    opp_train_state,
+                    st,
+                    ctx.feat_params,
+                    opp_normalizer_state,
+                    ctx.norm_params,
+                )
+                joint = jnp.stack([opp_acts, learner_acts], axis=1)
+            else:
+                learner_acts = ctx.deterministic_policy_actions(
+                    ctx.train_state,
+                    st,
+                    ctx.feat_params,
+                    ctx.normalizer_state,
+                    ctx.norm_params,
+                )
+                opp_st = ctx.flip_state(st)
+                opp_acts = ctx.deterministic_policy_actions(
+                    opp_train_state,
+                    opp_st,
+                    ctx.feat_params,
+                    opp_normalizer_state,
+                    ctx.norm_params,
+                )
+                opp_acts = ctx.flip_actions(opp_acts)
+                joint = jnp.stack([learner_acts, opp_acts], axis=1)
+            return step_batch(st, joint, ctx.env_params), None
+
+        final_state, _ = jax.lax.scan(step_fn, state, None, length=ctx.env_params.episode_steps)
+        winners = np.array(final_state.winner)
+        wins = int((winners == learner_idx).sum())
+        losses = int((winners == opponent_idx).sum())
+        draws = int((winners == 2).sum())
+        total = max(ctx.num_games, 1)
+        result = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total, "loss_rate": losses / total}
+        print(f"[eval/{self.name}]   p{learner_idx} wins={wins} losses={losses} draws={draws} win_rate={result['win_rate']:.3f}")
+        return result
+
+
+@dataclass(frozen=True)
 class ExternalScriptJaxEvalOpponent:
     """用 Kaggle 环境评估当前 JAX learner 对外部脚本 agent 的胜率。"""
 
@@ -339,17 +419,17 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             seed_offset=15485863,
         ))
     if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
-        opponents.append(ExternalScriptJaxEvalOpponent(
-            name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+        opponents.append(JaxCheckpointEvalOpponent(
+            name="ckpt_048900",
             metric_prefix="ckpt_48900",
-            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_048900.pkl",
             seed_offset=32452843,
         ))
     if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
-        opponents.append(ExternalScriptJaxEvalOpponent(
-            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+        opponents.append(JaxCheckpointEvalOpponent(
+            name="ckpt_032700",
             metric_prefix="ckpt_32700",
-            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_032700.pkl",
             seed_offset=49979687,
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:

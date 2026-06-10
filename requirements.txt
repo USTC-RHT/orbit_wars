@@ -1,9 +1,6 @@
 # Cloud GPU training environment for the current JAX autoregressive PPO stack.
 # Python: 3.12
 # Recommended GPU stack: NVIDIA driver with CUDA 12 support.
-#
-# Existing JAX env only missing torch for external eval? Prefer:
-#   bash scripts/install_eval_torch_cu124.sh
 
 absl-py==2.4.0
 chex==0.1.91

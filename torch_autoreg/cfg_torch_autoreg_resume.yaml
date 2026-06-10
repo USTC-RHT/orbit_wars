@@ -1,0 +1,56 @@
+# Torch autoregressive PPO resume config.
+# Source checkpoint converted into torch_autoreg/checkpoints/ckpt_last.pt:
+# /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+# Launch:
+#   python -m torch_autoreg.train --config torch_autoreg/cfg_torch_autoreg_resume.yaml
+
+seed: 42
+run_name: "torch_autoreg_32700_resume"
+device: cuda
+torch_threads: 4
+log_every: 1
+
+train:
+  checkpoint: checkpoints/ckpt_last.pt
+  out_dir: checkpoints
+  checkpoint_every: 400
+  freeze_normalizer: false
+
+opponent:
+  type: external
+  agent_dir: ../agents/external/slawekbiel-producer
+  learner_player: -1
+
+rollout:
+  num_envs: 128
+  rollout_steps: 64
+
+ppo:
+  total_updates: 50000
+  epochs: 4
+  minibatch_size: 2048
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  ent_coef_fire: 0.005
+  ent_coef_target: 0.01
+  ent_coef_amount: 0.005
+  ent_schedule: linear
+  ent_min_ratio: 0.2
+  lr: 5.0e-5
+  lr_schedule: warmup_cosine
+  warmup_updates: 50
+  min_lr_ratio: 0.1
+  anneal_lr: true
+  max_grad_norm: 0.5
+  norm_adv: true
+  target_kl: 0.02
+
+eval:
+  enabled: true
+  every: 1000
+  games: 20
+  seed: 200000
+  player: 1

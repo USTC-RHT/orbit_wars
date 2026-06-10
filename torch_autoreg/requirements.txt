@@ -1,0 +1,20 @@
+# Minimal dependencies for the Torch autoregressive agent.
+# Python: 3.12
+#
+# JAX is not required for training or inference from:
+#   torch_autoreg/checkpoints/ckpt_last.pt
+#
+# CUDA 12.4 PyTorch wheels live on the PyTorch cu124 index. Keep this as an
+# extra index so normal packages still resolve from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+numpy==2.4.4
+PyYAML==6.0.3
+torch==2.6.0+cu124
+
+# Kaggle Orbit Wars environment and CLI support.
+kaggle==2.0.2
+kaggle-environments @ git+https://github.com/Kaggle/kaggle-environments.git@27660ecca553b96b1e3d6b282ca855fd1f274847
+
+# Registers/provides the local Orbit Wars environment used by training.
+orbit-wars-lab @ git+https://github.com/automatylicza/orbit-wars-lab.git@22654dcb74cbb1deca098ce3799d59eb8750c569

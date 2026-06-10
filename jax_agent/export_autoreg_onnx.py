@@ -63,6 +63,7 @@ def _load_model(ckpt_path: Path):
         "hidden_size": int(cfg.model.hidden_size),
         "use_cnn": bool(cfg.model.use_cnn),
         "max_fleet_tokens": max_fleet_tokens,
+        "fleet_selection": str(getattr(cfg.model, "fleet_selection", "size")),
         "num_transformer_layers": int(getattr(cfg.model, "num_transformer_layers", 2)),
         "num_heads": int(getattr(cfg.model, "num_heads", 4)),
         "max_action_tokens": int(getattr(cfg.model, "max_action_tokens", 16)),

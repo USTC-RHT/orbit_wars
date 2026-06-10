@@ -1,8 +1,8 @@
 # RL_3 配置差异：
 # - 基于 4090 单卡配置，保持 target-mask / autoregressive / impact fleet token 选择逻辑。
 # - 仍然使用 fixed_pool 的两阶段训练：phase 1 先打 nearest、当前策略、lag 策略。
-# - phase 2 的 fixed_pool 在当前策略、lag 策略、producer-jax 之间等概率抽取。
-# - producer-jax 是原版 producer 的 JAX 复刻训练对手；eval 对手使用 sigma。
+# - phase 2 的 fixed_pool 在当前策略、lag 策略之间等概率抽取。
+# - eval 对手使用 sigma。
 # - 评估对手包含 sigma、tamrazov、pool_ckpt900。
 #
 # Launch:
@@ -91,7 +91,7 @@ self_play_update_interval: 50
 pool_mode: fixed_pool
 pool_start_phase: 1
 fixed_pool_phase1_opponents: ["nearest", "selfplay-current", "selfplay-lag"]
-fixed_pool_phase2_opponents: ["selfplay-current", "selfplay-lag", "producer-jax"]
+fixed_pool_phase2_opponents: ["selfplay-current", "selfplay-lag"]
 pool_lag_interval: 50
 promote_nearest_win_rate: 1.0
 promote_consecutive_evals: 2

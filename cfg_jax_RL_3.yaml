@@ -1,9 +1,10 @@
 # RL_3 配置差异：
-# - 基于 4090 单卡配置，保持 target-mask / autoregressive / impact fleet token 选择逻辑。
-# - 仍然使用 fixed_pool 的两阶段训练：phase 1 先打 nearest、当前策略、lag 策略。
-# - phase 2 的 fixed_pool 在当前策略、lag 策略之间等概率抽取。
-# - eval 对手使用 sigma。
-# - 评估对手包含 sigma、tamrazov、pool_ckpt900。
+# - 从 fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl 续训。
+# - 保持 target-mask / autoregressive / impact fleet token 选择逻辑。
+# - mixed 训练池：60% current-policy self-play，20% ckpt48900，20% ckpt32700。
+# - 两个 checkpoint 对手均使用 rl-agent/agents 内的项目本地 ONNX agent。
+# - checkpoint 对手通过 Kaggle env Python rollout 收集轨迹，速度会慢于纯 JIT self-play。
+# - producer 不作为训练对手，也不作为评估对象。
 #
 # Launch:
 #   python -m jax_agent.train_jax --config cfg_jax_RL_3.yaml
@@ -11,12 +12,14 @@
 # 24GB 显存配置：当前已使用 rollout_steps=64、num_envs=128、minibatch_size=2048。
 
 seed: 42
-run_name: "RL_3_fixed_pool_phase2"
+run_name: "RL_3_ckpt32700_resume_jax"
 device: auto
-save_dir: ../kaggle
+save_dir: outputs
 checkpoint_every: 400
 log_every: 1
 opponent: "pool"
+init_from_checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+start_update_from_checkpoint: true
 
 env:
   board_size: 100.0
@@ -87,24 +90,36 @@ ppo:
   clip_vloss: true
   target_kl: 0.02
 
-self_play_update_interval: 50
-pool_mode: fixed_pool
-pool_start_phase: 1
-fixed_pool_phase1_opponents: ["nearest", "selfplay-current", "selfplay-lag"]
-fixed_pool_phase2_opponents: ["selfplay-current", "selfplay-lag"]
+self_play_update_interval: 1
+pool_mode: mixed
+opponent_pool:
+  # 60% current-policy self-play.
+  - name: self_play
+    type: self
+    weight: 0.60
+
+  # 40% old strongest ONNX policies, split between ckpt 48900 and 32700.
+  - name: ckpt_48900
+    type: script
+    weight: 0.20
+    agent_dir: agents/mine/fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid
+  - name: ckpt_32700
+    type: script
+    weight: 0.20
+    agent_dir: agents/mine/fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid
 pool_lag_interval: 50
 promote_nearest_win_rate: 1.0
 promote_consecutive_evals: 2
 
 eval:
   enabled: true
-  every: 1000
-  nearest_every: 50
+  every: 400
+  nearest_every: 0
   slow_every: 400
   games: 20
   seed: 200000
   player: 1
-  opponents: ["sigma", "tamrazov", "pool_ckpt900"]
+  opponents: ["ckpt_48900", "ckpt_32700"]
 
 wandb:
   enabled: true
@@ -114,5 +129,6 @@ wandb:
   tags:
     - autoregressive
     - v1
-    - fixed_pool
+    - ckpt32700_resume
+    - mixed_local_checkpoints
     - rtx4090

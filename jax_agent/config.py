@@ -150,7 +150,7 @@ class TrainConfig:
     checkpoint_every: int = 10
     log_every: int = 1
     opponent: str = "nearest"
-    opponent_pool: list[str] = field(default_factory=lambda: ["nearest"])
+    opponent_pool: list[Any] = field(default_factory=lambda: ["nearest"])
     opponent_pool_weights: list[float] = field(default_factory=lambda: [1.0])
     init_from_checkpoint: str | None = None
     start_update_from_checkpoint: bool = True

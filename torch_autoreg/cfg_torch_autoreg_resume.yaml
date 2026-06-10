@@ -1,11 +1,10 @@
 # Torch autoregressive PPO resume config.
-# Source checkpoint converted into torch_autoreg/checkpoints/ckpt_last.pt:
-# /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+# Source checkpoint is already converted into torch_autoreg/checkpoints/ckpt_last.pt.
 # Launch:
 #   python -m torch_autoreg.train --config torch_autoreg/cfg_torch_autoreg_resume.yaml
 
 seed: 42
-run_name: "torch_autoreg_32700_resume"
+run_name: "torch_autoreg_32700_resume_mixed_pool"
 device: cuda
 torch_threads: 4
 log_every: 1
@@ -17,12 +16,35 @@ train:
   freeze_normalizer: false
 
 opponent:
-  type: external
-  agent_dir: ../agents/external/slawekbiel-producer
+  type: mixed
   learner_player: -1
+  pool:
+    # 60% current-policy self-play.
+    - name: self_play
+      type: self
+      weight: 0.60
+
+    # 30% external evaluation opponent: producer.
+    - name: producer
+      type: external
+      weight: 0.30
+      agent_dir: ../agents/external/slawekbiel-producer
+
+    # 10% old strongest policies, split between ckpt 48900 and 32700.
+    # These point to project-local ONNX checkpoint agent dirs under rl-agent/agents.
+    - name: ckpt_48900
+      type: external
+      weight: 0.05
+      agent_dir: ../agents/mine/fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid
+    - name: ckpt_32700
+      type: external
+      weight: 0.05
+      agent_dir: ../agents/mine/fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid
 
 rollout:
-  num_envs: 128
+  num_envs: 32
+  num_workers: 8
+  device: cpu
   rollout_steps: 64
 
 ppo:
@@ -50,7 +72,17 @@ ppo:
 
 eval:
   enabled: true
-  every: 1000
+  every: 400
   games: 20
   seed: 200000
   player: 1
+  opponents:
+    - name: producer
+      type: external
+      agent_dir: ../agents/external/slawekbiel-producer
+    - name: ckpt_48900
+      type: external
+      agent_dir: ../agents/mine/fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid
+    - name: ckpt_32700
+      type: external
+      agent_dir: ../agents/mine/fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid

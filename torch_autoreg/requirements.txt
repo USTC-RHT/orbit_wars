@@ -9,6 +9,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu124
 
 numpy==2.4.4
+onnxruntime==1.26.0
 PyYAML==6.0.3
 torch==2.6.0+cu124
 

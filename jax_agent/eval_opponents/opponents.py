@@ -18,6 +18,51 @@ from ..fast_env import EnvParams, EnvState, step_batch
 
 
 EvalResult = dict[str, float | int]
+_AGENT_LOCAL_PACKAGES = ("jax_agent", "orbit_lite", "flatbuffers")
+
+
+def _local_package_roots(agent_dir: Path) -> dict[str, Path]:
+    return {
+        name: (agent_dir / name).resolve()
+        for name in _AGENT_LOCAL_PACKAGES
+        if (agent_dir / name).exists()
+    }
+
+
+def _module_is_under(module: Any, root: Path) -> bool:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return False
+    try:
+        Path(module_file).resolve().relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _swap_in_agent_packages(agent_dir: Path) -> dict[str, Any]:
+    """Temporarily remove already-imported package names used by packaged agents."""
+    roots = _local_package_roots(agent_dir)
+    if not roots:
+        return {}
+    saved: dict[str, Any] = {}
+    for name, module in list(sys.modules.items()):
+        package = name.split(".", 1)[0]
+        if package not in roots:
+            continue
+        saved[name] = module
+        sys.modules.pop(name, None)
+    return saved
+
+
+def _restore_agent_packages(agent_dir: Path, saved: dict[str, Any]) -> None:
+    roots = _local_package_roots(agent_dir)
+    for name, module in list(sys.modules.items()):
+        package = name.split(".", 1)[0]
+        root = roots.get(package)
+        if root is not None and _module_is_under(module, root):
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
 
 
 @dataclass(frozen=True)
@@ -91,6 +136,7 @@ class ExternalScriptOpponent:
             raise ImportError(f"Could not load external opponent: {self.main_py}")
         module = importlib.util.module_from_spec(spec)
         old_path = list(sys.path)
+        saved_modules = _swap_in_agent_packages(self.agent_dir)
         try:
             sys.modules[module_name] = module
             sys.path.insert(0, str(self.agent_dir))
@@ -100,6 +146,7 @@ class ExternalScriptOpponent:
             raise
         finally:
             sys.path = old_path
+            _restore_agent_packages(self.agent_dir, saved_modules)
         agent = getattr(module, "agent", None)
         if agent is None or not callable(agent):
             raise AttributeError(f"External opponent has no callable agent(obs): {self.main_py}")
@@ -112,10 +159,17 @@ class ExternalScriptOpponent:
 
     def _call_agent(self, env_index: int, observation: Any) -> list[list[float | int]]:
         module = self.modules[env_index]
-        if self.call_with_config.get(env_index, False):
-            moves = module.agent(observation, {"__raw_path__": str(self.main_py)})
-        else:
-            moves = module.agent(observation)
+        old_path = list(sys.path)
+        saved_modules = _swap_in_agent_packages(self.agent_dir)
+        try:
+            sys.path.insert(0, str(self.agent_dir))
+            if self.call_with_config.get(env_index, False):
+                moves = module.agent(observation, {"__raw_path__": str(self.main_py)})
+            else:
+                moves = module.agent(observation)
+        finally:
+            sys.path = old_path
+            _restore_agent_packages(self.agent_dir, saved_modules)
         return list(moves or [])
 
 
@@ -283,6 +337,20 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             metric_prefix="producer",
             agent_dir=external_root / "slawekbiel-producer",
             seed_offset=15485863,
+        ))
+    if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+            metric_prefix="ckpt_48900",
+            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+            seed_offset=32452843,
+        ))
+    if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+            metric_prefix="ckpt_32700",
+            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+            seed_offset=49979687,
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:
         opponents.append(ExternalScriptJaxEvalOpponent(

@@ -253,8 +253,12 @@ class JaxCheckpointEvalOpponent:
     def evaluate(self, ctx: EvalContext) -> EvalResult:
         with self.checkpoint_path.open("rb") as f:
             ckpt = pickle.load(f)
-        opp_train_state = ctx.train_state.replace(params=ckpt["params"])
-        opp_normalizer_state = ckpt.get("normalizer_state", ctx.normalizer_state)
+        opp_params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+        opp_train_state = ctx.train_state.replace(params=opp_params)
+        opp_normalizer_state = jax.tree_util.tree_map(
+            jnp.asarray,
+            ckpt.get("normalizer_state", ctx.normalizer_state),
+        )
 
         _rng, reset_key = jax.random.split(jax.random.fold_in(ctx.rng, self.seed_offset))
         state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)

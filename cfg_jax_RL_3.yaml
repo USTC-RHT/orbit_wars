@@ -9,7 +9,9 @@
 # Launch:
 #   python -m jax_agent.train_jax --config cfg_jax_RL_3.yaml
 #
-# 24GB 显存配置：当前已使用 rollout_steps=64、num_envs=128、minibatch_size=2048。
+# JAX-native checkpoint 对战显存档：
+# - 64 x 64 = 4096 samples/update，适合 24GB 显存。
+# - 若仍 OOM，可先命令行覆盖 --num-envs 64 --rollout-steps 32。
 
 seed: 42
 run_name: "RL_3_ckpt32700_resume_jax"
@@ -69,7 +71,7 @@ ppo:
   num_envs: 128
   total_updates: 50000
   epochs: 4
-  minibatch_size: 2048
+  minibatch_size: 1024
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.2

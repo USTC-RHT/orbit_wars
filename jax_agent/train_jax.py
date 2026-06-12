@@ -69,6 +69,9 @@ from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions  # noqa: E402
 
 NEG_INF = -1.0e9
+AIM_HORIZON = 60
+AIM_COARSE_STEPS = 120
+AIM_TARGET_INSET = 1e-3
 
 
 def _stack_auto_rollout_rows(rows_by_time: list[list[AutoRollout]]) -> AutoRollout:
@@ -1762,12 +1765,14 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     流程保持一致：
     1. 在 60 回合视野内粗扫描 f(T) 的正到负符号变化。
     2. 二分 12 次得到连续命中时间 T*。
-    3. 只验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
-    4. 每个候选回合都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
+    3. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
+    4. 每个整数回合同时尝试瞄 target(k-1) 和 target(k)，覆盖舰队移动
+       命中与旋转星球 sweep 命中的两个关键几何面。
+    5. 每个候选角都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
     """
 
-    horizon = 60
-    n_coarse = 60
+    horizon = AIM_HORIZON
+    n_coarse = AIM_COARSE_STEPS
     n_bisect = 12
     clearance = 0.1
     speed = fleet_speed_local(jnp.maximum(ships, 1.0))
@@ -1808,15 +1813,17 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     candidate_turns = candidates.astype(jnp.float32)
     candidate_in_range = (candidate_turns >= 1.0) & (candidate_turns <= max_turns[..., None])
 
-    aim_t = candidate_turns - 1.0
-    px, py, target_pos_valid = target_pos_at_time_jax(state, target_idx, aim_t)
-    angle = jnp.arctan2(py - src[..., None, 3], px - src[..., None, 2])
+    aim_turns = jnp.stack([jnp.maximum(candidate_turns - 1.0, 0.0), candidate_turns], axis=-1)
+    aim_px, aim_py, aim_pos_valid = target_pos_at_time_jax(state, target_idx, aim_turns)
+    angle = jnp.arctan2(aim_py - src[..., None, None, 3], aim_px - src[..., None, None, 2])
     cos_a = jnp.cos(angle)
     sin_a = jnp.sin(angle)
-    fx0 = src[..., None, 2] + cos_a * (src[..., None, 4] + clearance)
-    fy0 = src[..., None, 3] + sin_a * (src[..., None, 4] + clearance)
-    fx_t = fx0 + candidate_turns * speed[..., None] * cos_a
-    fy_t = fy0 + candidate_turns * speed[..., None] * sin_a
+    candidate_turns_e = candidate_turns[..., None]
+    candidates_e = candidates[..., None]
+    fx0 = src[..., None, None, 2] + cos_a * (src[..., None, None, 4] + clearance)
+    fy0 = src[..., None, None, 3] + sin_a * (src[..., None, None, 4] + clearance)
+    fx_t = fx0 + candidate_turns_e * speed[..., None, None] * cos_a
+    fy_t = fy0 + candidate_turns_e * speed[..., None, None] * sin_a
 
     sun_hit = point_segment_distance_sq(50.0, 50.0, fx0, fy0, fx_t, fy_t) < 100.0
     first_collision_ok = target_is_first_collision_jax(
@@ -1825,34 +1832,43 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
         state,
         fx0,
         fy0,
-        speed[..., None],
+        speed[..., None, None],
         cos_a,
         sin_a,
-        candidates,
+        candidates_e,
     )
 
-    fx_prev = fx0 + (candidate_turns - 1.0) * speed[..., None] * cos_a
-    fy_prev = fy0 + (candidate_turns - 1.0) * speed[..., None] * sin_a
-    move_d2 = point_segment_distance_sq(px, py, fx_prev, fy_prev, fx_t, fy_t)
-    move_hits_target = move_d2 < target[..., None, 4] ** 2
+    fx_prev = fx0 + (candidate_turns_e - 1.0) * speed[..., None, None] * cos_a
+    fy_prev = fy0 + (candidate_turns_e - 1.0) * speed[..., None, None] * sin_a
+    px_old, py_old, target_pos_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e - 1.0)
+    move_d2 = point_segment_distance_sq(px_old, py_old, fx_prev, fy_prev, fx_t, fy_t)
+    target_hit_radius = jnp.maximum(target[..., None, None, 4] - AIM_TARGET_INSET, 0.0)
+    move_hits_target = move_d2 < target_hit_radius ** 2
 
-    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns)
-    target_moved = ((px_next - px) ** 2 + (py_next - py) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px, py, px_next, py_next)
-    sweep_hits_target = target_moved & target_next_valid & (sweep_d2 < target[..., None, 4] ** 2)
+    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e)
+    target_moved = ((px_next - px_old) ** 2 + (py_next - py_old) ** 2) > 1e-9
+    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px_old, py_old, px_next, py_next)
+    sweep_hits_target = (
+        target_moved
+        & target_next_valid
+        & (sweep_d2 < target_hit_radius ** 2)
+    )
 
     candidate_valid = (
-        has_interval[..., None]
-        & candidate_in_range
+        has_interval[..., None, None]
+        & candidate_in_range[..., None]
+        & aim_pos_valid
         & target_pos_valid
         & (~sun_hit)
         & first_collision_ok
         & (move_hits_target | sweep_hits_target)
-        & (ships[..., None] > 0.0)
+        & (ships[..., None, None] > 0.0)
     )
-    has_valid = candidate_valid.any(axis=-1)
-    chosen = jnp.argmax(candidate_valid, axis=-1)
-    chosen_angle = jnp.take_along_axis(angle, chosen[..., None], axis=-1).squeeze(-1)
+    candidate_valid_flat = candidate_valid.reshape(candidate_valid.shape[:-2] + (6,))
+    angle_flat = angle.reshape(angle.shape[:-2] + (6,))
+    has_valid = candidate_valid_flat.any(axis=-1)
+    chosen = jnp.argmax(candidate_valid_flat, axis=-1)
+    chosen_angle = jnp.take_along_axis(angle_flat, chosen[..., None], axis=-1).squeeze(-1)
     direct_angle = jnp.arctan2(target[..., 3] - src[..., 3], target[..., 2] - src[..., 2])
     return jnp.where(has_valid, chosen_angle, direct_angle), has_valid
 
@@ -1955,7 +1971,7 @@ def target_max_turns_jax(state: EnvState, target_idx, horizon: int):
 
 def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, speed, cos_a, sin_a, hit_turn):
     """按引擎阶段验证候选回合的第一碰撞对象就是目标。"""
-    horizon = 60
+    horizon = AIM_HORIZON
     turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
     turns = turns_i.astype(jnp.float32)
     planets = state.planets
@@ -2011,7 +2027,7 @@ def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, sp
     return (
         in_bounds_until_hit
         & (first_key < large)
-        & (first_planet == target_idx[..., None])
+        & (first_planet == target_idx.reshape(target_idx.shape + (1,) * (hit_turn.ndim - target_idx.ndim)))
         & (first_key >= target_key_lo)
         & (first_key <= target_key_hi)
     )

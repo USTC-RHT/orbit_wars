@@ -49,9 +49,11 @@ LOCAL_PLANET_RADIUS: float = 25.0
 SHIP_RATIOS = np.array([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=np.float32)
 
 # 瞄准参数（与 train_jax.py aim_with_prediction_jax 对齐）
-_N_COARSE: int = 60
+_AIM_HORIZON: int = 60
+_N_COARSE: int = 120
 _N_BISECT: int = 12
 LAUNCH_CLEARANCE: float = 0.1
+AIM_TARGET_INSET: float = 1e-3
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1418,10 +1420,10 @@ def _aim_single_np(
     """单对目标的瞄准求解，返回 (angle, hit_valid)。
 
     对应 train_jax.aim_with_prediction_jax 的单元素逻辑：
-      粗扫描 60 点 → 二分 12 次 → 整数精挑 3 候选
+      60 回合视野内粗扫描 120 点 → 二分 12 次 → 3 个整数回合 x 2 个瞄准角
     """
     speed     = _fleet_speed_scalar(max(ships, 1.0))
-    max_turns = _target_max_turns_np(s, tgt_slot, _N_COARSE)
+    max_turns = _target_max_turns_np(s, tgt_slot, _AIM_HORIZON)
 
     if max_turns < 1 or not s.planet_alive[tgt_slot]:
         tgt_x = float(s.planets[tgt_slot, 2])
@@ -1464,37 +1466,39 @@ def _aim_single_np(
     candidates  = [T for T in candidates if 1 <= T <= max_turns]
 
     for T in candidates:
-        pos = _target_pos_np(s, tgt_slot, T - 1)   # 引擎用 T-1 时刻目标位置确定角度
-        if pos is None:
-            continue
-        px, py   = pos
-        theta    = math.atan2(py - src_y, px - src_x)
-        cos_a    = math.cos(theta)
-        sin_a    = math.sin(theta)
-        fx0      = src_x + cos_a * (src_r + LAUNCH_CLEARANCE)
-        fy0      = src_y + sin_a * (src_r + LAUNCH_CLEARANCE)
-        fx_T     = fx0 + T * speed * cos_a
-        fy_T     = fy0 + T * speed * sin_a
-
-        # 太阳碰撞
-        if _point_segment_dist_scalar(CENTER, CENTER, fx0, fy0, fx_T, fy_T) < SUN_RADIUS:
-            continue
-
-        # 第一碰撞验证
-        if not _target_is_first_collision_np(s, tgt_slot, fx0, fy0, speed, cos_a, sin_a, T):
-            continue
-
-        # 最终命中检测
-        fx_prev = fx0 + (T - 1) * speed * cos_a
-        fy_prev = fy0 + (T - 1) * speed * sin_a
-        tgt_r   = float(s.planets[tgt_slot, 4])
-        if _point_segment_dist_scalar(px, py, fx_prev, fy_prev, fx_T, fy_T) < tgt_r:
-            return theta, True
-        # 扫过检测
+        pos_old = _target_pos_np(s, tgt_slot, T - 1)
         pos_next = _target_pos_np(s, tgt_slot, T)
-        if pos_next is not None and pos_next != (px, py):
-            if _point_segment_dist_scalar(fx_T, fy_T, px, py, pos_next[0], pos_next[1]) < tgt_r:
+        if pos_old is None:
+            continue
+        aim_positions = (pos_old,) if pos_next is None or pos_next == pos_old else (pos_old, pos_next)
+        for aim_pos in aim_positions:
+            px, py   = aim_pos
+            theta    = math.atan2(py - src_y, px - src_x)
+            cos_a    = math.cos(theta)
+            sin_a    = math.sin(theta)
+            fx0      = src_x + cos_a * (src_r + LAUNCH_CLEARANCE)
+            fy0      = src_y + sin_a * (src_r + LAUNCH_CLEARANCE)
+            fx_T     = fx0 + T * speed * cos_a
+            fy_T     = fy0 + T * speed * sin_a
+
+            # 太阳碰撞
+            if _point_segment_dist_scalar(CENTER, CENTER, fx0, fy0, fx_T, fy_T) < SUN_RADIUS:
+                continue
+
+            # 第一碰撞验证
+            if not _target_is_first_collision_np(s, tgt_slot, fx0, fy0, speed, cos_a, sin_a, T):
+                continue
+
+            # 最终命中检测。提交版保守内缩一点，避开原环境 strict < radius 的贴边误差。
+            fx_prev = fx0 + (T - 1) * speed * cos_a
+            fy_prev = fy0 + (T - 1) * speed * sin_a
+            tgt_r   = max(float(s.planets[tgt_slot, 4]) - AIM_TARGET_INSET, 0.0)
+            if _point_segment_dist_scalar(pos_old[0], pos_old[1], fx_prev, fy_prev, fx_T, fy_T) < tgt_r:
                 return theta, True
+            # 扫过检测
+            if pos_next is not None and pos_next != pos_old:
+                if _point_segment_dist_scalar(fx_T, fy_T, pos_old[0], pos_old[1], pos_next[0], pos_next[1]) < tgt_r:
+                    return theta, True
 
     # 全部失败：返回直连角度
     tgt_x = float(s.planets[tgt_slot, 2])

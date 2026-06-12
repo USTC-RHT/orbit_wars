@@ -50,8 +50,7 @@ SHIP_RATIOS = np.array([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=n
 
 # 瞄准参数（与 train_jax.py aim_with_prediction_jax 对齐）
 _AIM_HORIZON: int = 60
-_N_COARSE: int = 120
-_N_BISECT: int = 12
+_AIM_FP_ITERS: int = 8
 LAUNCH_CLEARANCE: float = 0.1
 AIM_TARGET_INSET: float = 1e-3
 
@@ -1420,7 +1419,7 @@ def _aim_single_np(
     """单对目标的瞄准求解，返回 (angle, hit_valid)。
 
     对应 train_jax.aim_with_prediction_jax 的单元素逻辑：
-      60 回合视野内粗扫描 120 点 → 二分 12 次 → 3 个整数回合 x 2 个瞄准角
+      fixed-point 求连续 T* → 3 个整数回合 x 3 个瞄准角
     """
     speed     = _fleet_speed_scalar(max(ships, 1.0))
     max_turns = _target_max_turns_np(s, tgt_slot, _AIM_HORIZON)
@@ -1430,35 +1429,20 @@ def _aim_single_np(
         tgt_y = float(s.planets[tgt_slot, 3])
         return math.atan2(tgt_y - src_y, tgt_x - src_x), False
 
-    def f(T: float) -> float:
-        return _aim_f_np(src_x, src_y, src_r, tgt_slot, s, speed, T)
-
-    # ── 粗扫描 ───────────────────────────────────────────────
-    dt   = max_turns / _N_COARSE
-    prev = f(1e-6)
-    t_lo = t_hi = None
-    for i in range(1, _N_COARSE + 1):
-        t   = i * dt
-        cur = f(t)
-        if prev > 0.0 and cur <= 0.0:
-            t_lo = (i - 1) * dt
-            t_hi = t
-            break
-        prev = cur
-
-    if t_lo is None:
+    pos0 = _target_pos_np(s, tgt_slot, 0.0)
+    if pos0 is None:
         tgt_x = float(s.planets[tgt_slot, 2])
         tgt_y = float(s.planets[tgt_slot, 3])
         return math.atan2(tgt_y - src_y, tgt_x - src_x), False
 
-    # ── 二分精化 ─────────────────────────────────────────────
-    for _ in range(_N_BISECT):
-        mid = (t_lo + t_hi) * 0.5
-        if f(t_lo) * f(mid) <= 0.0:
-            t_hi = mid
-        else:
-            t_lo = mid
-    t_star = (t_lo + t_hi) * 0.5
+    gap = src_r + LAUNCH_CLEARANCE + float(s.planets[tgt_slot, 4])
+    t_star = min(max((math.hypot(pos0[0] - src_x, pos0[1] - src_y) - gap) / speed, 0.0), float(max_turns))
+    for _ in range(_AIM_FP_ITERS):
+        pos = _target_pos_np(s, tgt_slot, t_star)
+        if pos is None:
+            break
+        dist = math.hypot(pos[0] - src_x, pos[1] - src_y)
+        t_star = min(max((dist - gap) / speed, 0.0), float(max_turns))
 
     # ── 整数精挑 3 候选 ──────────────────────────────────────
     T_floor     = int(t_star)
@@ -1466,11 +1450,17 @@ def _aim_single_np(
     candidates  = [T for T in candidates if 1 <= T <= max_turns]
 
     for T in candidates:
+        pos_star = _target_pos_np(s, tgt_slot, t_star)
         pos_old = _target_pos_np(s, tgt_slot, T - 1)
         pos_next = _target_pos_np(s, tgt_slot, T)
         if pos_old is None:
             continue
-        aim_positions = (pos_old,) if pos_next is None or pos_next == pos_old else (pos_old, pos_next)
+        aim_positions = []
+        for pos in (pos_star, pos_old, pos_next):
+            if pos is None:
+                continue
+            if not any(abs(pos[0] - old[0]) < 1e-7 and abs(pos[1] - old[1]) < 1e-7 for old in aim_positions):
+                aim_positions.append(pos)
         for aim_pos in aim_positions:
             px, py   = aim_pos
             theta    = math.atan2(py - src_y, px - src_x)

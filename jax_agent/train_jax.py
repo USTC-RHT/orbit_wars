@@ -70,7 +70,7 @@ from .train_opponents import nearest_opponent_actions  # noqa: E402
 
 NEG_INF = -1.0e9
 AIM_HORIZON = 60
-AIM_COARSE_STEPS = 120
+AIM_FP_ITERS = 8
 AIM_TARGET_INSET = 1e-3
 
 
@@ -1763,44 +1763,32 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     """与 src/physics.py 的 aim_with_prediction 同步的 JAX 批量瞄准。
 
     流程保持一致：
-    1. 在 60 回合视野内粗扫描 f(T) 的正到负符号变化。
-    2. 二分 12 次得到连续命中时间 T*。
-    3. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
-    4. 每个整数回合同时尝试瞄 target(k-1) 和 target(k)，覆盖舰队移动
-       命中与旋转星球 sweep 命中的两个关键几何面。
-    5. 每个候选角都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
+    1. 用 fixed-point 迭代求连续拦截时间 T*。
+    2. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
+    3. 每个整数回合同时尝试瞄 target(T*)、target(k-1) 和 target(k)，
+       覆盖连续拦截点、舰队移动命中和旋转星球 sweep 命中的关键几何面。
+    4. 每个候选角都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
     """
 
     horizon = AIM_HORIZON
-    n_coarse = AIM_COARSE_STEPS
-    n_bisect = 12
     clearance = 0.1
     speed = fleet_speed_local(jnp.maximum(ships, 1.0))
     max_turns = target_max_turns_jax(state, target_idx, horizon).astype(jnp.float32)
     can_search = max_turns >= 1.0
 
-    samples = jnp.arange(1, n_coarse + 1, dtype=jnp.float32)
-    dt = max_turns[..., None] / float(n_coarse)
-    ts = samples * dt
-    f_cur = aim_f_jax(src, target, target_idx, state, speed, ts)
-    f_prev0 = aim_f_jax(src, target, target_idx, state, speed, jnp.full_like(max_turns, 1e-6))
-    f_prev = jnp.concatenate([f_prev0[..., None], f_cur[..., :-1]], axis=-1)
-    crossing = (f_prev > 0.0) & (f_cur <= 0.0) & can_search[..., None]
-    has_interval = crossing.any(axis=-1)
-    first_i = jnp.argmax(crossing, axis=-1).astype(jnp.float32)
-    t_lo = first_i * (max_turns / float(n_coarse))
-    t_hi = (first_i + 1.0) * (max_turns / float(n_coarse))
+    px0, py0, target0_valid = target_pos_at_time_jax(state, target_idx, jnp.zeros_like(max_turns))
+    gap = src[..., 4] + clearance + target[..., 4]
+    d0 = jnp.sqrt((px0 - src[..., 2]) ** 2 + (py0 - src[..., 3]) ** 2)
+    t_star = jnp.clip((d0 - gap) / speed, 0.0, max_turns)
 
-    def bisect_body(_, carry):
-        lo, hi = carry
-        mid = 0.5 * (lo + hi)
-        f_lo = aim_f_jax(src, target, target_idx, state, speed, lo)
-        f_mid = aim_f_jax(src, target, target_idx, state, speed, mid)
-        use_left = (f_lo * f_mid) <= 0.0
-        return jnp.where(use_left, lo, mid), jnp.where(use_left, mid, hi)
+    def fixed_point_body(_, t_cur):
+        px, py, pos_valid = target_pos_at_time_jax(state, target_idx, t_cur)
+        dist = jnp.sqrt((px - src[..., 2]) ** 2 + (py - src[..., 3]) ** 2)
+        t_next = jnp.clip((dist - gap) / speed, 0.0, max_turns)
+        return jnp.where(pos_valid, t_next, t_cur)
 
-    t_lo, t_hi = jax.lax.fori_loop(0, n_bisect, bisect_body, (t_lo, t_hi))
-    t_star = 0.5 * (t_lo + t_hi)
+    t_star = jax.lax.fori_loop(0, AIM_FP_ITERS, fixed_point_body, t_star)
+    has_solution = can_search & target0_valid
     t_floor = jnp.floor(t_star).astype(jnp.int32)
     candidates = jnp.stack(
         [
@@ -1813,7 +1801,15 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     candidate_turns = candidates.astype(jnp.float32)
     candidate_in_range = (candidate_turns >= 1.0) & (candidate_turns <= max_turns[..., None])
 
-    aim_turns = jnp.stack([jnp.maximum(candidate_turns - 1.0, 0.0), candidate_turns], axis=-1)
+    t_star_for_candidates = jnp.broadcast_to(t_star[..., None], candidate_turns.shape)
+    aim_turns = jnp.stack(
+        [
+            t_star_for_candidates,
+            jnp.maximum(candidate_turns - 1.0, 0.0),
+            candidate_turns,
+        ],
+        axis=-1,
+    )
     aim_px, aim_py, aim_pos_valid = target_pos_at_time_jax(state, target_idx, aim_turns)
     angle = jnp.arctan2(aim_py - src[..., None, None, 3], aim_px - src[..., None, None, 2])
     cos_a = jnp.cos(angle)
@@ -1855,7 +1851,7 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     )
 
     candidate_valid = (
-        has_interval[..., None, None]
+        has_solution[..., None, None]
         & candidate_in_range[..., None]
         & aim_pos_valid
         & target_pos_valid
@@ -1864,8 +1860,8 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
         & (move_hits_target | sweep_hits_target)
         & (ships[..., None, None] > 0.0)
     )
-    candidate_valid_flat = candidate_valid.reshape(candidate_valid.shape[:-2] + (6,))
-    angle_flat = angle.reshape(angle.shape[:-2] + (6,))
+    candidate_valid_flat = candidate_valid.reshape(candidate_valid.shape[:-2] + (9,))
+    angle_flat = angle.reshape(angle.shape[:-2] + (9,))
     has_valid = candidate_valid_flat.any(axis=-1)
     chosen = jnp.argmax(candidate_valid_flat, axis=-1)
     chosen_angle = jnp.take_along_axis(angle_flat, chosen[..., None], axis=-1).squeeze(-1)

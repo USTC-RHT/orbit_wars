@@ -94,6 +94,11 @@ def point_segment_distance_sq(
     return ddx * ddx + ddy * ddy
 
 
+def circle_collision_hit(d2: jnp.ndarray, radius: jnp.ndarray) -> jnp.ndarray:
+    """Engine-faithful strict segment/circle hit test."""
+    return d2 < radius * radius
+
+
 def empty_state(params: EnvParams = EnvParams()) -> EnvState:
     """创建固定形状的空环境状态。"""
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
@@ -163,7 +168,7 @@ def state_from_observation(observation: Any, params: EnvParams = EnvParams()) ->
         fleet_alive=jnp.asarray(fleet_alive),
         step=jnp.asarray(int(read(observation, "step", 0) or 0), dtype=jnp.int32),
         angular_velocity=jnp.asarray(float(read(observation, "angular_velocity", 0.0) or 0.0), dtype=jnp.float32),
-        next_fleet_id=jnp.asarray(int(read(observation, "next_fleet_id", len(fleets)) or 0), dtype=jnp.int32),
+        next_fleet_id=jnp.asarray(int(read(observation, "next_fleet_id", 0) or 0), dtype=jnp.int32),
         comet_paths=jnp.asarray(comet_paths),
         comet_lengths=jnp.asarray(comet_lengths),
         comet_ships=jnp.asarray(comet_ships),
@@ -459,7 +464,10 @@ def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndar
 
     alive = state.fleet_alive
     in_bounds = (new_x >= 0.0) & (new_x <= params.board_size) & (new_y >= 0.0) & (new_y <= params.board_size)
-    sun_hit = point_segment_distance_sq(CENTER, CENTER, old_x, old_y, new_x, new_y) < SUN_RADIUS * SUN_RADIUS
+    sun_hit = circle_collision_hit(
+        point_segment_distance_sq(CENTER, CENTER, old_x, old_y, new_x, new_y),
+        SUN_RADIUS,
+    )
 
     px = state.planets[:, 2]
     py = state.planets[:, 3]
@@ -472,7 +480,13 @@ def _move_fleets(state: EnvState, params: EnvParams) -> tuple[EnvState, jnp.ndar
         new_x[:, None],
         new_y[:, None],
     )
-    planet_hit = (d2 < (pr[None, :] ** 2)) & state.planet_alive[None, :] & alive[:, None] & in_bounds[:, None] & (~sun_hit[:, None])
+    planet_hit = (
+        circle_collision_hit(d2, pr[None, :])
+        & state.planet_alive[None, :]
+        & alive[:, None]
+        & in_bounds[:, None]
+        & (~sun_hit[:, None])
+    )
     any_planet_hit = planet_hit.any(axis=1)
     hit_idx = jnp.argmax(planet_hit, axis=1)
     remove = alive & ((~in_bounds) | sun_hit | any_planet_hit)
@@ -516,7 +530,7 @@ def _rotate_planets_and_sweep(state: EnvState, params: EnvParams) -> tuple[EnvSt
         planets[None, :, 3],
     )
     moved_planet = ((old_x != planets[:, 2]) | (old_y != planets[:, 3])) & state.planet_alive
-    hit = (d2 < (planets[None, :, 4] ** 2)) & state.fleet_alive[:, None] & moved_planet[None, :]
+    hit = circle_collision_hit(d2, planets[None, :, 4]) & state.fleet_alive[:, None] & moved_planet[None, :]
     any_hit = hit.any(axis=1)
     hit_idx = jnp.argmax(hit, axis=1)
     owner = state.fleets[:, 1].astype(jnp.int32)
@@ -564,7 +578,7 @@ def _move_one_comet_group(i: jnp.ndarray, state: EnvState, combat0: jnp.ndarray,
         new_pos[None, :, 0],
         new_pos[None, :, 1],
     )
-    hit = (d2 < COMET_RADIUS * COMET_RADIUS) & state.fleet_alive[:, None] & sweep_active[None, :]
+    hit = circle_collision_hit(d2, COMET_RADIUS) & state.fleet_alive[:, None] & sweep_active[None, :]
     any_hit = hit.any(axis=1)
     hit_group_idx = jnp.argmax(hit, axis=1)
     hit_slots = safe_slots[hit_group_idx]

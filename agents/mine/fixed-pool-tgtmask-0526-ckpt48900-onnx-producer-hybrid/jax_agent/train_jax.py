@@ -16,6 +16,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -31,11 +32,13 @@ from .state import parse_observation  # noqa: E402
 try:
     import wandb as _wandb
     _WANDB_AVAILABLE = True
-except ImportError:
+    _WANDB_IMPORT_ERROR = None
+except ImportError as exc:
     _WANDB_AVAILABLE = False
+    _WANDB_IMPORT_ERROR = exc
 
 from .build_initial_state_bank import build_bank  # noqa: E402
-from .eval_opponents import EvalContext, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
+from .eval_opponents import EvalContext, ExternalScriptOpponent, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
 from .fast_env import (  # noqa: E402
     COMETS_PER_SPAWN,
     MAX_COMET_PATH,
@@ -63,9 +66,25 @@ from .ppo_jax import (
     safe_logits,
 )  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
-from .train_opponents import nearest_opponent_actions, selfplay_policy_actions  # noqa: E402
+from .train_opponents import nearest_opponent_actions  # noqa: E402
 
 NEG_INF = -1.0e9
+AIM_HORIZON = 60
+AIM_FP_ITERS = 8
+AIM_TARGET_INSET = 1e-3
+
+
+def _stack_auto_rollout_rows(rows_by_time: list[list[AutoRollout]]) -> AutoRollout:
+    """Stack Python-collected single-env rollout rows into [T, B, ...]."""
+    if not rows_by_time or not rows_by_time[0]:
+        raise ValueError("external rollout produced no rows")
+    stacked = {}
+    for field in AutoRollout._fields:
+        per_t = []
+        for rows_at_t in rows_by_time:
+            per_t.append(jnp.stack([getattr(row, field)[0] for row in rows_at_t], axis=0))
+        stacked[field] = jnp.stack(per_t, axis=0)
+    return AutoRollout(**stacked)
 
 
 def _resolve_lr_schedule(cfg) -> str:
@@ -583,9 +602,9 @@ def main() -> None:
         ckpt, ckpt_path = _load_checkpoint(init_ckpt)
         ckpt_params = ckpt["params"]
         _assert_param_compatible(ckpt_params, ckpt_path)
-        train_state = train_state.replace(params=ckpt_params)
+        train_state = train_state.replace(params=jax.tree_util.tree_map(jnp.asarray, ckpt_params))
         if "normalizer_state" in ckpt:
-            normalizer_state = ckpt["normalizer_state"]
+            normalizer_state = jax.tree_util.tree_map(jnp.asarray, ckpt["normalizer_state"])
         if getattr(cfg, "start_update_from_checkpoint", True):
             start_update = int(ckpt.get("update", 0)) + 1
         print(
@@ -670,8 +689,10 @@ def main() -> None:
             dir=str(run_dir),
         )
         print(f"wandb run: {_wandb.run.url}")
+    elif not _WANDB_AVAILABLE:
+        print(f"wandb unavailable: {_WANDB_IMPORT_ERROR} (install wandb in the training environment to enable logging)")
     else:
-        print("wandb disabled (set wandb.enabled: true in config to enable)")
+        print("wandb disabled by config (set wandb.enabled: true to enable)")
 
     opponent_name = getattr(cfg, "opponent", "nearest")
     self_play = opponent_name == "self"
@@ -683,6 +704,7 @@ def main() -> None:
     # - lag_checkpoint: 全程/分阶段对 pool_lag_interval 步前 checkpoint。
     # - fixed_pool: 旧版固定池，Phase 1 nearest/current/lag，Phase 2 current/lag。
     # - pfsp: 胜率加权采样，优先训练当前打不过的对手。
+    # - mixed: 按权重在 JAX self-play / JAX checkpoint / Python 外部脚本对手间采样。
     raw_pool_mode = str(getattr(cfg, "pool_mode", "pfsp") or "pfsp").lower()
     pool_mode_aliases = {
         "current": "current",
@@ -692,11 +714,13 @@ def main() -> None:
         "fixed_pool": "fixed_pool",
         "pfsp": "pfsp",
         "snapshot": "snapshot",
+        "mixed": "mixed",
+        "mixed_external": "mixed",
     }
     if raw_pool_mode not in pool_mode_aliases:
         raise ValueError(
             f"Unknown pool_mode={raw_pool_mode!r}; expected one of "
-            "current, lag_checkpoint, fixed_pool, pfsp, snapshot"
+            "current, lag_checkpoint, fixed_pool, pfsp, snapshot, mixed"
         )
     pool_mode = pool_mode_aliases[raw_pool_mode]
     current_pool = pool_mode == "current"
@@ -704,6 +728,7 @@ def main() -> None:
     fixed_pool = pool_mode == "fixed_pool"
     pfsp_pool = pool_mode == "pfsp"
     snapshot_pool = pool_mode == "snapshot"
+    mixed_pool = pool_mode == "mixed"
     phased_pool = lag_checkpoint_pool or fixed_pool
     lagged_pool = lag_checkpoint_pool or fixed_pool or pfsp_pool
     pool_phase = int(getattr(cfg, "pool_start_phase", 1)) if phased_pool else 1
@@ -725,6 +750,8 @@ def main() -> None:
             print(f"opponent=pool fixed_pool (start_phase={pool_phase}, lag_interval={pool_lag_interval}, promote_at={promote_nearest_win_rate:.2f}x{promote_consecutive_evals})")
         elif snapshot_pool:
             print(f"opponent=pool snapshot (interval={snapshot_interval}, current_ratio={snapshot_current_ratio:.0%})")
+        elif mixed_pool:
+            print("opponent=pool mixed (JAX self-play/checkpoints + optional Python external opponents)")
         else:
             print(f"opponent=pool PFSP (lag_interval={pool_lag_interval}, max_size={pool_max_size}, "
                   f"include_nearest={pool_include_nearest})")
@@ -754,12 +781,76 @@ def main() -> None:
         pool_entries = [{"id": "selfplay-current", "type": "current", "params": None, "winrate": 0.5}]
         if pool_include_nearest:
             pool_entries.insert(0, {"id": "nearest", "type": "nearest", "params": None, "winrate": 0.5})
+    mixed_entries: list[dict[str, Any]] = []
+    if use_pool and mixed_pool:
+        raw_pool = list(getattr(cfg, "opponent_pool", []) or [])
+        if not raw_pool:
+            raise ValueError("pool_mode='mixed' requires opponent_pool entries")
+        for idx, raw_entry in enumerate(raw_pool):
+            if isinstance(raw_entry, str):
+                entry = {"name": raw_entry, "type": raw_entry, "weight": 1.0}
+            elif isinstance(raw_entry, dict):
+                entry = dict(raw_entry)
+            else:
+                raise ValueError(f"opponent_pool[{idx}] must be a mapping or string")
+            kind = str(entry.get("type", "external") or "external").lower().replace("-", "_")
+            weight = float(entry.get("weight", 1.0))
+            if weight <= 0.0:
+                continue
+            name = str(entry.get("name") or kind)
+            if kind in {"self", "self_play", "selfplay", "current", "selfplay_current"}:
+                mixed_entries.append({"id": name, "type": "selfplay-current", "weight": weight})
+            elif kind in {"nearest"}:
+                mixed_entries.append({"id": name, "type": "nearest", "weight": weight})
+            elif kind in {"jax", "jax_checkpoint", "jax_ckpt", "native", "native_checkpoint"} or (
+                kind in {"checkpoint", "old"} and (entry.get("checkpoint") or entry.get("checkpoint_path"))
+            ):
+                ckpt_value = entry.get("checkpoint") or entry.get("checkpoint_path") or entry.get("path")
+                if not ckpt_value:
+                    raise ValueError(f"opponent_pool[{idx}] jax_checkpoint entry requires checkpoint")
+                ckpt, ckpt_path = _load_checkpoint(str(ckpt_value))
+                ckpt_params = ckpt["params"]
+                _assert_param_compatible(ckpt_params, ckpt_path)
+                mixed_entries.append({
+                    "id": name,
+                    "type": "jax-checkpoint",
+                    "weight": weight,
+                    "params": jax.tree_util.tree_map(jnp.asarray, ckpt_params),
+                    "normalizer_state": jax.tree_util.tree_map(
+                        jnp.asarray,
+                        ckpt.get("normalizer_state", normalizer_state),
+                    ),
+                    "checkpoint": ckpt_path,
+                })
+            elif kind in {"external", "script", "onnx"} or kind in {"checkpoint", "old"}:
+                agent_dir_value = entry.get("agent_dir") or entry.get("path")
+                if not agent_dir_value:
+                    raise ValueError(f"opponent_pool[{idx}] external entry requires agent_dir")
+                agent_dir = _resolve_config_path(str(agent_dir_value))
+                mixed_entries.append({
+                    "id": name,
+                    "type": "external",
+                    "weight": weight,
+                    "opponent": ExternalScriptOpponent(agent_dir),
+                    "agent_dir": agent_dir,
+                })
+            else:
+                raise ValueError(f"opponent_pool[{idx}] contains unknown mixed opponent type: {kind}")
+        if not mixed_entries:
+            raise ValueError("pool_mode='mixed' opponent_pool has no positive-weight entries")
+        total_weight = sum(float(entry["weight"]) for entry in mixed_entries)
+        summary = ", ".join(f"{entry['id']}={float(entry['weight']) / total_weight:.2f}" for entry in mixed_entries)
+        print(f"[pool] mixed entries: {summary}")
 
     def _copy_params(params):
         return jax.tree_util.tree_map(lambda x: x, params)
 
     def _pfsp_sample(entries: list[dict]) -> dict:
         weights = [(1.0 - float(entry["winrate"]) + 0.1) ** 2 for entry in entries]
+        return pool_rng.choices(entries, weights=weights, k=1)[0]
+
+    def _mixed_sample(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        weights = [float(entry["weight"]) for entry in entries]
         return pool_rng.choices(entries, weights=weights, k=1)[0]
 
     def _pool_summary(entries: list[dict]) -> str:
@@ -797,12 +888,30 @@ def main() -> None:
         print(f"[pool] update={update_idx} 对手池超出 {pool_max_size}，移除{reason}，"
               f"对手池: {_pool_summary(pool_entries)}")
 
-    fixed_phase1_opponents = ["nearest", "selfplay-current", "selfplay-lag"]
-    fixed_phase2_opponents = ["selfplay-current", "selfplay-lag"]
+    fixed_phase1_opponents = list(getattr(
+        cfg,
+        "fixed_pool_phase1_opponents",
+        ["nearest", "selfplay-current", "selfplay-lag"],
+    ))
+    fixed_phase2_opponents = list(getattr(
+        cfg,
+        "fixed_pool_phase2_opponents",
+        ["selfplay-current", "selfplay-lag"],
+    ))
     current_opponents = ["selfplay-current"]
     lag_checkpoint_phase1_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase1_opponents", ["selfplay-lag"]))
     lag_checkpoint_phase2_opponents = list(getattr(cfg, "pool_lag_checkpoint_phase2_opponents", ["selfplay-current", "selfplay-lag"]))
     valid_fixed_opponents = {"nearest", "selfplay-current", "selfplay-lag"}
+    if fixed_pool:
+        for phase_name, phase_opponents in (
+            ("fixed_pool_phase1_opponents", fixed_phase1_opponents),
+            ("fixed_pool_phase2_opponents", fixed_phase2_opponents),
+        ):
+            if not phase_opponents:
+                raise ValueError(f"{phase_name} must contain at least one opponent")
+            invalid = sorted(set(phase_opponents) - valid_fixed_opponents)
+            if invalid:
+                raise ValueError(f"{phase_name} contains unknown opponents: {invalid}")
     if lag_checkpoint_pool:
         for phase_name, phase_opponents in (
             ("pool_lag_checkpoint_phase1_opponents", lag_checkpoint_phase1_opponents),
@@ -863,12 +972,179 @@ def main() -> None:
             return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
         raise ValueError(f"Unknown training opponent: {opponent_id}")
 
+    @jax.jit
+    def _jit_external_sample(ts, st, ns, key):
+        raw_encoded = encode_batch(st, feat_params)
+        encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
+        sample = auto_policy_sample(ts, model, st, encoded, key, feat_params, max_action_tokens)
+        b = encoded.planet_features.shape[0]
+        row = AutoRollout(
+            encoded.planet_features,
+            encoded.relative_features,
+            encoded.global_features,
+            encoded.map_features,
+            encoded.fleet_features,
+            encoded.fleet_mask,
+            encoded.candidate_mask,
+            encoded.amount_mask,
+            encoded.source_mask,
+            sample["initial_ships"],
+            sample["end_action"],
+            sample["src_action"],
+            sample["tgt_action"],
+            sample["amt_action"],
+            sample["executed"],
+            sample["invalid"],
+            sample["old_logp_end"],
+            sample["old_logp_src"],
+            sample["old_logp_tgt"],
+            sample["old_logp_amt"],
+            sample["token_valid"],
+            sample["value"],
+            jnp.zeros((b,), dtype=jnp.float32),
+            jnp.zeros((b,), dtype=bool),
+        )
+        return ns, sample["actions"], row
+
+    @jax.jit
+    def _jit_external_value(ts, st, ns):
+        raw_encoded = encode_batch(st, feat_params)
+        encoded = normalize_encoded(raw_encoded, ns, norm_params)
+        b = encoded.planet_features.shape[0]
+        k = max_action_tokens
+        initial_ships = jnp.concatenate(
+            [jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships],
+            axis=1,
+        )
+        out = ts.apply_fn(
+            {"params": ts.params},
+            encoded.planet_features,
+            encoded.relative_features,
+            encoded.global_features,
+            encoded.candidate_mask,
+            encoded.amount_mask,
+            encoded.source_mask,
+            jnp.zeros((b, k), dtype=bool),
+            jnp.zeros((b, k), dtype=jnp.int32),
+            jnp.zeros((b, k), dtype=jnp.int32),
+            jnp.zeros((b, k), dtype=jnp.int32),
+            jnp.zeros((b, k), dtype=bool),
+            initial_ships,
+            map_features=encoded.map_features,
+            fleet_features=encoded.fleet_features,
+            fleet_mask=encoded.fleet_mask,
+        )
+        return out.value
+
+    external_next_seed = int(cfg.seed) + 3_000_000
+
+    def _canonical_external_state(obs, learner_idx: int):
+        st = kaggle_obs_to_jax_state(obs, env_params)
+        return flip_state(st) if learner_idx == 1 else st
+
+    def _reset_external_env(env_slot: int, opponent: ExternalScriptOpponent, seed: int):
+        from kaggle_environments import make as kag_make
+
+        learner_idx = (env_slot + seed) % 2 if bool(getattr(cfg, "alternate_player_sides", True)) else 0
+        opponent_idx = 1 - learner_idx
+        opponent.reset_env(env_slot, seed)
+        env = kag_make("orbit_wars", configuration={"seed": seed, "randomSeed": seed}, debug=False)
+        env.reset(num_agents=2)
+        states = env.step([[], []])
+        return {
+            "env": env,
+            "states": states,
+            "learner_idx": learner_idx,
+            "opponent_idx": opponent_idx,
+            "episode_steps": 0,
+        }
+
+    def _run_external_opponent(entry: dict[str, Any], ts, st, ns, key, ent_scale):
+        nonlocal external_next_seed
+        opponent = entry["opponent"]
+        if not isinstance(opponent, ExternalScriptOpponent):
+            raise TypeError(f"mixed external entry {entry.get('id')} has invalid opponent object")
+        _rng_in, rollout_key, ppo_key = jax.random.split(key, 3)
+        num_envs = int(cfg.ppo.num_envs)
+        envs = []
+        for env_slot in range(num_envs):
+            envs.append(_reset_external_env(env_slot, opponent, external_next_seed))
+            external_next_seed += 1
+
+        rows_by_time: list[list[AutoRollout]] = []
+        wins = losses = draws = 0
+        finished_rewards: list[float] = []
+        finished_steps: list[int] = []
+        for t in range(int(cfg.ppo.rollout_steps)):
+            rows_at_t: list[AutoRollout] = []
+            for env_slot, env_rec in enumerate(envs):
+                states = env_rec["states"]
+                learner_idx = int(env_rec["learner_idx"])
+                opponent_idx = int(env_rec["opponent_idx"])
+                obs = states[learner_idx]["observation"]
+                opp_obs = states[opponent_idx]["observation"]
+                jax_state = _canonical_external_state(obs, learner_idx)
+                sample_key = jax.random.fold_in(rollout_key, t * num_envs + env_slot)
+                ns, learner_actions, row = _jit_external_sample(ts, jax_state, ns, sample_key)
+                kaggle_actions = flip_actions(learner_actions) if learner_idx == 1 else learner_actions
+                learner_action = jax_actions_to_kaggle(kaggle_actions)
+                opp_action = opponent.act_for_env(env_slot, opp_obs)
+                joint_actions = [None, None]
+                joint_actions[learner_idx] = learner_action
+                joint_actions[opponent_idx] = opp_action
+                next_states = env_rec["env"].step(joint_actions)
+                env_rec["states"] = next_states
+                env_rec["episode_steps"] = int(env_rec["episode_steps"]) + 1
+                done = next_states[0]["status"] != "ACTIVE"
+                reward = float(next_states[learner_idx].get("reward", 0.0) or 0.0) if done else 0.0
+                row = row._replace(
+                    reward=jnp.asarray([reward], dtype=jnp.float32),
+                    done=jnp.asarray([done], dtype=bool),
+                )
+                rows_at_t.append(row)
+                if done:
+                    finished_rewards.append(reward)
+                    finished_steps.append(int(env_rec["episode_steps"]))
+                    if reward > 0.0:
+                        wins += 1
+                    elif reward < 0.0:
+                        losses += 1
+                    else:
+                        draws += 1
+                    envs[env_slot] = _reset_external_env(env_slot, opponent, external_next_seed)
+                    external_next_seed += 1
+            rows_by_time.append(rows_at_t)
+
+        rollout = _stack_auto_rollout_rows(rows_by_time)
+        last_values = []
+        for env_rec in envs:
+            learner_idx = int(env_rec["learner_idx"])
+            obs = env_rec["states"][learner_idx]["observation"]
+            jax_state = _canonical_external_state(obs, learner_idx)
+            last_values.append(_jit_external_value(ts, jax_state, ns)[0])
+        last_values = jnp.stack(last_values, axis=0)
+        returns, advantages = compute_gae_state(rollout.reward, rollout.done, rollout.old_value, last_values, ppo_params)
+        ts, ppo_metrics = ppo_update_auto(ts, rollout, returns, advantages, ppo_params, ppo_key, max_action_tokens, ent_scale)
+
+        finished = rollout.done
+        episodes = jnp.maximum(finished.sum(), 1)
+        ep_reward_sum = jnp.where(finished, rollout.reward, 0.0).sum()
+        ep_metrics = {
+            "episode_reward": ep_reward_sum / episodes,
+            "win_rate": jnp.asarray(wins / max(wins + losses + draws, 1), dtype=jnp.float32),
+            "mean_return": returns.mean(),
+            "episodes_per_rollout": finished.sum().astype(jnp.float32),
+            "external_mean_steps": jnp.asarray(float(np.mean(finished_steps) if finished_steps else 0.0), dtype=jnp.float32),
+            "external_mean_reward": jnp.asarray(float(np.mean(finished_rewards) if finished_rewards else 0.0), dtype=jnp.float32),
+        }
+        return ts, st, ns, {**ppo_metrics, **ep_metrics}
+
     for update in range(start_update, cfg.ppo.total_updates + 1):
         selected_pool_entry = None
         selected_pool_id = ""
 
         # 每隔 opponent_update_freq 步把当前权重同步给 self-play/current 对手
-        if (use_pool and current_pool) or ((update - 1) % max(opponent_update_freq, 1) == 0):
+        if (use_pool and (current_pool or mixed_pool)) or ((update - 1) % max(opponent_update_freq, 1) == 0):
             opponent_params = _copy_params(train_state.params)
             if self_play or use_pool:
                 print(f"[pool] update={update} 同步 selfplay-current 对手权重")
@@ -894,6 +1170,41 @@ def main() -> None:
                     step_key,
                     ent_scale,
                 )
+            elif mixed_pool:
+                selected_pool_entry = _mixed_sample(mixed_entries)
+                selected_pool_id = str(selected_pool_entry["id"])
+                selected_type = str(selected_pool_entry["type"])
+                if selected_type in {"selfplay-current", "nearest", "selfplay-lag"}:
+                    train_state, state, normalizer_state, metrics = _run_named_opponent(
+                        selected_type,
+                        train_state,
+                        state,
+                        normalizer_state,
+                        step_key,
+                        ent_scale,
+                    )
+                elif selected_type == "external":
+                    train_state, state, normalizer_state, metrics = _run_external_opponent(
+                        selected_pool_entry,
+                        train_state,
+                        state,
+                        normalizer_state,
+                        step_key,
+                        ent_scale,
+                    )
+                elif selected_type == "jax-checkpoint":
+                    train_state, state, normalizer_state, metrics = _run_step(
+                        _jit_selfplay,
+                        train_state,
+                        selected_pool_entry["params"],
+                        selected_pool_entry["normalizer_state"],
+                        state,
+                        normalizer_state,
+                        step_key,
+                        ent_scale,
+                    )
+                else:
+                    raise ValueError(f"Unknown mixed pool entry type: {selected_type}")
             elif snapshot_pool:
                 # 20% 打当前策略，80% 打历史快照；若快照池为空则全打当前
                 if snapshot_pool_entries and pool_rng.random() >= snapshot_current_ratio:
@@ -1045,6 +1356,8 @@ def main() -> None:
                         fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
                     elif fixed_pool:
                         fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                    elif mixed_pool:
+                        fixed_size = len(mixed_entries)
                     else:
                         fixed_size = len(pool_entries)
                     if phased_pool:
@@ -1118,6 +1431,8 @@ def main() -> None:
                     fixed_size = len(lag_checkpoint_phase1_opponents if pool_phase == 1 else lag_checkpoint_phase2_opponents)
                 elif fixed_pool:
                     fixed_size = len(fixed_phase1_opponents if pool_phase == 1 else fixed_phase2_opponents)
+                elif mixed_pool:
+                    fixed_size = len(mixed_entries)
                 else:
                     fixed_size = len(pool_entries)
                 pool_log = {"pool/size": float(len(pool_entries) if pfsp_pool else fixed_size)}
@@ -1448,42 +1763,32 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     """与 src/physics.py 的 aim_with_prediction 同步的 JAX 批量瞄准。
 
     流程保持一致：
-    1. 在 60 回合视野内粗扫描 f(T) 的正到负符号变化。
-    2. 二分 12 次得到连续命中时间 T*。
-    3. 只验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
-    4. 每个候选回合都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
+    1. 用 fixed-point 迭代求连续拦截时间 T*。
+    2. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
+    3. 每个整数回合同时尝试瞄 target(T*)、target(k-1) 和 target(k)，
+       覆盖连续拦截点、舰队移动命中和旋转星球 sweep 命中的关键几何面。
+    4. 每个候选角都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
     """
 
-    horizon = 60
-    n_coarse = 60
-    n_bisect = 12
+    horizon = AIM_HORIZON
     clearance = 0.1
     speed = fleet_speed_local(jnp.maximum(ships, 1.0))
     max_turns = target_max_turns_jax(state, target_idx, horizon).astype(jnp.float32)
     can_search = max_turns >= 1.0
 
-    samples = jnp.arange(1, n_coarse + 1, dtype=jnp.float32)
-    dt = max_turns[..., None] / float(n_coarse)
-    ts = samples * dt
-    f_cur = aim_f_jax(src, target, target_idx, state, speed, ts)
-    f_prev0 = aim_f_jax(src, target, target_idx, state, speed, jnp.full_like(max_turns, 1e-6))
-    f_prev = jnp.concatenate([f_prev0[..., None], f_cur[..., :-1]], axis=-1)
-    crossing = (f_prev > 0.0) & (f_cur <= 0.0) & can_search[..., None]
-    has_interval = crossing.any(axis=-1)
-    first_i = jnp.argmax(crossing, axis=-1).astype(jnp.float32)
-    t_lo = first_i * (max_turns / float(n_coarse))
-    t_hi = (first_i + 1.0) * (max_turns / float(n_coarse))
+    px0, py0, target0_valid = target_pos_at_time_jax(state, target_idx, jnp.zeros_like(max_turns))
+    gap = src[..., 4] + clearance + target[..., 4]
+    d0 = jnp.sqrt((px0 - src[..., 2]) ** 2 + (py0 - src[..., 3]) ** 2)
+    t_star = jnp.clip((d0 - gap) / speed, 0.0, max_turns)
 
-    def bisect_body(_, carry):
-        lo, hi = carry
-        mid = 0.5 * (lo + hi)
-        f_lo = aim_f_jax(src, target, target_idx, state, speed, lo)
-        f_mid = aim_f_jax(src, target, target_idx, state, speed, mid)
-        use_left = (f_lo * f_mid) <= 0.0
-        return jnp.where(use_left, lo, mid), jnp.where(use_left, mid, hi)
+    def fixed_point_body(_, t_cur):
+        px, py, pos_valid = target_pos_at_time_jax(state, target_idx, t_cur)
+        dist = jnp.sqrt((px - src[..., 2]) ** 2 + (py - src[..., 3]) ** 2)
+        t_next = jnp.clip((dist - gap) / speed, 0.0, max_turns)
+        return jnp.where(pos_valid, t_next, t_cur)
 
-    t_lo, t_hi = jax.lax.fori_loop(0, n_bisect, bisect_body, (t_lo, t_hi))
-    t_star = 0.5 * (t_lo + t_hi)
+    t_star = jax.lax.fori_loop(0, AIM_FP_ITERS, fixed_point_body, t_star)
+    has_solution = can_search & target0_valid
     t_floor = jnp.floor(t_star).astype(jnp.int32)
     candidates = jnp.stack(
         [
@@ -1496,15 +1801,25 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     candidate_turns = candidates.astype(jnp.float32)
     candidate_in_range = (candidate_turns >= 1.0) & (candidate_turns <= max_turns[..., None])
 
-    aim_t = candidate_turns - 1.0
-    px, py, target_pos_valid = target_pos_at_time_jax(state, target_idx, aim_t)
-    angle = jnp.arctan2(py - src[..., None, 3], px - src[..., None, 2])
+    t_star_for_candidates = jnp.broadcast_to(t_star[..., None], candidate_turns.shape)
+    aim_turns = jnp.stack(
+        [
+            t_star_for_candidates,
+            jnp.maximum(candidate_turns - 1.0, 0.0),
+            candidate_turns,
+        ],
+        axis=-1,
+    )
+    aim_px, aim_py, aim_pos_valid = target_pos_at_time_jax(state, target_idx, aim_turns)
+    angle = jnp.arctan2(aim_py - src[..., None, None, 3], aim_px - src[..., None, None, 2])
     cos_a = jnp.cos(angle)
     sin_a = jnp.sin(angle)
-    fx0 = src[..., None, 2] + cos_a * (src[..., None, 4] + clearance)
-    fy0 = src[..., None, 3] + sin_a * (src[..., None, 4] + clearance)
-    fx_t = fx0 + candidate_turns * speed[..., None] * cos_a
-    fy_t = fy0 + candidate_turns * speed[..., None] * sin_a
+    candidate_turns_e = candidate_turns[..., None]
+    candidates_e = candidates[..., None]
+    fx0 = src[..., None, None, 2] + cos_a * (src[..., None, None, 4] + clearance)
+    fy0 = src[..., None, None, 3] + sin_a * (src[..., None, None, 4] + clearance)
+    fx_t = fx0 + candidate_turns_e * speed[..., None, None] * cos_a
+    fy_t = fy0 + candidate_turns_e * speed[..., None, None] * sin_a
 
     sun_hit = point_segment_distance_sq(50.0, 50.0, fx0, fy0, fx_t, fy_t) < 100.0
     first_collision_ok = target_is_first_collision_jax(
@@ -1513,34 +1828,43 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
         state,
         fx0,
         fy0,
-        speed[..., None],
+        speed[..., None, None],
         cos_a,
         sin_a,
-        candidates,
+        candidates_e,
     )
 
-    fx_prev = fx0 + (candidate_turns - 1.0) * speed[..., None] * cos_a
-    fy_prev = fy0 + (candidate_turns - 1.0) * speed[..., None] * sin_a
-    move_d2 = point_segment_distance_sq(px, py, fx_prev, fy_prev, fx_t, fy_t)
-    move_hits_target = move_d2 < target[..., None, 4] ** 2
+    fx_prev = fx0 + (candidate_turns_e - 1.0) * speed[..., None, None] * cos_a
+    fy_prev = fy0 + (candidate_turns_e - 1.0) * speed[..., None, None] * sin_a
+    px_old, py_old, target_pos_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e - 1.0)
+    move_d2 = point_segment_distance_sq(px_old, py_old, fx_prev, fy_prev, fx_t, fy_t)
+    target_hit_radius = jnp.maximum(target[..., None, None, 4] - AIM_TARGET_INSET, 0.0)
+    move_hits_target = move_d2 < target_hit_radius ** 2
 
-    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns)
-    target_moved = ((px_next - px) ** 2 + (py_next - py) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px, py, px_next, py_next)
-    sweep_hits_target = target_moved & target_next_valid & (sweep_d2 < target[..., None, 4] ** 2)
+    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e)
+    target_moved = ((px_next - px_old) ** 2 + (py_next - py_old) ** 2) > 1e-9
+    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px_old, py_old, px_next, py_next)
+    sweep_hits_target = (
+        target_moved
+        & target_next_valid
+        & (sweep_d2 < target_hit_radius ** 2)
+    )
 
     candidate_valid = (
-        has_interval[..., None]
-        & candidate_in_range
+        has_solution[..., None, None]
+        & candidate_in_range[..., None]
+        & aim_pos_valid
         & target_pos_valid
         & (~sun_hit)
         & first_collision_ok
         & (move_hits_target | sweep_hits_target)
-        & (ships[..., None] > 0.0)
+        & (ships[..., None, None] > 0.0)
     )
-    has_valid = candidate_valid.any(axis=-1)
-    chosen = jnp.argmax(candidate_valid, axis=-1)
-    chosen_angle = jnp.take_along_axis(angle, chosen[..., None], axis=-1).squeeze(-1)
+    candidate_valid_flat = candidate_valid.reshape(candidate_valid.shape[:-2] + (9,))
+    angle_flat = angle.reshape(angle.shape[:-2] + (9,))
+    has_valid = candidate_valid_flat.any(axis=-1)
+    chosen = jnp.argmax(candidate_valid_flat, axis=-1)
+    chosen_angle = jnp.take_along_axis(angle_flat, chosen[..., None], axis=-1).squeeze(-1)
     direct_angle = jnp.arctan2(target[..., 3] - src[..., 3], target[..., 2] - src[..., 2])
     return jnp.where(has_valid, chosen_angle, direct_angle), has_valid
 
@@ -1643,7 +1967,7 @@ def target_max_turns_jax(state: EnvState, target_idx, horizon: int):
 
 def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, speed, cos_a, sin_a, hit_turn):
     """按引擎阶段验证候选回合的第一碰撞对象就是目标。"""
-    horizon = 60
+    horizon = AIM_HORIZON
     turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
     turns = turns_i.astype(jnp.float32)
     planets = state.planets
@@ -1699,7 +2023,7 @@ def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, sp
     return (
         in_bounds_until_hit
         & (first_key < large)
-        & (first_planet == target_idx[..., None])
+        & (first_planet == target_idx.reshape(target_idx.shape + (1,) * (hit_turn.ndim - target_idx.ndim)))
         & (first_key >= target_key_lo)
         & (first_key <= target_key_hi)
     )

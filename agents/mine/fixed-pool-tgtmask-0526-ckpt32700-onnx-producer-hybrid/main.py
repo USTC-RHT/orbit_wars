@@ -26,6 +26,22 @@ _HERE = Path(globals().get("__file__", ".")).resolve().parent
 if not sys.path or sys.path[0] != str(_HERE):
     sys.path.insert(0, str(_HERE))
 
+
+def _drop_foreign_jax_agent_modules() -> None:
+    local_pkg = (_HERE / "jax_agent").resolve()
+    for name, module in list(sys.modules.items()):
+        if name != "jax_agent" and not name.startswith("jax_agent."):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            sys.modules.pop(name, None)
+            continue
+        try:
+            Path(module_file).resolve().relative_to(local_pkg)
+        except ValueError:
+            sys.modules.pop(name, None)
+
+
 _ERROR_LOGGED = False
 _RUNTIME = None
 _RUNTIME_LOCK = threading.Lock()
@@ -145,10 +161,6 @@ def _safe_logits(x: np.ndarray) -> np.ndarray:
 
 
 def _import_onnxruntime():
-    if sys.version_info[:2] == (3, 11):
-        import onnxruntime as ort
-        return ort
-
     existing = sys.modules.get("onnxruntime")
     if existing is not None and hasattr(existing, "SessionOptions"):
         return existing
@@ -156,6 +168,7 @@ def _import_onnxruntime():
         if name == "onnxruntime" or name.startswith("onnxruntime."):
             del sys.modules[name]
 
+    abi_tag = f"cpython-{sys.version_info[0]}{sys.version_info[1]}"
     removed: list[tuple[int, str]] = []
     for entry in list(sys.path):
         if not entry:
@@ -164,7 +177,9 @@ def _import_onnxruntime():
             capi = Path(entry) / "onnxruntime" / "capi"
         except TypeError:
             continue
-        if any(capi.glob("onnxruntime_pybind11_state.cpython-311-*.so")):
+        has_ort_binary = any(capi.glob("onnxruntime_pybind11_state.cpython-*.so"))
+        has_matching_binary = any(capi.glob(f"onnxruntime_pybind11_state.{abi_tag}-*.so"))
+        if has_ort_binary and not has_matching_binary:
             while entry in sys.path:
                 idx = sys.path.index(entry)
                 removed.append((idx, sys.path.pop(idx)))
@@ -194,6 +209,7 @@ class _CheckpointRuntime:
 class _OnnxEnsembleRuntime:
     def __init__(self, root: Path):
         ort = _import_onnxruntime()
+        _drop_foreign_jax_agent_modules()
 
         from jax_agent.numpy_inference import (
             encode_batch_np,

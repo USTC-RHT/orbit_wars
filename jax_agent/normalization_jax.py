@@ -15,8 +15,8 @@ from .features_jax import EncodedBatch, GLOBAL_DIM
 
 
 # 只归一化连续特征列；布尔/类别列不参与 running statistics。
-PLANET_NORMALIZE_INDICES = jnp.asarray([5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25], dtype=jnp.int32)
-RELATIVE_NORMALIZE_INDICES = jnp.asarray([1, 2, 3, 4, 5, 6, 7, 11, 12, 13], dtype=jnp.int32)
+PLANET_NORMALIZE_INDICES = jnp.asarray([5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27], dtype=jnp.int32)
+RELATIVE_NORMALIZE_INDICES = jnp.asarray([1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21], dtype=jnp.int32)
 GLOBAL_NORMALIZE_INDICES = jnp.arange(GLOBAL_DIM, dtype=jnp.int32)
 
 
@@ -70,8 +70,9 @@ def update_and_normalize(encoded: EncodedBatch, state: NormalizerState, params: 
         return encoded, state
 
     source_mask = encoded.source_mask.astype(jnp.float32)
+    owned_mask = encoded.owned_mask.astype(jnp.float32)
     planet_values = encoded.planet_features[..., PLANET_NORMALIZE_INDICES]
-    planet_mean, planet_var, planet_count = masked_moments(planet_values, source_mask)
+    planet_mean, planet_var, planet_count = masked_moments(planet_values, owned_mask)
     new_planet_mean, new_planet_var, new_planet_count = update_moments(
         state.planet_mean,
         state.planet_var,
@@ -94,7 +95,7 @@ def update_and_normalize(encoded: EncodedBatch, state: NormalizerState, params: 
     )
 
     global_values = encoded.global_features[..., GLOBAL_NORMALIZE_INDICES]
-    global_mean, global_var, global_count = masked_moments(global_values, source_mask)
+    global_mean, global_var, global_count = masked_moments(global_values, owned_mask)
     new_global_mean, new_global_var, new_global_count = update_moments(
         state.global_mean,
         state.global_var,
@@ -166,12 +167,11 @@ def normalize_encoded(encoded: EncodedBatch, state: NormalizerState, params: Nor
         global_features=global_features,
         map_features=encoded.map_features,
         candidate_mask=encoded.candidate_mask,
-        amount_mask=encoded.amount_mask,
         source_ids=encoded.source_ids,
         source_ships=encoded.source_ships,
         candidate_ids=encoded.candidate_ids,
-        ship_buckets=encoded.ship_buckets,
         source_mask=encoded.source_mask,
+        owned_mask=encoded.owned_mask,
         fleet_features=encoded.fleet_features,
         fleet_mask=encoded.fleet_mask,
     )

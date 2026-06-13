@@ -39,7 +39,6 @@ def _load_model(ckpt_path: Path):
         relative_dim=RELATIVE_DIM,
         global_dim=GLOBAL_DIM,
         relative_count=cfg.env.max_planets + 1,
-        ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
         use_cnn=cfg.model.use_cnn,
         fleet_dim=FLEET_DIM,
@@ -53,7 +52,6 @@ def _load_model(ckpt_path: Path):
         "checkpoint": ckpt_path.name,
         "max_planets": int(cfg.env.max_planets),
         "max_fleets": int(feat_max_fleets),
-        "ship_bucket_count": int(cfg.env.ship_bucket_count),
         "max_ships": float(cfg.env.max_ships),
         "max_production": float(cfg.env.max_production),
         "episode_steps": int(cfg.env.episode_steps),
@@ -85,7 +83,6 @@ def _export_one(ckpt_path: Path, out_dir: Path, opset: int) -> dict:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     p = meta["max_planets"]
-    a = meta["ship_bucket_count"]
     h = meta["hidden_size"]
     ft = meta["max_fleet_tokens"]
 
@@ -194,42 +191,11 @@ def _export_one(ckpt_path: Path, out_dir: Path, opset: int) -> dict:
         **common_names,
     )
 
-    def auto_amt_logits(h_new, src_t, tgt_t, planet_out, relative_h, remaining, amount_mask):
-        return model.apply(
-            {"params": params},
-            h_new,
-            src_t,
-            tgt_t,
-            planet_out,
-            relative_h,
-            remaining,
-            amount_mask,
-            method=model.auto_amt_logits,
-        )
-
-    jax2onnx.to_onnx(
-        auto_amt_logits,
-        [
-            _shape((1, h), jnp.float32),
-            _shape((1,), jnp.int32),
-            _shape((1,), jnp.int32),
-            _shape((1, p + 1, h), jnp.float32),
-            _shape((1, p, p + 1, h), jnp.float32),
-            _shape((1, p + 1), jnp.float32),
-            _shape((1, p, p + 1, a), jnp.float32),
-        ],
-        output_path=ckpt_dir / "auto_amt_logits.onnx",
-        input_names=["h_new", "src_t", "tgt_t", "planet_out", "relative_h", "remaining", "amount_mask"],
-        output_names=["amount_logits"],
-        **common_names,
-    )
-
-    def auto_token_embed(src_t, tgt_t, amt_t, end_t, executed_t, step_i, planet_out):
+    def auto_token_embed(src_t, tgt_t, end_t, executed_t, step_i, planet_out):
         return model.apply(
             {"params": params},
             src_t,
             tgt_t,
-            amt_t,
             end_t,
             executed_t,
             step_i,
@@ -242,14 +208,13 @@ def _export_one(ckpt_path: Path, out_dir: Path, opset: int) -> dict:
         [
             _shape((1,), jnp.int32),
             _shape((1,), jnp.int32),
-            _shape((1,), jnp.int32),
             _shape((1,), jnp.bool_),
             _shape((1,), jnp.bool_),
             _shape((), jnp.int32),
             _shape((1, p + 1, h), jnp.float32),
         ],
         output_path=ckpt_dir / "auto_token_embed.onnx",
-        input_names=["src_t", "tgt_t", "amt_t", "end_t", "executed_t", "step_i", "planet_out"],
+        input_names=["src_t", "tgt_t", "end_t", "executed_t", "step_i", "planet_out"],
         output_names=["prev_tok"],
         **common_names,
     )

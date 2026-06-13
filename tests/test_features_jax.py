@@ -5,13 +5,17 @@ jnp = pytest.importorskip("jax.numpy")
 
 from jax_agent.fast_env import EnvParams, empty_state
 from jax_agent.features_jax import (
+    INBOUND_HORIZON,
+    PLANET_DIM,
     RELATIVE_DIM,
     FeatureParams,
     encode_batch,
     friendly_defense_score_jax,
+    relative_capture_floor_features,
     relative_eta_garrison_features,
 )
 from jax_agent.garrison_jax import GarrisonStatus
+from jax_agent.physics import aim_with_prediction_eta_jax
 
 
 def test_target_filter_defense_topk_keeps_projected_friendly_flip():
@@ -19,10 +23,10 @@ def test_target_filter_defense_topk_keeps_projected_friendly_flip():
     state = empty_state(params)
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
     planets = planets.at[0].set(jnp.array([0, 0, 10.0, 10.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
-    planets = planets.at[1].set(jnp.array([1, 0, 13.0, 10.0, 1.0, 5.0, 2.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 0, 18.0, 10.0, 1.0, 5.0, 2.0], dtype=jnp.float32))
     planets = planets.at[2].set(jnp.array([2, 0, 35.0, 10.0, 1.0, 50.0, 1.0], dtype=jnp.float32))
     fleets = jnp.zeros((params.max_fleets, 7), dtype=jnp.float32)
-    fleets = fleets.at[0].set(jnp.array([0, 1, 11.5, 10.0, 0.0, 2, 20.0], dtype=jnp.float32))
+    fleets = fleets.at[0].set(jnp.array([0, 1, 12.0, 10.0, 0.0, 2, 20.0], dtype=jnp.float32))
     state = state._replace(
         planets=planets,
         initial_planets=planets,
@@ -39,6 +43,27 @@ def test_target_filter_defense_topk_keeps_projected_friendly_flip():
     assert bool(src0_mask[0])
     assert bool(src0_mask[2])
     assert not bool(src0_mask[3])
+
+
+def test_source_mask_requires_min_launch_ships():
+    params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
+    state = empty_state(params)
+    planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
+    planets = planets.at[0].set(jnp.array([0, 0, 10.0, 10.0, 1.0, 9.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 0, 20.0, 10.0, 1.0, 10.0, 0.0], dtype=jnp.float32))
+    state = state._replace(
+        planets=planets,
+        initial_planets=planets,
+        planet_alive=jnp.array([True, True, False, False]),
+    )
+    batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
+
+    encoded = encode_batch(batched, FeatureParams(max_planets=4, target_filter_enabled=False))
+
+    assert not bool(encoded.source_mask[0, 0])
+    assert bool(encoded.source_mask[0, 1])
+    assert bool(encoded.owned_mask[0, 0])
+    assert bool(encoded.owned_mask[0, 1])
 
 
 def test_friendly_defense_score_prefers_pressure_gradient_from_backline():
@@ -88,7 +113,7 @@ def test_target_filter_defense_topk_uses_pressure_gradient_as_regroup_candidate(
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
     planets = planets.at[0].set(jnp.array([0, 0, 10.0, 10.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
     planets = planets.at[1].set(jnp.array([1, 0, 30.0, 10.0, 1.0, 20.0, 0.0], dtype=jnp.float32))
-    planets = planets.at[2].set(jnp.array([2, 0, 20.0, 10.0, 1.0, 20.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[2].set(jnp.array([2, 0, 20.0, 20.0, 1.0, 20.0, 0.0], dtype=jnp.float32))
     planets = planets.at[3].set(jnp.array([3, 1, 35.0, 10.0, 1.0, 100.0, 0.0], dtype=jnp.float32))
     state = state._replace(
         planets=planets,
@@ -109,10 +134,10 @@ def test_target_filter_pressure_regroup_is_source_conditioned():
     params = EnvParams(max_planets=5, max_fleets=4, max_actions=1)
     state = empty_state(params)
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
-    planets = planets.at[0].set(jnp.array([0, 0, 30.0, 50.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
-    planets = planets.at[1].set(jnp.array([1, 0, 65.0, 50.0, 1.0, 60.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[0].set(jnp.array([0, 0, 30.0, 65.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 0, 65.0, 65.0, 1.0, 60.0, 0.0], dtype=jnp.float32))
     planets = planets.at[2].set(jnp.array([2, 0, 30.0, 70.0, 1.0, 60.0, 0.0], dtype=jnp.float32))
-    planets = planets.at[3].set(jnp.array([3, 1, 75.0, 50.0, 1.0, 100.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[3].set(jnp.array([3, 1, 75.0, 65.0, 1.0, 100.0, 0.0], dtype=jnp.float32))
     state = state._replace(
         planets=planets,
         initial_planets=planets,
@@ -139,15 +164,16 @@ def test_reachability_filters_unreachable_attack_target():
         planet_alive=jnp.array([True, True, False, False]),
     )
     batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
-    fp = FeatureParams(max_planets=4, ship_bucket_count=8, target_filter_enabled=False)
+    fp = FeatureParams(max_planets=4, target_filter_enabled=False)
 
     encoded = encode_batch(batched, fp)
 
     assert not bool(encoded.candidate_mask[0, 0, 2])
-    assert not bool(encoded.amount_mask[0, 0, 2].any())
+    assert not bool(encoded.source_mask[0, 0])
+    assert bool(encoded.owned_mask[0, 0])
 
 
-def test_reachability_filters_slow_amount_buckets_but_keeps_fast_bucket():
+def test_reachability_keeps_target_when_full_send_can_reach():
     params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
     state = empty_state(params)
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
@@ -159,14 +185,57 @@ def test_reachability_filters_slow_amount_buckets_but_keeps_fast_bucket():
         planet_alive=jnp.array([True, True, False, False]),
     )
     batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
-    fp = FeatureParams(max_planets=4, ship_bucket_count=8, target_filter_enabled=False)
+    fp = FeatureParams(max_planets=4, target_filter_enabled=False)
 
     encoded = encode_batch(batched, fp)
-    target_amount = encoded.amount_mask[0, 0, 2]
 
     assert bool(encoded.candidate_mask[0, 0, 2])
-    assert not bool(target_amount[0])
-    assert bool(target_amount[-1])
+
+
+def test_relative_eta_uses_exact_physics_hit_turn():
+    params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
+    state = empty_state(params)
+    planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
+    planets = planets.at[0].set(jnp.array([0, 0, 10.0, 10.0, 1.0, 100.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 1, 70.0, 10.0, 1.0, 1.0, 0.0], dtype=jnp.float32))
+    state = state._replace(
+        planets=planets,
+        initial_planets=planets,
+        planet_alive=jnp.array([True, True, False, False]),
+    )
+    batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
+    fp = FeatureParams(max_planets=4, target_filter_enabled=False)
+
+    _angle, hit, eta_turns = aim_with_prediction_eta_jax(
+        state.planets[0].reshape(1, 1, 7),
+        state.planets[1].reshape(1, 1, 7),
+        jnp.asarray([[1]], dtype=jnp.int32),
+        batched,
+        jnp.asarray([[100.0]], dtype=jnp.float32),
+    )
+    encoded = encode_batch(batched, fp)
+
+    assert bool(hit[0, 0])
+    assert jnp.allclose(encoded.relative_features[0, 0, 2, 7], eta_turns[0, 0] / INBOUND_HORIZON)
+
+
+def test_target_pre_mask_filters_sun_blocked_target():
+    params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
+    state = empty_state(params)
+    planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
+    planets = planets.at[0].set(jnp.array([0, 0, 20.0, 50.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 1, 80.0, 50.0, 1.0, 1.0, 0.0], dtype=jnp.float32))
+    state = state._replace(
+        planets=planets,
+        initial_planets=planets,
+        planet_alive=jnp.array([True, True, False, False]),
+    )
+    batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
+    fp = FeatureParams(max_planets=4, target_filter_enabled=False)
+
+    encoded = encode_batch(batched, fp)
+
+    assert not bool(encoded.candidate_mask[0, 0, 2])
 
 
 def test_planet_inbound_features_use_garrison_arrivals():
@@ -237,6 +306,49 @@ def test_relative_eta_garrison_features_sample_future_state_and_arrivals():
     assert jnp.allclose(features[2, 6], 1.0)
 
 
+def test_relative_capture_floor_features_are_owner_aware():
+    owner = jnp.array(
+        [
+            [0, 0],
+            [1, 1],
+            [-1, -1],
+        ],
+        dtype=jnp.int32,
+    )
+    ships = jnp.array(
+        [
+            [50.0, 80.0],
+            [20.0, 20.0],
+            [4.0, 4.0],
+        ],
+        dtype=jnp.float32,
+    )
+    arrivals = jnp.zeros((3, 2, 2), dtype=jnp.float32)
+    alive = jnp.ones((3, 2), dtype=bool)
+    status = GarrisonStatus(
+        owner=owner,
+        ships=ships,
+        pre_combat_owner=owner,
+        pre_combat_ships=ships,
+        arrivals_by_owner=arrivals,
+        alive=alive,
+    )
+
+    floor_norm, surplus_norm = relative_capture_floor_features(
+        status,
+        eta_turns=jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
+        send_ships=jnp.asarray(30.0, dtype=jnp.float32),
+        params=FeatureParams(max_planets=3, max_ships=100.0),
+    )
+
+    assert jnp.allclose(floor_norm[0], 0.01)
+    assert jnp.allclose(floor_norm[1], 0.21)
+    assert jnp.allclose(floor_norm[2], 0.05)
+    assert jnp.allclose(surplus_norm[0], 0.29)
+    assert jnp.allclose(surplus_norm[1], 0.09)
+    assert jnp.allclose(surplus_norm[2], 0.25)
+
+
 def test_encode_relative_features_include_eta_garrison_columns():
     params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
     state = empty_state(params)
@@ -253,6 +365,14 @@ def test_encode_relative_features_include_eta_garrison_columns():
 
     encoded = encode_batch(batched, fp)
 
+    assert encoded.planet_features.shape[-1] == PLANET_DIM
     assert encoded.relative_features.shape[-1] == RELATIVE_DIM
+    assert jnp.allclose(encoded.planet_features[0, 0, 26], 1.0)
+    assert jnp.allclose(encoded.planet_features[0, 0, 27], 0.0)
     assert jnp.allclose(encoded.relative_features[0, 0, 2, 10], 1.0)
     assert encoded.relative_features[0, 0, 2, 11] > 0.10
+    assert encoded.relative_features[0, 0, 2, 17] > 0.5
+    assert jnp.allclose(encoded.relative_features[0, 0, 2, 18], 0.0)
+    assert jnp.allclose(encoded.relative_features[0, 0, 2, 19], 0.0)
+    assert encoded.relative_features[0, 0, 2, 20] > encoded.relative_features[0, 0, 2, 11]
+    assert encoded.relative_features[0, 0, 2, 21] > 0.0

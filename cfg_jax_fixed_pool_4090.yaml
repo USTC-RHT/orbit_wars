@@ -17,7 +17,6 @@ opponent: "pool"
 env:
   board_size: 100.0
   episode_steps: 500
-  ship_bucket_count: 8
   max_planets: 45
   max_ships: 500.0
   max_production: 5.0
@@ -70,7 +69,6 @@ ppo:
   ent_coef: 0.01
   ent_coef_fire: 0.005
   ent_coef_target: 0.01
-  ent_coef_amount: 0.005
   ent_schedule: linear
   ent_min_ratio: 0.2
   lr: 5e-5

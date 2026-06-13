@@ -2,7 +2,7 @@
 
 整体结构：
 1. Encoder：把星球、舰队和全局信息编码成 Transformer token。
-2. Decoder：GRU 按 token 逐步生成 end/src/tgt/amount。
+2. Decoder：GRU 按 token 逐步生成 end/src/tgt，发射量由 full-send 规则确定。
 3. Critic：从全局状态表示输出状态价值，用于 PPO 的 value loss。
 """
 
@@ -43,7 +43,6 @@ class AutoPolicyOutput:
     end_logits: jnp.ndarray     # [B, K]
     src_logits: jnp.ndarray     # [B, K, P+1]
     tgt_logits: jnp.ndarray     # [B, K, P+1]
-    amount_logits: jnp.ndarray  # [B, K, A]
     value: jnp.ndarray          # [B]
 
 
@@ -97,7 +96,6 @@ class AutoregressiveActorCritic(nn.Module):
     relative_dim: int
     global_dim: int
     relative_count: int
-    ship_bucket_count: int
     hidden_size: int = 128
     use_cnn: bool = False
     map_channels: int = 6
@@ -116,12 +114,10 @@ class AutoregressiveActorCritic(nn.Module):
         relative_features,
         global_features,
         candidate_mask,
-        amount_mask,
         source_mask,
         end_actions,
         src_actions,
         tgt_actions,
-        amt_actions,
         executed,
         initial_ships,
         map_features=None,
@@ -146,7 +142,6 @@ class AutoregressiveActorCritic(nn.Module):
         bos = self.param("bos_token", nn.initializers.normal(0.02), (hidden,))
         end_tok = self.param("end_token", nn.initializers.normal(0.02), (hidden,))
         invalid_tok = self.param("invalid_token", nn.initializers.normal(0.02), (hidden,))
-        amount_emb = self.param("amount_emb", nn.initializers.normal(0.02), (self.ship_bucket_count, hidden))
         step_emb = self.param("step_emb", nn.initializers.normal(0.02), (self.max_action_tokens, hidden))
 
         key_proj = actor_logit_dense(hidden, name="auto_key_proj")(planet_out)
@@ -158,8 +153,6 @@ class AutoregressiveActorCritic(nn.Module):
         src_out = actor_logit_dense(hidden, name="auto_src_out")
         tgt_pre = hidden_dense(hidden, name="auto_tgt_pre")
         tgt_out = actor_logit_dense(hidden, name="auto_tgt_out")
-        amt_pre = hidden_dense(hidden, name="auto_amt_pre")
-        amt_out = actor_logit_dense(self.ship_bucket_count, name="auto_amt_out")
         end_bias = self.param("end_bias", nn.initializers.constant(self.end_bias_init), (1,))
         pointer_logit_scale = self.param(
             "pointer_logit_scale",
@@ -170,10 +163,10 @@ class AutoregressiveActorCritic(nn.Module):
 
         batch_idx = jnp.arange(batch_size)
 
-        def token_embed(src_t, tgt_t, amt_t, end_t, executed_t, step_i):
+        def token_embed(src_t, tgt_t, end_t, executed_t, step_i):
             src_h = planet_out[batch_idx, jnp.clip(src_t, 0, self.relative_count - 1)]
             tgt_h = planet_out[batch_idx, jnp.clip(tgt_t, 0, self.relative_count - 1)]
-            raw = src_h + tgt_h + amount_emb[jnp.clip(amt_t, 0, self.ship_bucket_count - 1)] + step_emb[step_i]
+            raw = src_h + tgt_h + step_emb[step_i]
             raw = raw / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(raw), axis=-1, keepdims=True), 1e-12))
             return jnp.where(
                 end_t[:, None],
@@ -183,7 +176,7 @@ class AutoregressiveActorCritic(nn.Module):
 
         def decode_step(carry, item):
             h, prev_tok, remaining = carry
-            step_i, end_t, src_t, tgt_t, amt_t, executed_t = item
+            step_i, end_t, src_t, tgt_t, executed_t = item
             decoder_input = jnp.concatenate([prev_tok, state_emb], axis=-1)
             h_new, _ = decoder_cell(h, decoder_input)
 
@@ -219,28 +212,17 @@ class AutoregressiveActorCritic(nn.Module):
             tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
             tgt_logits = jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
-            tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
-            tgt_h = planet_out[batch_idx, tgt_safe]
-            selected_rel_h = jnp.take_along_axis(rel_for_src, tgt_safe[:, None, None], axis=1).squeeze(1)
-            amt_h = nn.relu(amt_pre(jnp.concatenate([h_new, src_h, tgt_h, selected_rel_h], axis=-1)))
-            amount_logits = amt_out(amt_h)
-            source_amount_mask = amount_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-            selected_amount_mask = jnp.take_along_axis(source_amount_mask, tgt_safe[:, None, None], axis=1).squeeze(1)
-            dynamic_amount_mask = self._dynamic_amount_mask(remaining[batch_idx, src_safe])
-            selected_amount_mask = selected_amount_mask & dynamic_amount_mask
-            amount_logits = jnp.where(selected_amount_mask, amount_logits, -1.0e9)
-
-            ships_sent = self._ships_for_bucket(remaining[batch_idx, src_safe], amt_t)
+            ships_sent = self._full_send_ships(remaining[batch_idx, src_safe])
             remaining = remaining.at[batch_idx, src_safe].add(jnp.where(executed_t, -ships_sent, 0.0))
-            next_tok = token_embed(src_safe, tgt_safe, amt_t, end_t, executed_t, step_i)
-            return (h_new, next_tok, remaining), (end_logits, src_logits, tgt_logits, amount_logits)
+            tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
+            next_tok = token_embed(src_safe, tgt_safe, end_t, executed_t, step_i)
+            return (h_new, next_tok, remaining), (end_logits, src_logits, tgt_logits)
 
         init = (h0, jnp.broadcast_to(bos[None, :], (batch_size, hidden)), initial_ships)
         carry = init
         end_logs = []
         src_logs = []
         tgt_logs = []
-        amt_logs = []
         for step_i in range(self.max_action_tokens):
             carry, step_out = decode_step(
                 carry,
@@ -249,26 +231,22 @@ class AutoregressiveActorCritic(nn.Module):
                     end_actions[:, step_i],
                     src_actions[:, step_i],
                     tgt_actions[:, step_i],
-                    amt_actions[:, step_i],
                     executed[:, step_i],
                 ),
             )
-            e, s, t, a = step_out
+            e, s, t = step_out
             end_logs.append(e)
             src_logs.append(s)
             tgt_logs.append(t)
-            amt_logs.append(a)
         end_logits = jnp.stack(end_logs, axis=0)
         src_logits = jnp.stack(src_logs, axis=0)
         tgt_logits = jnp.stack(tgt_logs, axis=0)
-        amount_logits = jnp.stack(amt_logs, axis=0)
         value_h = nn.relu(hidden_dense(hidden, name="auto_value_h")(jnp.concatenate([cls_out, global_h], axis=-1)))
         value = value_out_dense(1, name="auto_value_out")(value_h).squeeze(-1)
         return AutoPolicyOutput(
             jnp.swapaxes(end_logits, 0, 1),
             jnp.swapaxes(src_logits, 0, 1),
             jnp.swapaxes(tgt_logits, 0, 1),
-            jnp.swapaxes(amount_logits, 0, 1),
             value,
         )
 
@@ -354,42 +332,19 @@ class AutoregressiveActorCritic(nn.Module):
         return jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
     @nn.compact
-    def auto_amt_logits(self, h_new, src_t, tgt_t, planet_out, relative_h, remaining, amount_mask):
-        """在给定 src+tgt 后输出派兵档位 logits，并应用动态剩余兵力约束。"""
-        hidden = self.hidden_size
-        batch_idx = jnp.arange(h_new.shape[0])
-        source_count = relative_h.shape[1]
-        src_safe = jnp.clip(src_t, 0, self.relative_count - 1)
-        tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
-        src_h = planet_out[batch_idx, src_safe]
-        tgt_h = planet_out[batch_idx, tgt_safe]
-        rel_for_src = relative_h[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-        selected_rel_h = jnp.take_along_axis(rel_for_src, tgt_safe[:, None, None], axis=1).squeeze(1)
-        amt_h = nn.relu(hidden_dense(hidden, name="auto_amt_pre")(jnp.concatenate([h_new, src_h, tgt_h, selected_rel_h], axis=-1)))
-        amount_logits = actor_logit_dense(self.ship_bucket_count, name="auto_amt_out")(amt_h)
-        amount_mask_f = amount_mask.astype(jnp.float32)
-        source_amount_mask = amount_mask_f[batch_idx, jnp.clip(src_safe - 1, 0, amount_mask_f.shape[1] - 1)]
-        selected_amount_mask = jnp.take_along_axis(source_amount_mask, tgt_safe[:, None, None], axis=1).squeeze(1)
-        dynamic_amount_mask = self._dynamic_amount_mask(remaining[batch_idx, src_safe]).astype(jnp.float32)
-        selected_amount_mask = (selected_amount_mask * dynamic_amount_mask) > 0.5
-        return jnp.where(selected_amount_mask, amount_logits, -1.0e9)
-
-    @nn.compact
-    def auto_token_embed(self, src_t, tgt_t, amt_t, end_t, executed_t, step_i, planet_out):
+    def auto_token_embed(self, src_t, tgt_t, end_t, executed_t, step_i, planet_out):
         """把当前 token 的执行结果编码成下一步 GRU 输入。"""
         hidden = self.hidden_size
         batch_idx = jnp.arange(src_t.shape[0])
         end_tok = self.param("end_token", nn.initializers.normal(0.02), (hidden,))
         invalid_tok = self.param("invalid_token", nn.initializers.normal(0.02), (hidden,))
-        amount_emb = self.param("amount_emb", nn.initializers.normal(0.02), (self.ship_bucket_count, hidden))
         step_emb = self.param("step_emb", nn.initializers.normal(0.02), (self.max_action_tokens, hidden))
         src_safe = jnp.clip(src_t, 0, self.relative_count - 1)
         tgt_safe = jnp.clip(tgt_t, 0, self.relative_count - 1)
         src_h = planet_out[batch_idx, src_safe]
         tgt_h = planet_out[batch_idx, tgt_safe]
-        amount_tok = jnp.take(jnp.asarray(amount_emb), jnp.clip(amt_t, 0, self.ship_bucket_count - 1), axis=0)
         step_tok = jnp.take(jnp.asarray(step_emb), step_i, axis=0)
-        raw = src_h + tgt_h + amount_tok + step_tok
+        raw = src_h + tgt_h + step_tok
         raw = raw / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(raw), axis=-1, keepdims=True), 1e-12))
         return jnp.where(
             end_t[:, None],
@@ -468,24 +423,10 @@ class AutoregressiveActorCritic(nn.Module):
         relative_h = MLP(hidden)(relative_features)
         return cls_out, planet_out, relative_h
 
-    def _ships_for_bucket(self, ships, bucket):
-        """根据当前剩余兵力和档位索引得到实际派兵数。"""
-        buckets = self._bucket_values(ships)
-        return jnp.take_along_axis(buckets, jnp.clip(bucket, 0, self.ship_bucket_count - 1)[:, None], axis=-1).squeeze(-1)
-
-    def _bucket_values(self, ships):
-        """按比例生成动态派兵档位，最小合法发射数为 10。"""
-        ratios = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)
-        ratios = ratios[: self.ship_bucket_count]
+    def _full_send_ships(self, ships):
+        """Full-send rule: launch all currently remaining ships from the source."""
         s = jnp.floor(ships)
-        raw = jnp.clip(jnp.round(s[:, None] * ratios[None, :]), 10.0, s[:, None])
-        return jnp.where(s[:, None] >= 10.0, raw, jnp.zeros_like(raw))
-
-    def _dynamic_amount_mask(self, ships):
-        """动态 amount mask：只允许剩余兵力能覆盖的正数档位。"""
-        buckets = self._bucket_values(ships)
-        positive = buckets >= 10.0
-        return positive
+        return jnp.where(s >= 10.0, s, 0.0)
 
     def _planet_features_with_noop(self, planet_features):
         """在 planet token 前补 no-op slot，使动作索引 0 始终可用。"""

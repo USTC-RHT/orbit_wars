@@ -14,12 +14,11 @@ class EnvConfig:
     """环境和动作空间相关配置。
 
     max_planets 控制全图目标槽位数量：index 0 保留为 no-op，后面最多
-    放 max_planets 个当前星球；ship_bucket_count 是网络可选择的派兵档位。
+    放 max_planets 个当前星球。
     """
 
     board_size: float = 100.0
     episode_steps: int = 500
-    ship_bucket_count: int = 6
     max_planets: int = 45
     max_ships: float = 500.0
     max_production: float = 5.0
@@ -108,7 +107,6 @@ class PPOConfig:
     ent_coef: float = 0.01
     ent_coef_fire: float = -1.0
     ent_coef_target: float = -1.0
-    ent_coef_amount: float = -1.0
     ent_schedule: str = "constant"
     ent_min_ratio: float = 1.0
     vf_coef: float = 0.5

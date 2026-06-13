@@ -8,7 +8,6 @@
 
 ```yaml
 env.max_planets: 45
-env.ship_bucket_count: 8
 env.target_filter_enabled: true
 env.attack_top_k: 10
 env.defense_top_k: 5
@@ -21,8 +20,8 @@ model.max_action_tokens: 12
 state_norm.enabled: true
 ```
 
-注意：`features_jax.py` 的默认 `MAX_FLEET_TOKENS = 32`，但上面的主训练配置会覆盖为
-`40`。旧的 `cfg_jax_fixed_pool_0525.yaml` 使用 `max_fleet_tokens: 16`，且没有显式设置
+注意：`features_jax.py` 的默认 `MAX_FLEET_TOKENS = 40`。旧的
+`cfg_jax_fixed_pool_0525.yaml` 使用 `max_fleet_tokens: 16`，且没有显式设置
 `fleet_selection`，因此会走默认 `size` 选择。
 
 ## 维度和返回值
@@ -30,8 +29,8 @@ state_norm.enabled: true
 `jax_agent/features_jax.py` 中的固定特征维度：
 
 ```python
-PLANET_DIM = 26
-RELATIVE_DIM = 15
+PLANET_DIM = 28
+RELATIVE_DIM = 22
 GLOBAL_DIM = 11
 FLEET_DIM = 28
 MAP_CHANNELS = 6
@@ -39,23 +38,21 @@ MAP_GRID_SIZE = 8
 INBOUND_HORIZON = 60.0
 MIN_LAUNCH = 10.0
 LOCAL_PLANET_RADIUS = 25.0
-SHIP_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
 ```
 
 `encode_batch(state, params)` 返回 `EncodedBatch`：
 
 ```python
-planet_features    # [B, P, 26]
-relative_features  # [B, P, P + 1, 15]
+planet_features    # [B, P, 28]
+relative_features  # [B, P, P + 1, 22]
 global_features    # [B, P, 11]
 map_features       # [B, P, 6, 8, 8]
 candidate_mask     # [B, P, P + 1]
-amount_mask        # [B, P, P + 1, ship_bucket_count]
 source_ids         # [B, P]
 source_ships       # [B, P]
 candidate_ids      # [B, P, P + 1]
-ship_buckets       # [B, P, ship_bucket_count]
 source_mask        # [B, P]
+owned_mask         # [B, P]
 fleet_features     # [B, P, max_fleet_tokens, 28]
 fleet_mask         # [B, P, max_fleet_tokens]
 ```
@@ -115,6 +112,8 @@ fleet_mask         # [B, P, max_fleet_tokens]
 # 23 inbound_my_eta_mean: 我方 inbound 船数加权平均 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
 # 24 inbound_enemy_eta_min: 敌方 inbound 最短 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
 # 25 inbound_enemy_eta_mean: 敌方 inbound 船数加权平均 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
+# 26 safe_drain_ratio: producer-style safe_drain / max(current ships, 1)。
+# 27 full_send_risk_ratio: max(current ships - safe_drain, 0) / max(current ships, 1)。
 ```
 
 旋转判定来自 `ROTATION_RADIUS_LIMIT`：`distance(initial_planet, center) + radius < limit`。
@@ -133,14 +132,21 @@ fleet_mask         # [B, P, max_fleet_tokens]
 # 4  target_ship_ratio: clip01((target 船数 + 1) / max(source 船数, 1))。
 # 5  source_ships: clip01(source 船数 / max_ships)，复制到每个 target 行。
 # 6  proto_score: Proto-style 目标评分 / 100.0。
-# 7  eta_max_bucket: 使用最大派兵档速度估算的 ETA / INBOUND_HORIZON。
-# 8  target_owner_at_eta_is_neutral: 按 ceil(eta_max_bucket) 从 garrison pre-combat 表取样。
+# 7  physics_eta_norm: full-send 物理层命中 tick / INBOUND_HORIZON；无命中则为 (INBOUND_HORIZON + 1) / INBOUND_HORIZON。
+# 8  target_owner_at_eta_is_neutral: 按 ceil(physics_eta) 从 garrison pre-combat 表取样。
 # 9  target_owner_at_eta_is_mine: 同上。
 # 10 target_owner_at_eta_is_enemy: 同上。
 # 11 target_ships_at_eta: 目标在 ETA 步生产后、到达结算前的驻军 / max_ships。
 # 12 my_arrivals_through_eta: garrison 到达表中 <= ETA 步的我方到达船数 / max_ships。
 # 13 enemy_arrivals_through_eta: garrison 到达表中 <= ETA 步的敌方到达船数 / max_ships。
-# 14 eta_out_of_garrison_horizon: eta_max_bucket 是否超过 DEFAULT_GARRISON_HORIZON。
+# 14 eta_out_of_garrison_horizon: physics_eta 是否超过 DEFAULT_GARRISON_HORIZON。
+# 15 pressure_delta: producer-style enemy_pressure[target] - enemy_pressure[source]，再除以 max_ships 并裁剪到 [-1, 1]。
+# 16 target_enemy_pressure: producer-style enemy_pressure[target] / max_ships。
+# 17 capture_margin_at_eta: (full_send_ships - target_ships_at_eta) / max_ships，裁剪到 [-1, 1]。
+# 18 arrival_balance_at_eta: (my_arrivals_through_eta - enemy_arrivals_through_eta) / max_ships，裁剪到 [-1, 1]。
+# 19 contestedness_at_eta: (my_arrivals_through_eta + enemy_arrivals_through_eta) / max_ships。
+# 20 capture_floor_at_eta: producer-style ETA 到达时最低派兵门槛 / max_ships；友方目标为 1 船，非友方为 ceil(projected_defenders + 1)。
+# 21 capture_surplus_at_eta: (full_send_ships - capture_floor_at_eta) / max_ships，裁剪到 [-1, 1]。
 ```
 
 `proto_score(src, tgt)` 的实现：
@@ -156,7 +162,7 @@ total_ships = min_ships + enemy_produced
 proto_score = (100 - dist) + 15 * tgt.production + 10 * enemy_bonus - 0.7 * total_ships - 2 * eta
 ```
 
-这个分数是软提示。actor 最终仍通过 policy logits 选择 source、target 和 amount；
+这个分数是软提示。actor 最终仍通过 policy logits 选择 source 和 target；
 当 `target_filter_enabled=true` 时，它还会参与候选目标 top-K 过滤。
 
 ## global_features
@@ -267,11 +273,17 @@ score = -importance + 1e-4 * dist_to_center / BOARD_SIZE
 
 ## Masks 和候选过滤
 
-`source_mask[src]` 是静态 source 所属权 mask：
+`source_mask[src]` 是 source pre-mask：
 
 ```python
-source_mask = planet_alive & (owner == 0)
+source_mask = planet_alive
+            & (owner == 0)
+            & (ships >= MIN_LAUNCH)
+            & candidate_mask[src, 1:].any()
 ```
+
+也就是说，一个星球只有在“能发射且至少有一个非 no-op target 可选”时才会进入 source head。
+这会提前过滤掉 target 全 mask 的 source，避免靠 rollout 里的 invalid token 事后跳过。
 
 source head 的实际可选 mask 还会叠加动态剩余兵力：
 
@@ -281,13 +293,20 @@ src_mask &= remaining_ships >= MIN_LAUNCH
 src_mask[0] = False
 ```
 
-target 的静态合法性来自 `candidate_mask[src, tgt]`：
+`owned_mask[src]` 是更宽的我方星球统计 mask：
+
+```python
+owned_mask = planet_alive & (owner == 0)
+```
+
+target 的 pre-mask 来自 `candidate_mask[src, tgt]`，先做静态/几何粗筛，再做物理精筛：
 
 ```python
 attackable_by_ships = source.ships > target.ships
 
 target_valid = target_alive
              & (target != source)
+             & reachable_by_full_send_fleet
              & (
                   target_is_friend
                   | ((target_is_enemy | target_is_neutral) & attackable_by_ships)
@@ -302,55 +321,44 @@ target head 会再把 `tgt=0` 关掉：
 tgt_mask = candidate_mask[src] & (target_slot != 0)
 ```
 
-当 `target_filter_enabled=true` 时，`candidate_mask` 会继续被 `apply_target_filter()` 剪枝：
+粗筛后，target 会进入 `physics_target_hit_eta_jax()`，用同一套物理层计算 full-send 是否可命中以及精确 ETA：
+
+```python
+angle, hit, eta_turns = aim_with_prediction_eta_jax(source, target, target_idx, state, full_send_ships)
+eta_feature = eta_turns / INBOUND_HORIZON
+candidate_mask[src, target] = target_valid & hit
+```
+
+这一步使用 Newton 连续拦截时间 + 相邻整数 tick 验证，并检查太阳、出界、首次碰撞对象和旋转/彗星 sweep。
+ETA 相关 relative features、garrison-at-ETA 取样、友方 defense/pressure 的 ETA 衰减都使用这个物理层 ETA。
+
+当 `target_filter_enabled=true` 时，物理精筛后的 `candidate_mask` 会继续被 `apply_target_filter()` 剪枝：
 
 ```python
 # no-op slot 继续保留。
 # attack targets: 在敌方/中立候选里按 proto_score 保留 attack_top_k 个。
-# defense targets: 在友方候选里按 defense_pressure 保留 defense_top_k 个，且 defense_pressure > 0。
-```
-
-`defense_pressure` 的实现：
-
-```python
-projected_defense = target.ships + inbound_my_ships + enemy_eta * target.production
-defense_pressure = enemy_inbound_ships - projected_defense if enemy_inbound_ships > 0 else 0
+# defense targets: 在友方候选里按 will_flip/pressure_delta/ETA 衰减后的防守增援分数保留 defense_top_k 个。
 ```
 
 当前主训练配置 `attack_top_k=10`、`defense_top_k=5`，因此 target 候选不是“所有静态合法目标”，
-而是经过 Proto/defense pressure top-K 过滤后的目标集合。
+而是已经经过 reachability、物理命中、Proto/防守增援 top-K 过滤后的目标集合。
 
-amount 的静态 mask 来自 `amount_mask[src, tgt, bucket]`：
+因此 target head 在采样前已经看不到物理层打不到的目标。`source_mask` 也会叠加
+`candidate_mask[src, 1:].any()`，没有任何可选 target 的 source 在 source head 阶段就会被关闭。
+如果当前局面没有任何可执行 source，rollout 会强制生成 end token。
 
-```python
-ship_buckets = build_ship_buckets(source.ships)
-valid_bucket = ship_buckets[bucket] > 0
-amount_mask[src, tgt, bucket] = candidate_mask[src, tgt] & valid_bucket
-amount_mask[src, 0, :] = True  # no-op 行占位；target head 不会选 tgt=0
-```
+## full-send amount
 
-amount head 会再叠加动态剩余兵力 mask：
+当前 no-amount-head 分支不再训练 amount head，也不再生成 `amount_mask`。
+一旦某个 source-target 动作通过 target pre-mask，派兵量由规则决定：
 
 ```python
-dynamic_bucket = build_ship_buckets(remaining_ships[source])
-amt_mask_t = amount_mask[src, tgt] & (dynamic_bucket >= MIN_LAUNCH)
+ships = floor(remaining_ships[source])
+ships = ships if ships >= MIN_LAUNCH else 0
 ```
 
-## ship_buckets
-
-派兵档位由 source 当前船数或 decoder 的动态剩余船数按比例生成：
-
-```python
-ratios = SHIP_RATIOS[:ship_bucket_count]
-s = floor(ships)
-raw = clip(round(s * ratios), MIN_LAUNCH, s)
-buckets = raw if s >= MIN_LAUNCH else 0
-```
-
-当前主训练配置 `ship_bucket_count=8`，即使用全部 8 个比例档位。
-`EncodedBatch.ship_buckets` 是编码时基于 source 初始船数生成的元数据；
-rollout 和模型内部实际发射时会根据 `remaining_ships` 重新计算动态 bucket，避免同一 env step
-内多 token 超发。
+因此 decoder 每执行一条命令后，该 source 的 remaining 会被扣到 0，同一 env step 中不会再次从该 source 发射。
+target reachability 粗筛也使用 full-send 舰队速度判断目标是否物理可达。
 
 ## inbound collision features
 
@@ -391,8 +399,8 @@ enemy_eta_mean
 归一化列：
 
 ```python
-PLANET_NORMALIZE_INDICES = [5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
-RELATIVE_NORMALIZE_INDICES = [1, 2, 3, 4, 5, 6, 7, 11, 12, 13]
+PLANET_NORMALIZE_INDICES = [5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+RELATIVE_NORMALIZE_INDICES = [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21]
 GLOBAL_NORMALIZE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 ```
 
@@ -400,13 +408,13 @@ GLOBAL_NORMALIZE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 ```python
 # planet stats:
-#   只用 source_mask=True 的我方存活星球行更新统计量。
+#   用 owned_mask=True 的我方存活星球行更新统计量。
 #
 # relative stats:
 #   只用 source_mask=True 的 source 行，并排除 candidate_ids < 0 的 no-op target 行。
 #
 # global stats:
-#   用 source_mask=True 的 source 行更新；同一个 state 会按我方 source 数重复计入。
+#   用 owned_mask=True 的行更新；同一个 state 会按我方存活星球数重复计入。
 ```
 
 归一化公式：
@@ -435,7 +443,7 @@ checkpoint 和 ONNX 导出会一起携带 normalizer 状态；评估/推理必�
 #   2. fleet_features 使用 shared_fleet_features = fleet_features[:, 0]。
 #   3. CLS token、planet tokens、fleet tokens 加 type embedding 后进入 Transformer。
 #   4. global_features[:, 0] 经过 MLP，和 CLS 输出拼成 state_emb。
-#   5. relative_features 单独经过 MLP，供 target/amount head 使用。
+#   5. relative_features 单独经过 MLP，供 target head 使用。
 #
 # Source head:
 #   使用 planet_out/source keys。
@@ -446,10 +454,6 @@ checkpoint 和 ONNX 导出会一起携带 normalizer 状态；评估/推理必�
 #   使用已选 source、planet_out、relative_h、candidate_mask。
 #   target slot 0 永远关闭。
 #
-# Amount head:
-#   使用已选 source、已选 target、relative_h、amount_mask。
-#   额外叠加 remaining_ships 动态 bucket mask。
-#
 # End head:
 #   每个 decoder token 先判断是否停止生成；停止动作不依赖 target no-op。
 ```
@@ -457,13 +461,13 @@ checkpoint 和 ONNX 导出会一起携带 normalizer 状态；评估/推理必�
 `model.use_transformer` 是配置里的兼容字段，当前 `AutoregressiveActorCritic` 实现本身总是按
 `num_transformer_layers` 构建 Transformer 编码层。设为 0 层才会实质跳过 Transformer block。
 
-rollout 时，模型输出的是 `(end, src, tgt, amount bucket)` token；真正提交给环境的动作是：
+rollout 时，模型输出的是 `(end, src, tgt)` token；真正提交给环境的动作是：
 
 ```python
 [source_planet_id, launch_angle, ships]
 ```
 
-`launch_angle` 由 `train_jax.aim_with_prediction_jax()` 根据 source、target、ships 计算，并做物理层命中校验。
-当前 `train_jax.py` 版本使用 Newton 迭代求连续拦截时间，再验证相邻整数 tick，支持旋转星球和彗星目标。
-如果瞄准/物理校验失败，该 token 会被标为 `invalid`，不会真实发射，decoder 下一步会收到
-`invalid_token`。
+`launch_angle` 由同一套 Newton aiming 逻辑根据 source、target、ships 计算。由于 target head 已经经过
+target pre-mask，已选 target 的物理可命中性在采样前确定；rollout 阶段只重新计算发射角，不再用 `aim_hit`
+做事后否决。若没有合法 source 会强制 end；若采样到 source/target pre-mask 外的编号，该 token 仍会标为
+`invalid`，不会真实发射，decoder 下一步会收到 `invalid_token`。

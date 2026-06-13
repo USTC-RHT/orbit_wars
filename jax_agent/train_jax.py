@@ -40,23 +40,18 @@ except ImportError as exc:
 from .build_initial_state_bank import build_bank  # noqa: E402
 from .eval_opponents import EvalContext, ExternalScriptOpponent, default_eval_opponents, eval_metric_fields as build_eval_metric_fields  # noqa: E402
 from .fast_env import (  # noqa: E402
-    COMETS_PER_SPAWN,
-    MAX_COMET_PATH,
-    MAX_COMET_SPAWNS,
     EnvParams,
     EnvState,
     comet_arrays_from_observation,
-    comet_planet_mask,
     load_state_bank,
-    point_segment_distance_sq,
     scores,
     select_from_bank,
     step_batch,
 )
 from .features_jax import FLEET_DIM, FeatureParams, encode_batch  # noqa: E402
-from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax, safe_drain_all_sources_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
+from .physics import aim_with_prediction_jax  # noqa: E402
 from .ppo_jax import (
     AutoRollout,
     PPOParams,
@@ -70,12 +65,6 @@ from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions  # noqa: E402
 
 NEG_INF = -1.0e9
-AIM_HORIZON = 60
-AIM_NEWTON_ITERS = 5
-AIM_NEWTON_MIN_DERIV = 1e-4
-AIM_NEWTON_MAX_STEP = 12.0
-AIM_TARGET_INSET = 1e-3
-SAFE_DRAIN_HORIZON = DEFAULT_GARRISON_HORIZON
 MIN_LAUNCH_SHIPS = 10.0
 
 
@@ -273,25 +262,21 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
 
 
-def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_HORIZON):
-    """Use producer-style safe_drain as the policy's removable-ship budget.
+def full_send_amount(ships: jnp.ndarray) -> jnp.ndarray:
+    """Full-send branch: launch all currently remaining ships from a selected source."""
+    s = jnp.floor(ships)
+    return jnp.where(s >= MIN_LAUNCH_SHIPS, s, 0.0)
 
-    ``source_mask`` handles the first layer (can this planet be picked as a
-    source at all), while ``source_ships`` becomes the dynamic amount budget used
-    by the model's existing bucket mask and by the final emitted ship count.
-    """
-    status = garrison_status_jax(state, horizon=horizon)
-    drain = safe_drain_all_sources_jax(
-        status,
-        source_ships=encoded.source_ships,
-        h_eff=jnp.asarray(float(horizon), dtype=jnp.float32),
-        player_id=0,
-    )
-    budget = jnp.minimum(encoded.source_ships, drain)
-    budget = jnp.where(jnp.isfinite(budget), budget, 0.0)
-    budget = jnp.where(encoded.source_mask, budget, 0.0).clip(min=0.0)
-    source_mask = encoded.source_mask & (budget >= MIN_LAUNCH_SHIPS)
-    return encoded._replace(source_ships=budget, source_mask=source_mask)
+
+def has_valid_logits(logits: jnp.ndarray) -> jnp.ndarray:
+    """Whether a masked categorical row still has at least one real action."""
+    return (jnp.isfinite(logits) & (logits > NEG_INF * 0.5)).any(axis=-1)
+
+
+def selected_target_is_valid(encoded, batch_idx, src_slot, tgt_t) -> jnp.ndarray:
+    """Validate the sampled target against the precomputed target pre-mask."""
+    tgt_safe = jnp.clip(tgt_t, 0, encoded.candidate_mask.shape[-1] - 1)
+    return (tgt_t > 0) & encoded.candidate_mask[batch_idx, src_slot, tgt_safe]
 
 
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
@@ -302,7 +287,6 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
     """
     raw_enc = encode_batch(state, feat_params)
     encoded = normalize_encoded(raw_enc, norm_state, norm_params)
-    encoded = apply_safe_drain_budget(state, encoded)
     b = encoded.planet_features.shape[0]
     k = model.max_action_tokens
     initial_ships = jnp.concatenate(
@@ -333,7 +317,8 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
             method=model.auto_step_base,
         )
         tv = ~ended
-        end_t = tv & (jax.nn.sigmoid(end_logits_t) > 0.5)
+        no_valid_source = ~has_valid_logits(src_logits_t)
+        end_t = tv & ((jax.nn.sigmoid(end_logits_t) > 0.5) | no_valid_source)
         src_t = jnp.argmax(safe_logits(src_logits_t), axis=-1)
 
         src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
@@ -345,32 +330,18 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         )
         tgt_t = jnp.argmax(safe_logits(tgt_logits_t), axis=-1)
 
-        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
-        amt_logits_t = train_state.apply_fn(
-            {"params": train_state.params},
-            h_new, src_for_heads, tgt_for_heads, planet_out,
-            relative_h, remaining, encoded.amount_mask,
-            method=model.auto_amt_logits,
-        )
-        amt_t = jnp.argmax(safe_logits(amt_logits_t), axis=-1)
-
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
-        source_buckets = dynamic_ship_buckets(
-            remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)],
-            feat_params.ship_bucket_count,
-        )
-        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)])
         src_planets = state.planets[batch_idx, src_slot]
         tgt_planets = state.planets[batch_idx, tgt_slot]
-        angle, aim_hit = aim_with_prediction_jax(
+        angle, _hit = aim_with_prediction_jax(
             src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], state, ships[:, None]
         )
         angle = angle[:, 0]
-        aim_hit = aim_hit[:, 0]
-        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
-        tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
+        tgt_valid = selected_target_is_valid(encoded, batch_idx, src_slot, tgt_t)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid
 
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -388,8 +359,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
 
         prev_tok = train_state.apply_fn(
             {"params": train_state.params},
-            src_for_heads, tgt_for_heads,
-            jnp.where(tv & (~end_t), amt_t, 0),
+            src_for_heads, jnp.where(tv & (~end_t), tgt_t, 0),
             end_t, exec_t, t, planet_out,
             method=model.auto_token_embed,
         )
@@ -414,15 +384,14 @@ def auto_opponent_policy_actions(
     """自博弈训练用的冻结参数对手。
 
     它先把棋盘翻转到 player 1 视角，再用冻结的 opponent_params 生成动作。
-    与 learner 的 ``auto_policy_sample`` 保持一致：end / src / tgt / amount
-    四个 head 都按当前 logits 采样（categorical / bernoulli），不再 argmax，
+    与 learner 的 ``auto_policy_sample`` 保持一致：end / src / tgt
+    三个 head 都按当前 logits 采样（categorical / bernoulli），不再 argmax，
     用于训练时给学习者提供有探索的对手。评估路径仍使用
     ``auto_deterministic_policy_actions`` 走 argmax。
     """
     flipped = flip_state_fn(state)
     raw_enc = encode_batch(flipped, opp_fp)
     encoded = normalize_encoded(raw_enc, opp_ns, norm_params)
-    encoded = apply_safe_drain_budget(flipped, encoded)
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
     initial_ships = jnp.concatenate(
@@ -446,10 +415,11 @@ def auto_opponent_policy_actions(
             state_emb, h, prev_tok, remaining, encoded.relative_features, encoded.source_mask, src_key_proj,
             method=model.auto_step_base,
         )
-        rng, key_end, key_src, key_tgt, key_amt = jax.random.split(rng, 5)
+        rng, key_end, key_src, key_tgt = jax.random.split(rng, 4)
         tv = ~ended
         sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
-        end_t = tv & sampled_end
+        no_valid_source = ~has_valid_logits(src_logits_t)
+        end_t = tv & (sampled_end | no_valid_source)
         src_t = jax.random.categorical(key_src, safe_logits(src_logits_t), axis=-1)
         src_for_heads = jnp.where(tv & (~end_t), src_t, 0)
 
@@ -459,32 +429,18 @@ def auto_opponent_policy_actions(
             method=model.auto_tgt_logits,
         )
         tgt_t = jax.random.categorical(key_tgt, safe_logits(tgt_logits_t), axis=-1)
-        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
-
-        amt_logits_t = model.apply(
-            {"params": opponent_params},
-            h_new, src_for_heads, tgt_for_heads, planet_out,
-            relative_h, remaining, encoded.amount_mask,
-            method=model.auto_amt_logits,
-        )
-        amt_t = jax.random.categorical(key_amt, safe_logits(amt_logits_t), axis=-1)
-
         src_slot = jnp.clip(src_t - 1, 0, opp_fp.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, opp_fp.max_planets - 1)
-        source_buckets = dynamic_ship_buckets(
-            remaining[batch_idx, jnp.clip(src_t, 0, opp_fp.max_planets)], opp_fp.ship_bucket_count
-        )
-        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, opp_fp.max_planets)])
         src_planets = flipped.planets[batch_idx, src_slot]
         tgt_planets = flipped.planets[batch_idx, tgt_slot]
-        angle, aim_hit = aim_with_prediction_jax(
+        angle, _hit = aim_with_prediction_jax(
             src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], flipped, ships[:, None]
         )
         angle = angle[:, 0]
-        aim_hit = aim_hit[:, 0]
-        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
-        tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
+        tgt_valid = selected_target_is_valid(encoded, batch_idx, src_slot, tgt_t)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
             [jnp.where(exec_t, source_ids, 0.0), jnp.where(exec_t, angle, 0.0), jnp.where(exec_t, ships, 0.0)],
@@ -496,8 +452,7 @@ def auto_opponent_policy_actions(
         )
         prev_tok = model.apply(
             {"params": opponent_params},
-            src_for_heads, tgt_for_heads,
-            jnp.where(tv & (~end_t), amt_t, 0),
+            src_for_heads, jnp.where(tv & (~end_t), tgt_t, 0),
             end_t, exec_t, t, planet_out,
             method=model.auto_token_embed,
         )
@@ -537,7 +492,6 @@ def main() -> None:
     reward_params = RewardParams.from_train_config(cfg)
     ent_coef_fire = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_fire", -1.0) < 0.0 else cfg.ppo.ent_coef_fire
     ent_coef_target = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_target", -1.0) < 0.0 else cfg.ppo.ent_coef_target
-    ent_coef_amount = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_amount", -1.0) < 0.0 else cfg.ppo.ent_coef_amount
     ppo_params = PPOParams(
         gamma=cfg.ppo.gamma,
         gae_lambda=cfg.ppo.gae_lambda,
@@ -545,7 +499,6 @@ def main() -> None:
         ent_coef=cfg.ppo.ent_coef,
         ent_coef_fire=ent_coef_fire,
         ent_coef_target=ent_coef_target,
-        ent_coef_amount=ent_coef_amount,
         vf_coef=cfg.ppo.vf_coef,
         max_grad_norm=cfg.ppo.max_grad_norm,
         epochs=cfg.ppo.epochs,
@@ -575,7 +528,6 @@ def main() -> None:
         relative_dim=sample.relative_features.shape[-1],
         global_dim=sample.global_features.shape[-1],
         relative_count=cfg.env.max_planets + 1,
-        ship_bucket_count=cfg.env.ship_bucket_count,
         hidden_size=cfg.model.hidden_size,
         use_cnn=cfg.model.use_cnn,
         fleet_dim=FLEET_DIM,
@@ -664,7 +616,6 @@ def main() -> None:
             "entropy_end",
             "entropy_src",
             "entropy_tgt",
-            "entropy_amt",
             "approx_kl",
             "clipfrac",
             "max_abs_log_ratio",
@@ -692,7 +643,6 @@ def main() -> None:
                 "ent_coef": cfg.ppo.ent_coef,
                 "ent_coef_fire": ent_coef_fire,
                 "ent_coef_target": ent_coef_target,
-                "ent_coef_amount": ent_coef_amount,
                 "ent_schedule": getattr(cfg.ppo, "ent_schedule", "constant"),
                 "ent_min_ratio": getattr(cfg.ppo, "ent_min_ratio", 1.0),
                 "vf_coef": cfg.ppo.vf_coef,
@@ -1004,7 +954,6 @@ def main() -> None:
     def _jit_external_sample(ts, st, ns, key):
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
         sample = auto_policy_sample(ts, model, st, encoded, key, feat_params, max_action_tokens)
         b = encoded.planet_features.shape[0]
         row = AutoRollout(
@@ -1015,19 +964,16 @@ def main() -> None:
             encoded.fleet_features,
             encoded.fleet_mask,
             encoded.candidate_mask,
-            encoded.amount_mask,
             encoded.source_mask,
             sample["initial_ships"],
             sample["end_action"],
             sample["src_action"],
             sample["tgt_action"],
-            sample["amt_action"],
             sample["executed"],
             sample["invalid"],
             sample["old_logp_end"],
             sample["old_logp_src"],
             sample["old_logp_tgt"],
-            sample["old_logp_amt"],
             sample["token_valid"],
             sample["value"],
             jnp.zeros((b,), dtype=jnp.float32),
@@ -1039,7 +985,6 @@ def main() -> None:
     def _jit_external_value(ts, st, ns):
         raw_encoded = encode_batch(st, feat_params)
         encoded = normalize_encoded(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
         b = encoded.planet_features.shape[0]
         k = max_action_tokens
         initial_ships = jnp.concatenate(
@@ -1052,10 +997,8 @@ def main() -> None:
             encoded.relative_features,
             encoded.global_features,
             encoded.candidate_mask,
-            encoded.amount_mask,
             encoded.source_mask,
             jnp.zeros((b, k), dtype=bool),
-            jnp.zeros((b, k), dtype=jnp.int32),
             jnp.zeros((b, k), dtype=jnp.int32),
             jnp.zeros((b, k), dtype=jnp.int32),
             jnp.zeros((b, k), dtype=bool),
@@ -1296,8 +1239,7 @@ def main() -> None:
             f" logr_heads="
             f"{metrics.get('max_abs_log_ratio_end', 0.0):.1f}/"
             f"{metrics.get('max_abs_log_ratio_src', 0.0):.1f}/"
-            f"{metrics.get('max_abs_log_ratio_tgt', 0.0):.1f}/"
-            f"{metrics.get('max_abs_log_ratio_amt', 0.0):.1f}"
+            f"{metrics.get('max_abs_log_ratio_tgt', 0.0):.1f}"
         )
         if update % log_every == 0:
             print(line, flush=True)
@@ -1412,7 +1354,6 @@ def main() -> None:
                 f"{metrics.get('entropy_end', 0.0):.8f}",
                 f"{metrics.get('entropy_src', 0.0):.8f}",
                 f"{metrics.get('entropy_tgt', 0.0):.8f}",
-                f"{metrics.get('entropy_amt', 0.0):.8f}",
                 f"{metrics['approx_kl']:.8f}",
                 f"{metrics['clipfrac']:.8f}",
                 f"{metrics.get('max_abs_log_ratio', 0.0):.8f}",
@@ -1444,11 +1385,9 @@ def main() -> None:
                     "entropy/end": float(metrics.get("entropy_end", 0.0)),
                     "entropy/src": float(metrics.get("entropy_src", 0.0)),
                     "entropy/tgt": float(metrics.get("entropy_tgt", 0.0)),
-                    "entropy/amt": float(metrics.get("entropy_amt", 0.0)),
                     "losses/max_abs_log_ratio_end": float(metrics.get("max_abs_log_ratio_end", 0.0)),
                     "losses/max_abs_log_ratio_src": float(metrics.get("max_abs_log_ratio_src", 0.0)),
                     "losses/max_abs_log_ratio_tgt": float(metrics.get("max_abs_log_ratio_tgt", 0.0)),
-                    "losses/max_abs_log_ratio_amt": float(metrics.get("max_abs_log_ratio_amt", 0.0)),
                     "autoregressive/invalid_action_rate": float(metrics.get("invalid_action_rate", 0.0)),
                     "autoregressive/executed_action_rate": float(metrics.get("executed_action_rate", 0.0)),
                     "autoregressive/seq_len_mean": float(metrics.get("seq_len_mean", 0.0)),
@@ -1520,7 +1459,6 @@ def collect_rollout_auto(
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
         if opponent_kind == "selfplay":
@@ -1551,19 +1489,16 @@ def collect_rollout_auto(
             encoded.fleet_features,
             encoded.fleet_mask,
             encoded.candidate_mask,
-            encoded.amount_mask,
             encoded.source_mask,
             sample["initial_ships"],
             sample["end_action"],
             sample["src_action"],
             sample["tgt_action"],
-            sample["amt_action"],
             sample["executed"],
             sample["invalid"],
             sample["old_logp_end"],
             sample["old_logp_src"],
             sample["old_logp_tgt"],
-            sample["old_logp_amt"],
             sample["token_valid"],
             sample["value"],
             reward_env,
@@ -1579,7 +1514,6 @@ def collect_rollout_auto(
     )
     last_raw_encoded = encode_batch(state, feat_params)
     last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
-    last_encoded = apply_safe_drain_budget(state, last_encoded)
     b = last_encoded.planet_features.shape[0]
     k = max_action_tokens
     last_initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=last_encoded.source_ships.dtype), last_encoded.source_ships], axis=1)
@@ -1589,10 +1523,8 @@ def collect_rollout_auto(
         last_encoded.relative_features,
         last_encoded.global_features,
         last_encoded.candidate_mask,
-        last_encoded.amount_mask,
         last_encoded.source_mask,
         jnp.zeros((b, k), dtype=bool),
-        jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=bool),
@@ -1629,30 +1561,20 @@ def _categorical_log_prob_local(logits, action):
     return jnp.take_along_axis(jax.nn.log_softmax(logits), action[..., None], axis=-1).squeeze(-1)
 
 
-def dynamic_ship_buckets(ships, bucket_count: int):
-    """根据当前剩余兵力动态生成派兵档位。"""
-    ratios = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)[:bucket_count]
-    s = jnp.floor(ships)
-    raw = jnp.clip(jnp.round(s[:, None] * ratios[None, :]), 10.0, s[:, None])
-    return jnp.where(s[:, None] >= 10.0, raw, jnp.zeros_like(raw))
-
-
 def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: FeatureParams, max_action_tokens: int):
-    """自回归 rollout 采样，并在采样后做物理层校验。"""
+    """自回归 rollout 采样；target pre-mask 已包含物理层命中约束。"""
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
     initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=encoded.source_ships.dtype), encoded.source_ships], axis=1)
     end_action = jnp.zeros((b, k), dtype=bool)
     src_action = jnp.zeros((b, k), dtype=jnp.int32)
     tgt_action = jnp.zeros((b, k), dtype=jnp.int32)
-    amt_action = jnp.zeros((b, k), dtype=jnp.int32)
     executed = jnp.zeros((b, k), dtype=bool)
     invalid = jnp.zeros((b, k), dtype=bool)
     token_valid = jnp.zeros((b, k), dtype=bool)
     old_logp_end = jnp.zeros((b, k), dtype=jnp.float32)
     old_logp_src = jnp.zeros((b, k), dtype=jnp.float32)
     old_logp_tgt = jnp.zeros((b, k), dtype=jnp.float32)
-    old_logp_amt = jnp.zeros((b, k), dtype=jnp.float32)
     actions = jnp.zeros((b, feat_params.max_planets, 3), dtype=jnp.float32)
     ended = jnp.zeros((b,), dtype=bool)
     state_emb, h, prev_tok, remaining, planet_out, relative_h, key_proj, src_key_proj, value = train_state.apply_fn(
@@ -1670,9 +1592,9 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
     batch_idx = jnp.arange(b)
 
     def body(t, carry):
-        (key, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
-         token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = carry
-        key, key_end, key_src, key_tgt, key_amt = jax.random.split(key, 5)
+        (key, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, executed, invalid,
+         token_valid, old_logp_end, old_logp_src, old_logp_tgt, actions) = carry
+        key, key_end, key_src, key_tgt = jax.random.split(key, 4)
         h_new, end_logits_t, src_logits_t = train_state.apply_fn(
             {"params": train_state.params},
             state_emb,
@@ -1686,7 +1608,8 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         )
         tv = ~ended
         sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
-        end_t = tv & sampled_end
+        no_valid_source = ~has_valid_logits(src_logits_t)
+        end_t = tv & (sampled_end | no_valid_source)
         src_logits_t = safe_logits(src_logits_t)
         src_t = jax.random.categorical(key_src, src_logits_t, axis=-1)
 
@@ -1704,33 +1627,16 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         tgt_logits_t = safe_logits(tgt_logits_t)
         tgt_t = jax.random.categorical(key_tgt, tgt_logits_t, axis=-1)
 
-        tgt_for_heads = jnp.where(tv & (~end_t), tgt_t, 0)
-        amt_logits_t = train_state.apply_fn(
-            {"params": train_state.params},
-            h_new,
-            src_for_heads,
-            tgt_for_heads,
-            planet_out,
-            relative_h,
-            remaining,
-            encoded.amount_mask,
-            method=model.auto_amt_logits,
-        )
-        amt_logits_t = safe_logits(amt_logits_t)
-        amt_t = jax.random.categorical(key_amt, amt_logits_t, axis=-1)
-
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
-        source_buckets = dynamic_ship_buckets(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)], feat_params.ship_bucket_count)
-        ships = jnp.take_along_axis(source_buckets, amt_t[:, None], axis=-1).squeeze(-1)
+        ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)])
         src_planets = state.planets[batch_idx, src_slot]
         tgt_planets = state.planets[batch_idx, tgt_slot]
-        angle, aim_hit = aim_with_prediction_jax(src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], state, ships[:, None])
+        angle, _hit = aim_with_prediction_jax(src_planets[:, None, :], tgt_planets[:, None, :], tgt_slot[:, None], state, ships[:, None])
         angle = angle[:, 0]
-        aim_hit = aim_hit[:, 0]
-        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
-        tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
+        tgt_valid = selected_target_is_valid(encoded, batch_idx, src_slot, tgt_t)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid
         invalid_t = tv & (~end_t) & (~exec_t)
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -1746,8 +1652,7 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         prev_tok = train_state.apply_fn(
             {"params": train_state.params},
             src_for_heads,
-            tgt_for_heads,
-            jnp.where(tv & (~end_t), amt_t, 0),
+            jnp.where(tv & (~end_t), tgt_t, 0),
             end_t,
             exec_t,
             t,
@@ -1756,464 +1661,35 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         )
         end_action = end_action.at[:, t].set(end_t)
         src_action = src_action.at[:, t].set(src_for_heads)
-        tgt_action = tgt_action.at[:, t].set(tgt_for_heads)
-        amt_action = amt_action.at[:, t].set(jnp.where(tv & (~end_t), amt_t, 0))
+        tgt_action = tgt_action.at[:, t].set(jnp.where(tv & (~end_t), tgt_t, 0))
         executed = executed.at[:, t].set(exec_t)
         invalid = invalid.at[:, t].set(invalid_t)
         token_valid = token_valid.at[:, t].set(tv)
         old_logp_end = old_logp_end.at[:, t].set(jnp.where(tv, _bernoulli_log_prob_local(end_logits_t, end_t), 0.0))
         old_logp_src = old_logp_src.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(src_logits_t, src_t), 0.0))
         old_logp_tgt = old_logp_tgt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(tgt_logits_t, tgt_t), 0.0))
-        old_logp_amt = old_logp_amt.at[:, t].set(jnp.where(exec_t, _categorical_log_prob_local(amt_logits_t, amt_t), 0.0))
         ended = ended | end_t
-        return (key, ended, h_new, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
-                token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
+        return (key, ended, h_new, prev_tok, remaining, end_action, src_action, tgt_action, executed, invalid,
+                token_valid, old_logp_end, old_logp_src, old_logp_tgt, actions)
 
-    init = (rng, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
-            token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions)
-    (_, _ended, _h, _prev_tok, _remaining, end_action, src_action, tgt_action, amt_action, executed, invalid,
-     token_valid, old_logp_end, old_logp_src, old_logp_tgt, old_logp_amt, actions) = jax.lax.fori_loop(0, k, body, init)
+    init = (rng, ended, h, prev_tok, remaining, end_action, src_action, tgt_action, executed, invalid,
+            token_valid, old_logp_end, old_logp_src, old_logp_tgt, actions)
+    (_, _ended, _h, _prev_tok, _remaining, end_action, src_action, tgt_action, executed, invalid,
+     token_valid, old_logp_end, old_logp_src, old_logp_tgt, actions) = jax.lax.fori_loop(0, k, body, init)
     return {
         "actions": actions,
         "initial_ships": initial_ships,
         "end_action": end_action,
         "src_action": src_action,
         "tgt_action": tgt_action,
-        "amt_action": amt_action,
         "executed": executed,
         "invalid": invalid,
         "token_valid": token_valid,
         "old_logp_end": old_logp_end,
         "old_logp_src": old_logp_src,
         "old_logp_tgt": old_logp_tgt,
-        "old_logp_amt": old_logp_amt,
         "value": value,
     }
-
-
-def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
-    """与 src/physics.py 的 aim_with_prediction 同步的 JAX 批量瞄准。
-
-    流程保持一致：
-    1. 用 Newton 迭代求连续拦截时间 T*。
-    2. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
-    3. 每个整数回合同时尝试瞄 target(T*)、target(k-1) 和 target(k)，
-       覆盖连续拦截点、舰队移动命中和旋转星球 sweep 命中的关键几何面。
-    4. 每个候选角都按引擎顺序检查太阳、出界、第一碰撞和目标碰撞。
-    """
-
-    horizon = AIM_HORIZON
-    clearance = 0.1
-    speed = fleet_speed_local(jnp.maximum(ships, 1.0))
-    max_turns = target_max_turns_jax(state, target_idx, horizon).astype(jnp.float32)
-    can_search = max_turns >= 1.0
-
-    px0, py0, target0_valid = target_pos_at_time_jax(state, target_idx, jnp.zeros_like(max_turns))
-    gap = src[..., 4] + clearance + target[..., 4]
-    d0 = jnp.sqrt((px0 - src[..., 2]) ** 2 + (py0 - src[..., 3]) ** 2)
-    t_star = jnp.clip((d0 - gap) / speed, 0.0, max_turns)
-
-    def newton_body(_, t_cur):
-        px, py, vx, vy, pos_valid = target_pos_velocity_at_time_jax(state, target_idx, t_cur)
-        rx = px - src[..., 2]
-        ry = py - src[..., 3]
-        dist = jnp.sqrt(jnp.maximum(rx * rx + ry * ry, 1.0e-9))
-        f_val = dist - gap - speed * t_cur
-        radial_velocity = (rx * vx + ry * vy) / dist
-        deriv = radial_velocity - speed
-        raw_step = f_val / deriv
-        max_step = jnp.minimum(jnp.maximum(max_turns, 1.0), AIM_NEWTON_MAX_STEP)
-        step = jnp.clip(raw_step, -max_step, max_step)
-        t_newton = jnp.clip(t_cur - step, 0.0, max_turns)
-        use_newton = (
-            pos_valid
-            & jnp.isfinite(t_newton)
-            & jnp.isfinite(raw_step)
-            & jnp.isfinite(deriv)
-            & (jnp.abs(deriv) > AIM_NEWTON_MIN_DERIV)
-        )
-        return jnp.where(use_newton, t_newton, t_cur)
-
-    t_star = jax.lax.fori_loop(0, AIM_NEWTON_ITERS, newton_body, t_star)
-    has_solution = can_search & target0_valid
-    t_floor = jnp.floor(t_star).astype(jnp.int32)
-    candidates = jnp.stack(
-        [
-            jnp.maximum(t_floor - 1, 1),
-            jnp.maximum(t_floor, 1),
-            t_floor + 1,
-        ],
-        axis=-1,
-    )
-    candidate_turns = candidates.astype(jnp.float32)
-    candidate_in_range = (candidate_turns >= 1.0) & (candidate_turns <= max_turns[..., None])
-
-    t_star_for_candidates = jnp.broadcast_to(t_star[..., None], candidate_turns.shape)
-    aim_turns = jnp.stack(
-        [
-            t_star_for_candidates,
-            jnp.maximum(candidate_turns - 1.0, 0.0),
-            candidate_turns,
-        ],
-        axis=-1,
-    )
-    aim_px, aim_py, aim_pos_valid = target_pos_at_time_jax(state, target_idx, aim_turns)
-    angle = jnp.arctan2(aim_py - src[..., None, None, 3], aim_px - src[..., None, None, 2])
-    cos_a = jnp.cos(angle)
-    sin_a = jnp.sin(angle)
-    candidate_turns_e = candidate_turns[..., None]
-    candidates_e = candidates[..., None]
-    fx0 = src[..., None, None, 2] + cos_a * (src[..., None, None, 4] + clearance)
-    fy0 = src[..., None, None, 3] + sin_a * (src[..., None, None, 4] + clearance)
-    fx_t = fx0 + candidate_turns_e * speed[..., None, None] * cos_a
-    fy_t = fy0 + candidate_turns_e * speed[..., None, None] * sin_a
-
-    sun_hit = point_segment_distance_sq(50.0, 50.0, fx0, fy0, fx_t, fy_t) < 100.0
-    first_collision_ok = target_is_first_collision_jax(
-        src,
-        target_idx,
-        state,
-        fx0,
-        fy0,
-        speed[..., None, None],
-        cos_a,
-        sin_a,
-        candidates_e,
-    )
-
-    fx_prev = fx0 + (candidate_turns_e - 1.0) * speed[..., None, None] * cos_a
-    fy_prev = fy0 + (candidate_turns_e - 1.0) * speed[..., None, None] * sin_a
-    px_old, py_old, target_pos_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e - 1.0)
-    move_d2 = point_segment_distance_sq(px_old, py_old, fx_prev, fy_prev, fx_t, fy_t)
-    target_hit_radius = jnp.maximum(target[..., None, None, 4] - AIM_TARGET_INSET, 0.0)
-    move_hits_target = move_d2 < target_hit_radius ** 2
-
-    px_next, py_next, target_next_valid = target_pos_at_time_jax(state, target_idx, candidate_turns_e)
-    target_moved = ((px_next - px_old) ** 2 + (py_next - py_old) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(fx_t, fy_t, px_old, py_old, px_next, py_next)
-    sweep_hits_target = (
-        target_moved
-        & target_next_valid
-        & (sweep_d2 < target_hit_radius ** 2)
-    )
-
-    candidate_valid = (
-        has_solution[..., None, None]
-        & candidate_in_range[..., None]
-        & aim_pos_valid
-        & target_pos_valid
-        & (~sun_hit)
-        & first_collision_ok
-        & (move_hits_target | sweep_hits_target)
-        & (ships[..., None, None] > 0.0)
-    )
-    candidate_valid_flat = candidate_valid.reshape(candidate_valid.shape[:-2] + (9,))
-    angle_flat = angle.reshape(angle.shape[:-2] + (9,))
-    has_valid = candidate_valid_flat.any(axis=-1)
-    chosen = jnp.argmax(candidate_valid_flat, axis=-1)
-    chosen_angle = jnp.take_along_axis(angle_flat, chosen[..., None], axis=-1).squeeze(-1)
-    direct_angle = jnp.arctan2(target[..., 3] - src[..., 3], target[..., 2] - src[..., 2])
-    return jnp.where(has_valid, chosen_angle, direct_angle), has_valid
-
-
-def aim_f_jax(src, target, target_idx, state: EnvState, speed, turns):
-    """f(T)=dist(src,target(T))-(src.radius+clearance+T*speed)-target.radius。"""
-    px, py, valid = target_pos_at_time_jax(state, target_idx, turns)
-    src_x = _expand_like_time(src[..., 2], turns)
-    src_y = _expand_like_time(src[..., 3], turns)
-    src_radius = _expand_like_time(src[..., 4], turns)
-    speed_t = _expand_like_time(speed, turns)
-    target_radius = _expand_like_time(target[..., 4], turns)
-    dist = jnp.sqrt((px - src_x) ** 2 + (py - src_y) ** 2)
-    value = dist - (src_radius + 0.1 + turns * speed_t) - target_radius
-    return jnp.where(valid, value, jnp.inf)
-
-
-def target_pos_at_time_jax(state: EnvState, target_idx, turns):
-    """目标星球在浮点 turns 后的位置，支持普通星球和彗星线性插值。"""
-    b, p = target_idx.shape
-    batch_idx = jnp.arange(b)[:, None]
-    planets = state.planets[batch_idx, target_idx]
-    initial = state.initial_planets[batch_idx, target_idx]
-    alive = state.planet_alive[batch_idx, target_idx]
-
-    base_x = _expand_like_time(planets[..., 2], turns)
-    base_y = _expand_like_time(planets[..., 3], turns)
-    dx = initial[..., 2] - 50.0
-    dy = initial[..., 3] - 50.0
-    orbit_r = jnp.sqrt(dx * dx + dy * dy)
-    phi_cur = jnp.arctan2(planets[..., 3] - 50.0, planets[..., 2] - 50.0)
-    phi = _expand_like_time(phi_cur, turns) + _expand_like_time(state.angular_velocity[:, None], turns) * turns
-    rot_x = 50.0 + _expand_like_time(orbit_r, turns) * jnp.cos(phi)
-    rot_y = 50.0 + _expand_like_time(orbit_r, turns) * jnp.sin(phi)
-    comet_mask = jax.vmap(comet_planet_mask)(state)
-    is_comet = comet_mask[batch_idx, target_idx]
-    rotating = (orbit_r + initial[..., 4] < 50.0) & alive & (~is_comet)
-    px = jnp.where(_expand_like_time(rotating, turns), rot_x, base_x)
-    py = jnp.where(_expand_like_time(rotating, turns), rot_y, base_y)
-    valid = _expand_like_time(alive, turns)
-
-    comet_x, comet_y, comet_valid = comet_target_pos_at_time_jax(state, target_idx, turns)
-    is_comet_t = _expand_like_time(is_comet, turns)
-    px = jnp.where(is_comet_t, comet_x, px)
-    py = jnp.where(is_comet_t, comet_y, py)
-    valid = jnp.where(is_comet_t, comet_valid, valid)
-    return px, py, valid
-
-
-def target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
-    """目标星球在浮点 turns 后的位置和速度，用于 Newton 求解 T*。"""
-    b, p = target_idx.shape
-    batch_idx = jnp.arange(b)[:, None]
-    planets = state.planets[batch_idx, target_idx]
-    initial = state.initial_planets[batch_idx, target_idx]
-    alive = state.planet_alive[batch_idx, target_idx]
-
-    base_x = _expand_like_time(planets[..., 2], turns)
-    base_y = _expand_like_time(planets[..., 3], turns)
-    zero = jnp.zeros_like(base_x)
-    dx = initial[..., 2] - 50.0
-    dy = initial[..., 3] - 50.0
-    orbit_r = jnp.sqrt(dx * dx + dy * dy)
-    phi_cur = jnp.arctan2(planets[..., 3] - 50.0, planets[..., 2] - 50.0)
-    omega = _expand_like_time(state.angular_velocity[:, None], turns)
-    phi = _expand_like_time(phi_cur, turns) + omega * turns
-    orbit_r_t = _expand_like_time(orbit_r, turns)
-    rot_x = 50.0 + orbit_r_t * jnp.cos(phi)
-    rot_y = 50.0 + orbit_r_t * jnp.sin(phi)
-    rot_vx = -omega * orbit_r_t * jnp.sin(phi)
-    rot_vy = omega * orbit_r_t * jnp.cos(phi)
-
-    comet_mask = jax.vmap(comet_planet_mask)(state)
-    is_comet = comet_mask[batch_idx, target_idx]
-    rotating = (orbit_r + initial[..., 4] < 50.0) & alive & (~is_comet)
-    rotating_t = _expand_like_time(rotating, turns)
-    px = jnp.where(rotating_t, rot_x, base_x)
-    py = jnp.where(rotating_t, rot_y, base_y)
-    vx = jnp.where(rotating_t, rot_vx, zero)
-    vy = jnp.where(rotating_t, rot_vy, zero)
-    valid = _expand_like_time(alive, turns)
-
-    comet_x, comet_y, comet_vx, comet_vy, comet_valid = comet_target_pos_velocity_at_time_jax(state, target_idx, turns)
-    is_comet_t = _expand_like_time(is_comet, turns)
-    px = jnp.where(is_comet_t, comet_x, px)
-    py = jnp.where(is_comet_t, comet_y, py)
-    vx = jnp.where(is_comet_t, comet_vx, vx)
-    vy = jnp.where(is_comet_t, comet_vy, vy)
-    valid = jnp.where(is_comet_t, comet_valid, valid)
-    return px, py, vx, vy, valid
-
-
-def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
-    """彗星目标在浮点 turns 后的位置。非彗星返回无效占位。"""
-    extra = turns.ndim - target_idx.ndim
-    one_shape = (1,) * extra
-    slots = state.comet_slots.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    target_e = target_idx.reshape(target_idx.shape + one_shape + (1, 1))
-    active = (
-        (state.comet_slots >= 0)
-        & (state.comet_path_index[:, :, None] >= -1)
-        & (state.comet_lengths > 0)
-    ).reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    match = (slots == target_e) & active
-
-    path_index = state.comet_path_index.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, 1))
-    lengths = state.comet_lengths.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    fi = path_index + turns[..., None, None]
-    i0 = jnp.floor(fi).astype(jnp.int32)
-    frac = fi - i0.astype(jnp.float32)
-    valid_i0 = (i0 >= 0) & (i0 < lengths)
-    i1 = jnp.minimum(i0 + 1, lengths - 1)
-    has_i1 = i0 + 1 < lengths
-    i0_safe = jnp.clip(i0, 0, MAX_COMET_PATH - 1)
-    i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
-    path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
-    paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
-    pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
-    weights = (match & valid_i0).astype(jnp.float32)
-    has = weights.sum(axis=(-2, -1)) > 0.0
-    px = (pos[..., 0] * weights).sum(axis=(-2, -1))
-    py = (pos[..., 1] * weights).sum(axis=(-2, -1))
-    return px, py, has
-
-
-def comet_target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
-    """彗星目标在浮点 turns 后的位置和路径段速度。非彗星返回无效占位。"""
-    extra = turns.ndim - target_idx.ndim
-    one_shape = (1,) * extra
-    slots = state.comet_slots.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    target_e = target_idx.reshape(target_idx.shape + one_shape + (1, 1))
-    active = (
-        (state.comet_slots >= 0)
-        & (state.comet_path_index[:, :, None] >= -1)
-        & (state.comet_lengths > 0)
-    ).reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    match = (slots == target_e) & active
-
-    path_index = state.comet_path_index.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, 1))
-    lengths = state.comet_lengths.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
-    fi = path_index + turns[..., None, None]
-    i0 = jnp.floor(fi).astype(jnp.int32)
-    frac = fi - i0.astype(jnp.float32)
-    valid_i0 = (i0 >= 0) & (i0 < lengths)
-    i1 = jnp.minimum(i0 + 1, lengths - 1)
-    has_i1 = i0 + 1 < lengths
-    i0_safe = jnp.clip(i0, 0, MAX_COMET_PATH - 1)
-    i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
-    path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
-    paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
-    pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
-    vel = jnp.where(has_i1[..., None], pos1 - pos0, jnp.zeros_like(pos0))
-    weights = (match & valid_i0).astype(jnp.float32)
-    has = weights.sum(axis=(-2, -1)) > 0.0
-    px = (pos[..., 0] * weights).sum(axis=(-2, -1))
-    py = (pos[..., 1] * weights).sum(axis=(-2, -1))
-    vx = (vel[..., 0] * weights).sum(axis=(-2, -1))
-    vy = (vel[..., 1] * weights).sum(axis=(-2, -1))
-    return px, py, vx, vy, has
-
-
-def target_max_turns_jax(state: EnvState, target_idx, horizon: int):
-    """普通目标搜索 horizon；彗星目标按 src/physics.py 限制为 remaining_life-1。"""
-    b, p = target_idx.shape
-    slots = state.comet_slots[:, None, :, :]
-    target_e = target_idx[:, :, None, None]
-    active = (state.comet_slots[:, None, :, :] >= 0) & (state.comet_path_index[:, None, :, None] >= -1)
-    match = (slots == target_e) & active
-    remaining = state.comet_lengths[:, None, :, :] - state.comet_path_index[:, None, :, None]
-    comet_remaining = jnp.where(match, remaining, 0).max(axis=(-2, -1))
-    comet_has = match.any(axis=(-2, -1))
-    comet_max = jnp.minimum(jnp.asarray(horizon, dtype=jnp.int32), jnp.maximum(0, comet_remaining - 1))
-    return jnp.where(comet_has, comet_max, horizon)
-
-
-def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, speed, cos_a, sin_a, hit_turn):
-    """按引擎阶段验证候选回合的第一碰撞对象就是目标。"""
-    horizon = AIM_HORIZON
-    turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
-    turns = turns_i.astype(jnp.float32)
-    planets = state.planets
-    planet_alive = state.planet_alive
-    px_t, py_t = all_planet_pos_at_turns(state, horizon)
-    fx_prev = fx0[..., None] + (turns - 1.0) * speed[..., None] * cos_a[..., None]
-    fy_prev = fy0[..., None] + (turns - 1.0) * speed[..., None] * sin_a[..., None]
-    fx_cur = fx0[..., None] + turns * speed[..., None] * cos_a[..., None]
-    fy_cur = fy0[..., None] + turns * speed[..., None] * sin_a[..., None]
-    active_step = turns_i.reshape((1,) * hit_turn.ndim + (horizon,)) <= hit_turn[..., None]
-    in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
-    in_bounds_until_hit = (in_bounds | (~active_step)).all(axis=-1)
-
-    src_axes = (None,) * (hit_turn.ndim - 1)
-    px_old = px_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    py_old = py_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    px_new = px_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
-    py_new = py_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
-    radii = planets[(slice(None),) + src_axes + (slice(None), 4)]
-    alive = planet_alive[(slice(None),) + src_axes + (slice(None), None)]
-
-    move_d2 = point_segment_distance_sq(
-        px_old,
-        py_old,
-        fx_prev[..., None, :],
-        fy_prev[..., None, :],
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-    )
-    move_hit = (move_d2 < radii[..., None] ** 2) & alive & active_step[..., None, :]
-
-    sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-        px_old,
-        py_old,
-        px_new,
-        py_new,
-    )
-    sweep_hit = (sweep_d2 < radii[..., None] ** 2) & alive & sweep_active & active_step[..., None, :]
-
-    large = jnp.int32(2 * (horizon + 1) + 1)
-    move_keys = (2 * turns_i).reshape((1,) * (move_hit.ndim - 1) + (horizon,))
-    sweep_keys = (2 * turns_i + 1).reshape((1,) * (sweep_hit.ndim - 1) + (horizon,))
-    first_move = jnp.where(move_hit, move_keys, large).min(axis=-1)
-    first_sweep = jnp.where(sweep_hit, sweep_keys, large).min(axis=-1)
-    first_by_planet = jnp.minimum(first_move, first_sweep)
-    first_planet = first_by_planet.argmin(axis=-1)
-    first_key = first_by_planet.min(axis=-1)
-    target_key_lo = 2 * hit_turn
-    target_key_hi = 2 * hit_turn + 1
-    return (
-        in_bounds_until_hit
-        & (first_key < large)
-        & (first_planet == target_idx.reshape(target_idx.shape + (1,) * (hit_turn.ndim - target_idx.ndim)))
-        & (first_key >= target_key_lo)
-        & (first_key <= target_key_hi)
-    )
-
-
-def _expand_like_time(x, turns):
-    """把 [B,P] 标量特征扩展到 turns 的 [B,P,...] 形状。"""
-    return x.reshape(x.shape + (1,) * (turns.ndim - x.ndim))
-
-
-def all_planet_pos_at_turns(state: EnvState, horizon: int):
-    """计算未来 horizon 步内全部星球位置 [B, P, horizon+1]。
-
-    step 0 为当前位置；静止星球固定，旋转星球按角速度追踪，彗星使用预存路径。
-    """
-    planets = state.planets
-    initial_planets = state.initial_planets
-    planet_alive = state.planet_alive
-    turns = jnp.arange(horizon + 1, dtype=jnp.float32)
-    dx = initial_planets[..., 2] - 50.0
-    dy = initial_planets[..., 3] - 50.0
-    orbit_r = jnp.sqrt(dx * dx + dy * dy)
-    comet_mask = jax.vmap(comet_planet_mask)(state)
-    rotating = (orbit_r + initial_planets[..., 4] < 50.0) & planet_alive & (~comet_mask)
-    phi_cur = jnp.arctan2(planets[..., 3] - 50.0, planets[..., 2] - 50.0)
-    phi = phi_cur[..., None] + state.angular_velocity[:, None, None] * turns
-    px = 50.0 + orbit_r[..., None] * jnp.cos(phi)
-    py = 50.0 + orbit_r[..., None] * jnp.sin(phi)
-    px = jnp.where(rotating[..., None], px, planets[..., None, 2])
-    py = jnp.where(rotating[..., None], py, planets[..., None, 3])
-
-    comet_slots = state.comet_slots.reshape(state.planets.shape[0], MAX_COMET_SPAWNS * COMETS_PER_SPAWN)
-    safe_slots = jnp.where(comet_slots >= 0, comet_slots, 0)
-    group_active = state.comet_path_index[:, :, None] >= -1
-    active = (state.comet_slots >= 0) & group_active
-    active_flat = active.reshape(state.planets.shape[0], MAX_COMET_SPAWNS * COMETS_PER_SPAWN)
-    path_index = state.comet_path_index[:, :, None, None] + jnp.arange(horizon + 1, dtype=jnp.int32)[None, None, None, :]
-    path_index = jnp.broadcast_to(path_index, (state.planets.shape[0], MAX_COMET_SPAWNS, COMETS_PER_SPAWN, horizon + 1))
-    valid_t = active[..., None] & (path_index >= 0) & (path_index < state.comet_lengths[..., None])
-    path_index = jnp.clip(path_index, 0, MAX_COMET_PATH - 1)
-    gather_index = jnp.broadcast_to(
-        path_index[..., None],
-        (state.planets.shape[0], MAX_COMET_SPAWNS, COMETS_PER_SPAWN, horizon + 1, 2),
-    )
-    path_pos = jnp.take_along_axis(state.comet_paths, gather_index, axis=3)
-    path_pos = jnp.where(valid_t[..., None], path_pos, -1000.0)
-    flat_pos = path_pos.reshape(state.planets.shape[0], MAX_COMET_SPAWNS * COMETS_PER_SPAWN, horizon + 1, 2)
-    slot_onehot = jax.nn.one_hot(safe_slots, state.planets.shape[1], dtype=jnp.float32) * active_flat[..., None].astype(jnp.float32)
-    comet_has = slot_onehot.sum(axis=1) > 0.0
-    comet_px = jnp.einsum("bkp,bkt->bpt", slot_onehot, flat_pos[..., 0])
-    comet_py = jnp.einsum("bkp,bkt->bpt", slot_onehot, flat_pos[..., 1])
-    px = jnp.where(comet_has[..., None], comet_px, px)
-    py = jnp.where(comet_has[..., None], comet_py, py)
-    return px, py
-
-
-def fleet_speed_local(ships):
-    """根据舰数计算舰队速度：与 orbit_wars.py fleet_speed 完全一致。"""
-    ratio = jnp.clip(jnp.log(jnp.maximum(ships, 1.0)) / jnp.log(1000.0), 0.0, 1.0)
-    return jnp.minimum(1.0 + 5.0 * (ratio**1.5), 6.0)
 
 
 def replace_done(state: EnvState, reset: EnvState) -> EnvState:

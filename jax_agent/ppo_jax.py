@@ -39,7 +39,6 @@ class PPOParams:
     ent_coef: float = 0.01     # 熵奖励系数（鼓励探索）
     ent_coef_fire: float = 0.01
     ent_coef_target: float = 0.01
-    ent_coef_amount: float = 0.01
     vf_coef: float = 0.5       # 价值函数损失系数
     max_grad_norm: float = 0.5 # 梯度范数裁剪阈值
     epochs: int = 4            # 每次 rollout 训练轮数
@@ -51,7 +50,7 @@ class PPOParams:
 class AutoRollout(NamedTuple):
     """自回归 rollout 数据，按 [T, B, ...] 堆叠。
 
-    end/src/tgt/amt 是每个 decoder token 的动作；executed 表示动作通过物理层并真实发射；
+    end/src/tgt 是每个 decoder token 的动作；executed 表示动作通过 pre-mask 并真实发射；
     token_valid 表示该 token 在终止前被解码过，用于 end head 的 PPO loss。
     """
     planet_features: jnp.ndarray
@@ -61,19 +60,16 @@ class AutoRollout(NamedTuple):
     fleet_features: jnp.ndarray
     fleet_mask: jnp.ndarray
     candidate_mask: jnp.ndarray
-    amount_mask: jnp.ndarray
     source_mask: jnp.ndarray
     initial_ships: jnp.ndarray
     end_action: jnp.ndarray
     src_action: jnp.ndarray
     tgt_action: jnp.ndarray
-    amt_action: jnp.ndarray
     executed: jnp.ndarray
     invalid: jnp.ndarray
     old_logp_end: jnp.ndarray
     old_logp_src: jnp.ndarray
     old_logp_tgt: jnp.ndarray
-    old_logp_amt: jnp.ndarray
     token_valid: jnp.ndarray
     old_value: jnp.ndarray
     reward: jnp.ndarray
@@ -135,10 +131,8 @@ def make_auto_train_state(
         sample_batch.relative_features,
         sample_batch.global_features,
         sample_batch.candidate_mask,
-        sample_batch.amount_mask,
         sample_batch.source_mask,
         jnp.zeros((b, k), dtype=bool),
-        jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=jnp.int32),
         jnp.zeros((b, k), dtype=bool),
@@ -173,7 +167,8 @@ def categorical_entropy(logits):
 def safe_logits(logits):
     """修复全非法 logits 行，避免 softmax/categorical 产生 NaN。"""
     _assert_all_finite("ppo/logits", logits)
-    invalid = ~jnp.isfinite(logits).any(axis=-1)
+    valid = jnp.isfinite(logits) & (logits > NEG_INF * 0.5)
+    invalid = ~valid.any(axis=-1)
     fixed = jnp.where(invalid[..., None], NEG_INF, logits)
     return fixed.at[..., 0].set(jnp.where(invalid, 0.0, fixed[..., 0]))
 
@@ -231,14 +226,12 @@ def ppo_update_auto(train_state: TrainState, rollout: AutoRollout, returns, adva
         "entropy_end",
         "entropy_src",
         "entropy_tgt",
-        "entropy_amt",
         "approx_kl",
         "clipfrac",
         "max_abs_log_ratio",
         "max_abs_log_ratio_end",
         "max_abs_log_ratio_src",
         "max_abs_log_ratio_tgt",
-        "max_abs_log_ratio_amt",
         "invalid_action_rate",
         "executed_action_rate",
         "seq_len_mean",
@@ -295,12 +288,10 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
             batch["relative_features"],
             batch["global_features"],
             batch["candidate_mask"],
-            batch["amount_mask"],
             batch["source_mask"],
             batch["end_action"],
             batch["src_action"],
             batch["tgt_action"],
-            batch["amt_action"],
             batch["executed"],
             batch["initial_ships"],
             map_features=batch["map_features"],
@@ -310,14 +301,12 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         end_logp = bernoulli_log_prob(outputs.end_logits, batch["end_action"])
         src_logits = safe_logits(outputs.src_logits)
         tgt_logits = safe_logits(outputs.tgt_logits)
-        amt_logits = safe_logits(outputs.amount_logits)
         src_logp = categorical_log_prob(src_logits, batch["src_action"])
         tgt_logp = categorical_log_prob(tgt_logits, batch["tgt_action"])
-        amt_logp = categorical_log_prob(amt_logits, batch["amt_action"])
 
         token_valid = batch["token_valid"].astype(jnp.float32)
         end_mask = token_valid              # end head 对所有“已解码 token”学习。
-        arg_mask = batch["executed"].astype(jnp.float32)  # src/tgt/amt 只学习真实执行动作。
+        arg_mask = batch["executed"].astype(jnp.float32)  # src/tgt 只学习真实执行动作。
         adv = batch["advantages"]
         if params.norm_adv:
             adv_mean = adv.mean()
@@ -341,8 +330,7 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         l_end, kl_end, cf_end, mr_end = token_loss(end_logp, batch["old_logp_end"], end_mask)
         l_src, kl_src, cf_src, mr_src = token_loss(src_logp, batch["old_logp_src"], arg_mask)
         l_tgt, kl_tgt, cf_tgt, mr_tgt = token_loss(tgt_logp, batch["old_logp_tgt"], arg_mask)
-        l_amt, kl_amt, cf_amt, mr_amt = token_loss(amt_logp, batch["old_logp_amt"], arg_mask)
-        policy_loss = (l_end + l_src + l_tgt + l_amt) / 4.0
+        policy_loss = (l_end + l_src + l_tgt) / 3.0
 
         value = _assert_all_finite("ppo_auto/value", outputs.value)
         value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
@@ -351,25 +339,22 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         ent_end = _fire_entropy(outputs.end_logits)
         ent_src = categorical_entropy(src_logits)
         ent_tgt = categorical_entropy(tgt_logits)
-        ent_amt = categorical_entropy(amt_logits)
         end_denom = jnp.maximum(end_mask.sum(), 1.0)
         arg_denom = jnp.maximum(arg_mask.sum(), 1.0)
         entropy_end = (ent_end * end_mask).sum() / end_denom
         entropy_src = (ent_src * arg_mask).sum() / arg_denom
         entropy_tgt = (ent_tgt * arg_mask).sum() / arg_denom
-        entropy_amt = (ent_amt * arg_mask).sum() / arg_denom
-        entropy = entropy_end + entropy_src + entropy_tgt + entropy_amt
+        entropy = entropy_end + entropy_src + entropy_tgt
         entropy_bonus = ent_scale * (
             params.ent_coef_fire * entropy_end
             + params.ent_coef_target * entropy_tgt
-            + params.ent_coef_amount * entropy_amt
             + params.ent_coef * entropy_src
         )
         loss = policy_loss + params.vf_coef * value_loss - entropy_bonus
         loss = _assert_all_finite("ppo_auto/loss", loss)
-        approx_kl = (kl_end + kl_src + kl_tgt + kl_amt) / 4.0
-        clipfrac = (cf_end + cf_src + cf_tgt + cf_amt) / 4.0
-        max_abs_log_ratio = jnp.maximum(jnp.maximum(mr_end, mr_src), jnp.maximum(mr_tgt, mr_amt))
+        approx_kl = (kl_end + kl_src + kl_tgt) / 3.0
+        clipfrac = (cf_end + cf_src + cf_tgt) / 3.0
+        max_abs_log_ratio = jnp.maximum(jnp.maximum(mr_end, mr_src), mr_tgt)
         non_end = (batch["token_valid"] & (~batch["end_action"])).astype(jnp.float32)
         non_end_denom = jnp.maximum(non_end.sum(), 1.0)
         invalid_action_rate = (batch["invalid"].astype(jnp.float32) * non_end).sum() / non_end_denom
@@ -383,14 +368,12 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
             "entropy_end": entropy_end,
             "entropy_src": entropy_src,
             "entropy_tgt": entropy_tgt,
-            "entropy_amt": entropy_amt,
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "max_abs_log_ratio": max_abs_log_ratio,
             "max_abs_log_ratio_end": mr_end,
             "max_abs_log_ratio_src": mr_src,
             "max_abs_log_ratio_tgt": mr_tgt,
-            "max_abs_log_ratio_amt": mr_amt,
             "invalid_action_rate": invalid_action_rate,
             "executed_action_rate": executed_action_rate,
             "seq_len_mean": seq_len_mean,
@@ -415,19 +398,16 @@ def flatten_auto_rollout(rollout: AutoRollout, returns, advantages):
         "fleet_features": flat(rollout.fleet_features),
         "fleet_mask": flat(rollout.fleet_mask),
         "candidate_mask": flat(rollout.candidate_mask),
-        "amount_mask": flat(rollout.amount_mask),
         "source_mask": flat(rollout.source_mask),
         "initial_ships": flat(rollout.initial_ships),
         "end_action": flat(rollout.end_action),
         "src_action": flat(rollout.src_action),
         "tgt_action": flat(rollout.tgt_action),
-        "amt_action": flat(rollout.amt_action),
         "executed": flat(rollout.executed),
         "invalid": flat(rollout.invalid),
         "old_logp_end": flat(rollout.old_logp_end),
         "old_logp_src": flat(rollout.old_logp_src),
         "old_logp_tgt": flat(rollout.old_logp_tgt),
-        "old_logp_amt": flat(rollout.old_logp_amt),
         "token_valid": flat(rollout.token_valid),
         "old_value": flat(rollout.old_value),
         "returns": flat(returns),

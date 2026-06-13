@@ -12,9 +12,9 @@
 
 核心设计原则：
 
-- **自回归多命令决策**：每回合由 decoder 连续生成 `END` 或 `(source, target, amount)` 命令
-- **条件式三级选择**：先选 source，再基于 source 选 target，最后基于 source-target pair 选派兵量
-- **物理计算后置**：网络只选"打谁/派多少"，真实的发射角度和碰撞检测在动作确定后再计算
+- **自回归多命令决策**：每回合由 decoder 连续生成 `END` 或 `(source, target)` 命令
+- **条件式两级选择**：先选 source，再基于 source 选 target
+- **物理计算后置**：网络只选"从哪打谁"，派兵量走 full-send 规则，真实发射角度和碰撞检测在动作确定后再计算
 - **Reward 精细塑形**：终局胜负（主信号）+ 多维局势变化 shaping + 事件驱动奖惩
 
 ---
@@ -41,14 +41,13 @@ rl-agent/
 
 ## 3. 动作空间
 
-网络不直接输出角度，而是在每个 decoder step 输出一条离散命令。命令可以是结束符，也可以是一组 `(source, target, amount)`：
+网络不直接输出角度，而是在每个 decoder step 输出一条离散命令。命令可以是结束符，也可以是一组 `(source, target)`；派兵量固定为该 source 当前剩余飞船的全量：
 
 | 动作维度 | 类型 | 含义 |
 |----------|------|------|
 | `end` | Bernoulli/Categorical | 当前 step 是否结束本回合命令生成 |
 | `source` | Categorical | 从哪个己方星球发兵 |
 | `target` | Categorical | 打哪个目标槽位 |
-| `amount` | Categorical | 派兵比例档位 |
 
 ### 3.1 目标槽位定义
 
@@ -59,15 +58,14 @@ target slot 1..45   = 当前全图所有星球/彗星（按 id 排序，不足�
 
 ### 3.2 合法性 Mask
 
-`features_jax.py` 会为 source、target、amount 分别生成 mask：
+`features_jax.py` 会为 source、target 生成 mask；发射量由 full-send 规则确定：
 
 | Mask | 形状 | 规则 |
 |------|------|------|
 | `source_mask` | `[B, P]` | 只有己方且有可用兵力的星球可作为 source |
 | `candidate_mask` | `[B, P, P + 1]` | 每个 source 只允许合法 target |
-| `amount_mask` | `[B, P, P + 1, 8]` | 每个 source-target pair 只允许可执行的派兵比例 |
 
-Decoder 每执行一条命令后会更新该 source 的剩余兵力，后续命令的 source/amount mask 会基于新的剩余兵力重新计算。
+Decoder 每执行一条命令后会把该 source 的 `remaining` 全量发出并扣到 0，后续命令的 source mask 会基于新的剩余兵力重新计算。
 
 ---
 
@@ -77,15 +75,14 @@ Decoder 每执行一条命令后会更新该 source 的剩余兵力，后续命�
 
 | 特征组 | 形状 | 说明 |
 |--------|------|------|
-| `planet_features` | `[B, P, 26]` | 每个星球自己的状态特征 |
-| `relative_features` | `[B, P, P + 1, 15]` | 每个 source 到每个 target 的相对特征 |
+| `planet_features` | `[B, P, 28]` | 每个星球自己的状态特征 |
+| `relative_features` | `[B, P, P + 1, 22]` | 每个 source 到每个 target 的相对特征 |
 | `global_features` | `[B, P, 11]` | 全局游戏状态，模型取 `global_features[:, 0]` |
 | `fleet_features` | `[B, P, F, 28]` | 舰队 token 特征 |
 | `fleet_mask` | `[B, P, F]` | 舰队 token 是否有效 |
 | `map_features` | `[B, P, 6, 8, 8]` | 每个 source 视角的局部地图 |
 | `source_mask` | `[B, P]` | 哪些星球可作为 source |
 | `candidate_mask` | `[B, P, P + 1]` | 每个 source 的合法 target |
-| `amount_mask` | `[B, P, P + 1, 8]` | 每个 source-target 的合法派兵档 |
 
 ### 4.1 planet_features
 
@@ -93,7 +90,7 @@ Decoder 每执行一条命令后会更新该 source 的剩余兵力，后续命�
 
 ### 4.2 relative_features
 
-`relative_features[src, tgt]` 描述 source 到 target 的关系，例如相对位移、距离、相对兵力、最快到达时间、目标先验价值等。它不进入 Transformer token，而是在 target head 和 amount head 中加回去，让同一个目标在不同 source 视角下有不同 key。
+`relative_features[src, tgt]` 描述 source 到 target 的关系，例如相对位移、距离、相对兵力、最快到达时间、目标先验价值等。它不进入 Transformer token，而是在 target head 中加回去，让同一个目标在不同 source 视角下有不同 key。
 
 ### 4.3 global / fleet / map
 
@@ -108,7 +105,7 @@ Decoder 每执行一条命令后会更新该 source 的剩余兵力，后续命�
 当前 JAX 路线使用 `jax_agent/model_jax.py` 中的 `AutoregressiveActorCritic`。模型先用 Transformer 编码整局状态，再用 GRU decoder 自回归地产生多条命令，每条命令为：
 
 ```
-END 或 (source, target, amount)
+END 或 (source, target)
 ```
 
 默认每回合最多生成 `max_action_tokens = 12` 条命令。
@@ -135,11 +132,11 @@ global_ctx = MLP(global_features[:, 0])
 state_ctx = MLP(concat(cls_out, global_ctx))
 ```
 
-`relative_features` 不进入 Transformer，而是单独经过 MLP 得到 `relative_h`，在 target head 和 amount head 中补回 source-target 的相对距离、方向、攻防关系等信息。
+`relative_features` 不进入 Transformer，而是单独经过 MLP 得到 `relative_h`，在 target head 中补回 source-target 的相对距离、方向、攻防关系等信息。
 
 ### 5.2 Decoder
 
-Decoder 每一步先用上一步 token 和 `state_ctx` 更新 GRU hidden state，然后依次输出 source、target、amount。
+Decoder 每一步先用上一步 token 和 `state_ctx` 更新 GRU hidden state，然后依次输出 source、target。
 
 ```python
 # =====================
@@ -164,23 +161,20 @@ tgt_logits = pointer(
   keys = MLP(planet_out) + relative_h
 )
 
-# amount head
-tgt_h = planet_out[tgt]
-pair_h = relative_h[tgt]
-amount_logits = MLP(concat(h, src_h, tgt_h, pair_h))
+# amount
+ships = floor(remaining[src])  # full-send rule, not a policy head
 ```
 
 **设计细节**：
 - source head 使用 `source_mask` 和当前剩余兵力 mask，不能发兵的星球不会被选中
-- target head 使用 `candidate_mask[src]`，只允许合法目标
-- amount head 使用 `amount_mask[src, tgt]` 和剩余兵力 mask，避免选择不可执行的派兵比例
-- decoder 会在每条已执行命令后更新 source 剩余兵力，因此同一回合后续命令能感知前面已经派出的兵
+- target head 使用 `candidate_mask[src]`，只允许经过静态合法性、reachability 粗筛、Top-K 和 Newton 物理精筛的目标
+- decoder 会在每条已执行命令后把 source 剩余兵力扣到 0，因此同一回合后续命令能感知前面已经派出的兵
 
 ### 训练 vs 推理
 
 | 阶段 | 动作序列 | 选择方式 |
 |------|----------|----------|
-| 训练 rollout | `END / source / target / amount` 序列 | 按策略分布采样 |
+| 训练 rollout | `END / source / target` 序列 | 按策略分布采样 |
 | PPO 更新 | replay rollout 中保存的 token | 重算 log-prob、entropy、value |
 | Kaggle/eval/网页推理 | 同一套 decoder | 通常使用 deterministic/argmax |
 
@@ -243,7 +237,7 @@ $$
 |------|------|
 | $\mathcal{L}_{policy}$ | PPO clipped objective |
 | $\mathcal{L}_{value}$ | return 与 critic value 的 MSE（支持 value clipping） |
-| $\mathcal{H}$ | 策略熵（含 end / source / target / amount），鼓励探索 |
+| $\mathcal{H}$ | 策略熵（含 end / source / target），鼓励探索 |
 | `approx_kl` | 监控新旧策略距离，超过阈值提前停止本轮更新 |
 
 ### 7.2 GAE 计算
@@ -260,7 +254,7 @@ $$
 
 ### 7.3 PPO 中的 log-prob
 
-当前实现不会先把整段动作序列合成一个总 `logp_seq` 再做 PPO ratio，而是保存并重算四类 token log-prob：
+当前实现不会先把整段动作序列合成一个总 `logp_seq` 再做 PPO ratio，而是保存并重算三类 token log-prob：
 
 $$
 \log \pi_{end}(e_t | h_t)
@@ -268,14 +262,13 @@ $$
 
 $$
 \log \pi_{src}(src_t | h_t),\quad
-\log \pi_{tgt}(tgt_t | h_t, src_t),\quad
-\log \pi_{amt}(amt_t | h_t, src_t, tgt_t)
+\log \pi_{tgt}(tgt_t | h_t, src_t)
 $$
 
-其中 `end` 对所有 `token_valid` step 参与 loss，`src/tgt/amt` 只在 `executed=True` 的 step 参与 loss。`ppo_jax.py` 分别计算 `end/src/tgt/amt` 的 PPO clipped loss，然后取平均：
+其中 `end` 对所有 `token_valid` step 参与 loss，`src/tgt` 只在 `executed=True` 的 step 参与 loss。`ppo_jax.py` 分别计算 `end/src/tgt` 的 PPO clipped loss，然后取平均：
 
 ```python
-policy_loss = (l_end + l_src + l_tgt + l_amt) / 4.0
+policy_loss = (l_end + l_src + l_tgt) / 3.0
 ```
 
 因此从概率建模角度看，一条已执行命令的 log-prob 可以理解为这些条件概率的和；但当前 PPO 优化实现是“按 head/token 分开做 ratio”，不是“整段序列求和后做一个总 ratio”。

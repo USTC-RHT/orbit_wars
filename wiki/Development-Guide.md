@@ -226,8 +226,6 @@ ppo:
   total_updates: 2000       # 总更新轮次
   num_envs: 8               # 并行环境数
   rollout_steps: 128        # 每次 rollout 步数
-env:
-  ship_bucket_count: 8      # 派兵档位数
 opponent: nearest           # 训练对手：random / nearest / self
 device: auto                # 自动选择 CPU / CUDA
 reward:

@@ -70,7 +70,9 @@ from .train_opponents import nearest_opponent_actions  # noqa: E402
 
 NEG_INF = -1.0e9
 AIM_HORIZON = 60
-AIM_FP_ITERS = 8
+AIM_NEWTON_ITERS = 5
+AIM_NEWTON_MIN_DERIV = 1e-4
+AIM_NEWTON_MAX_STEP = 12.0
 AIM_TARGET_INSET = 1e-3
 
 
@@ -1763,7 +1765,7 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     """与 src/physics.py 的 aim_with_prediction 同步的 JAX 批量瞄准。
 
     流程保持一致：
-    1. 用 fixed-point 迭代求连续拦截时间 T*。
+    1. 用 Newton 迭代求连续拦截时间 T*。
     2. 验证 floor(T*)-1/floor(T*)/floor(T*)+1 三个整数回合。
     3. 每个整数回合同时尝试瞄 target(T*)、target(k-1) 和 target(k)，
        覆盖连续拦截点、舰队移动命中和旋转星球 sweep 命中的关键几何面。
@@ -1781,13 +1783,28 @@ def aim_with_prediction_jax(src, target, target_idx, state: EnvState, ships):
     d0 = jnp.sqrt((px0 - src[..., 2]) ** 2 + (py0 - src[..., 3]) ** 2)
     t_star = jnp.clip((d0 - gap) / speed, 0.0, max_turns)
 
-    def fixed_point_body(_, t_cur):
-        px, py, pos_valid = target_pos_at_time_jax(state, target_idx, t_cur)
-        dist = jnp.sqrt((px - src[..., 2]) ** 2 + (py - src[..., 3]) ** 2)
-        t_next = jnp.clip((dist - gap) / speed, 0.0, max_turns)
-        return jnp.where(pos_valid, t_next, t_cur)
+    def newton_body(_, t_cur):
+        px, py, vx, vy, pos_valid = target_pos_velocity_at_time_jax(state, target_idx, t_cur)
+        rx = px - src[..., 2]
+        ry = py - src[..., 3]
+        dist = jnp.sqrt(jnp.maximum(rx * rx + ry * ry, 1.0e-9))
+        f_val = dist - gap - speed * t_cur
+        radial_velocity = (rx * vx + ry * vy) / dist
+        deriv = radial_velocity - speed
+        raw_step = f_val / deriv
+        max_step = jnp.minimum(jnp.maximum(max_turns, 1.0), AIM_NEWTON_MAX_STEP)
+        step = jnp.clip(raw_step, -max_step, max_step)
+        t_newton = jnp.clip(t_cur - step, 0.0, max_turns)
+        use_newton = (
+            pos_valid
+            & jnp.isfinite(t_newton)
+            & jnp.isfinite(raw_step)
+            & jnp.isfinite(deriv)
+            & (jnp.abs(deriv) > AIM_NEWTON_MIN_DERIV)
+        )
+        return jnp.where(use_newton, t_newton, t_cur)
 
-    t_star = jax.lax.fori_loop(0, AIM_FP_ITERS, fixed_point_body, t_star)
+    t_star = jax.lax.fori_loop(0, AIM_NEWTON_ITERS, newton_body, t_star)
     has_solution = can_search & target0_valid
     t_floor = jnp.floor(t_star).astype(jnp.int32)
     candidates = jnp.stack(
@@ -1914,6 +1931,49 @@ def target_pos_at_time_jax(state: EnvState, target_idx, turns):
     return px, py, valid
 
 
+def target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
+    """目标星球在浮点 turns 后的位置和速度，用于 Newton 求解 T*。"""
+    b, p = target_idx.shape
+    batch_idx = jnp.arange(b)[:, None]
+    planets = state.planets[batch_idx, target_idx]
+    initial = state.initial_planets[batch_idx, target_idx]
+    alive = state.planet_alive[batch_idx, target_idx]
+
+    base_x = _expand_like_time(planets[..., 2], turns)
+    base_y = _expand_like_time(planets[..., 3], turns)
+    zero = jnp.zeros_like(base_x)
+    dx = initial[..., 2] - 50.0
+    dy = initial[..., 3] - 50.0
+    orbit_r = jnp.sqrt(dx * dx + dy * dy)
+    phi_cur = jnp.arctan2(planets[..., 3] - 50.0, planets[..., 2] - 50.0)
+    omega = _expand_like_time(state.angular_velocity[:, None], turns)
+    phi = _expand_like_time(phi_cur, turns) + omega * turns
+    orbit_r_t = _expand_like_time(orbit_r, turns)
+    rot_x = 50.0 + orbit_r_t * jnp.cos(phi)
+    rot_y = 50.0 + orbit_r_t * jnp.sin(phi)
+    rot_vx = -omega * orbit_r_t * jnp.sin(phi)
+    rot_vy = omega * orbit_r_t * jnp.cos(phi)
+
+    comet_mask = jax.vmap(comet_planet_mask)(state)
+    is_comet = comet_mask[batch_idx, target_idx]
+    rotating = (orbit_r + initial[..., 4] < 50.0) & alive & (~is_comet)
+    rotating_t = _expand_like_time(rotating, turns)
+    px = jnp.where(rotating_t, rot_x, base_x)
+    py = jnp.where(rotating_t, rot_y, base_y)
+    vx = jnp.where(rotating_t, rot_vx, zero)
+    vy = jnp.where(rotating_t, rot_vy, zero)
+    valid = _expand_like_time(alive, turns)
+
+    comet_x, comet_y, comet_vx, comet_vy, comet_valid = comet_target_pos_velocity_at_time_jax(state, target_idx, turns)
+    is_comet_t = _expand_like_time(is_comet, turns)
+    px = jnp.where(is_comet_t, comet_x, px)
+    py = jnp.where(is_comet_t, comet_y, py)
+    vx = jnp.where(is_comet_t, comet_vx, vx)
+    vy = jnp.where(is_comet_t, comet_vy, vy)
+    valid = jnp.where(is_comet_t, comet_valid, valid)
+    return px, py, vx, vy, valid
+
+
 def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
     """彗星目标在浮点 turns 后的位置。非彗星返回无效占位。"""
     extra = turns.ndim - target_idx.ndim
@@ -1949,6 +2009,46 @@ def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
     px = (pos[..., 0] * weights).sum(axis=(-2, -1))
     py = (pos[..., 1] * weights).sum(axis=(-2, -1))
     return px, py, has
+
+
+def comet_target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
+    """彗星目标在浮点 turns 后的位置和路径段速度。非彗星返回无效占位。"""
+    extra = turns.ndim - target_idx.ndim
+    one_shape = (1,) * extra
+    slots = state.comet_slots.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    target_e = target_idx.reshape(target_idx.shape + one_shape + (1, 1))
+    active = (
+        (state.comet_slots >= 0)
+        & (state.comet_path_index[:, :, None] >= -1)
+        & (state.comet_lengths > 0)
+    ).reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    match = (slots == target_e) & active
+
+    path_index = state.comet_path_index.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, 1))
+    lengths = state.comet_lengths.reshape((state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN))
+    fi = path_index + turns[..., None, None]
+    i0 = jnp.floor(fi).astype(jnp.int32)
+    frac = fi - i0.astype(jnp.float32)
+    valid_i0 = (i0 >= 0) & (i0 < lengths)
+    i1 = jnp.minimum(i0 + 1, lengths - 1)
+    has_i1 = i0 + 1 < lengths
+    i0_safe = jnp.clip(i0, 0, MAX_COMET_PATH - 1)
+    i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
+    path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
+    paths = state.comet_paths.reshape(path_shape)
+    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
+    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
+    pos0 = (one0[..., None] * paths).sum(axis=-2)
+    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
+    vel = jnp.where(has_i1[..., None], pos1 - pos0, jnp.zeros_like(pos0))
+    weights = (match & valid_i0).astype(jnp.float32)
+    has = weights.sum(axis=(-2, -1)) > 0.0
+    px = (pos[..., 0] * weights).sum(axis=(-2, -1))
+    py = (pos[..., 1] * weights).sum(axis=(-2, -1))
+    vx = (vel[..., 0] * weights).sum(axis=(-2, -1))
+    vy = (vel[..., 1] * weights).sum(axis=(-2, -1))
+    return px, py, vx, vy, has
 
 
 def target_max_turns_jax(state: EnvState, target_idx, horizon: int):

@@ -78,7 +78,7 @@ Decoder 每执行一条命令后会更新该 source 的剩余兵力，后续命�
 | 特征组 | 形状 | 说明 |
 |--------|------|------|
 | `planet_features` | `[B, P, 26]` | 每个星球自己的状态特征 |
-| `relative_features` | `[B, P, P + 1, 8]` | 每个 source 到每个 target 的相对特征 |
+| `relative_features` | `[B, P, P + 1, 15]` | 每个 source 到每个 target 的相对特征 |
 | `global_features` | `[B, P, 11]` | 全局游戏状态，模型取 `global_features[:, 0]` |
 | `fleet_features` | `[B, P, F, 28]` | 舰队 token 特征 |
 | `fleet_mask` | `[B, P, F]` | 舰队 token 是否有效 |

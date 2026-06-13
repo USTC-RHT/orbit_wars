@@ -54,6 +54,7 @@ from .fast_env import (  # noqa: E402
     step_batch,
 )
 from .features_jax import FLEET_DIM, FeatureParams, encode_batch  # noqa: E402
+from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax, safe_drain_all_sources_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
 from .ppo_jax import (
@@ -74,6 +75,8 @@ AIM_NEWTON_ITERS = 5
 AIM_NEWTON_MIN_DERIV = 1e-4
 AIM_NEWTON_MAX_STEP = 12.0
 AIM_TARGET_INSET = 1e-3
+SAFE_DRAIN_HORIZON = DEFAULT_GARRISON_HORIZON
+MIN_LAUNCH_SHIPS = 10.0
 
 
 def _stack_auto_rollout_rows(rows_by_time: list[list[AutoRollout]]) -> AutoRollout:
@@ -270,6 +273,27 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
 
 
+def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_HORIZON):
+    """Use producer-style safe_drain as the policy's removable-ship budget.
+
+    ``source_mask`` handles the first layer (can this planet be picked as a
+    source at all), while ``source_ships`` becomes the dynamic amount budget used
+    by the model's existing bucket mask and by the final emitted ship count.
+    """
+    status = garrison_status_jax(state, horizon=horizon)
+    drain = safe_drain_all_sources_jax(
+        status,
+        source_ships=encoded.source_ships,
+        h_eff=jnp.asarray(float(horizon), dtype=jnp.float32),
+        player_id=0,
+    )
+    budget = jnp.minimum(encoded.source_ships, drain)
+    budget = jnp.where(jnp.isfinite(budget), budget, 0.0)
+    budget = jnp.where(encoded.source_mask, budget, 0.0).clip(min=0.0)
+    source_mask = encoded.source_mask & (budget >= MIN_LAUNCH_SHIPS)
+    return encoded._replace(source_ships=budget, source_mask=source_mask)
+
+
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
     """评估用贪心自回归策略。
 
@@ -278,6 +302,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
     """
     raw_enc = encode_batch(state, feat_params)
     encoded = normalize_encoded(raw_enc, norm_state, norm_params)
+    encoded = apply_safe_drain_budget(state, encoded)
     b = encoded.planet_features.shape[0]
     k = model.max_action_tokens
     initial_ships = jnp.concatenate(
@@ -397,6 +422,7 @@ def auto_opponent_policy_actions(
     flipped = flip_state_fn(state)
     raw_enc = encode_batch(flipped, opp_fp)
     encoded = normalize_encoded(raw_enc, opp_ns, norm_params)
+    encoded = apply_safe_drain_budget(flipped, encoded)
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
     initial_ships = jnp.concatenate(
@@ -978,6 +1004,7 @@ def main() -> None:
     def _jit_external_sample(ts, st, ns, key):
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
+        encoded = apply_safe_drain_budget(st, encoded)
         sample = auto_policy_sample(ts, model, st, encoded, key, feat_params, max_action_tokens)
         b = encoded.planet_features.shape[0]
         row = AutoRollout(
@@ -1012,6 +1039,7 @@ def main() -> None:
     def _jit_external_value(ts, st, ns):
         raw_encoded = encode_batch(st, feat_params)
         encoded = normalize_encoded(raw_encoded, ns, norm_params)
+        encoded = apply_safe_drain_budget(st, encoded)
         b = encoded.planet_features.shape[0]
         k = max_action_tokens
         initial_ships = jnp.concatenate(
@@ -1492,6 +1520,7 @@ def collect_rollout_auto(
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
+        encoded = apply_safe_drain_budget(st, encoded)
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
         if opponent_kind == "selfplay":
@@ -1550,6 +1579,7 @@ def collect_rollout_auto(
     )
     last_raw_encoded = encode_batch(state, feat_params)
     last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
+    last_encoded = apply_safe_drain_budget(state, last_encoded)
     b = last_encoded.planet_features.shape[0]
     k = max_action_tokens
     last_initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=last_encoded.source_ships.dtype), last_encoded.source_ships], axis=1)

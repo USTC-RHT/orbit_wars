@@ -31,7 +31,7 @@ state_norm.enabled: true
 
 ```python
 PLANET_DIM = 26
-RELATIVE_DIM = 8
+RELATIVE_DIM = 15
 GLOBAL_DIM = 11
 FLEET_DIM = 28
 MAP_CHANNELS = 6
@@ -46,7 +46,7 @@ SHIP_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
 
 ```python
 planet_features    # [B, P, 26]
-relative_features  # [B, P, P + 1, 8]
+relative_features  # [B, P, P + 1, 15]
 global_features    # [B, P, 11]
 map_features       # [B, P, 6, 8, 8]
 candidate_mask     # [B, P, P + 1]
@@ -108,13 +108,13 @@ fleet_mask         # [B, P, max_fleet_tokens]
 # 18 near_enemy_planet_count_r25: R=25 内敌方星球数量 / max_planets。
 # 19 near_neutral_planet_count_r25: R=25 内中立星球数量 / max_planets。
 #
-# 飞向该星球的 inbound 特征：
+# 飞向该星球的短期 inbound 特征，来自 garrison_jax 的 18 步到达表：
 # 20 inbound_my_ships: 预计飞向该星球的我方船数 / max_ships。
 # 21 inbound_enemy_ships: 预计飞向该星球的敌方船数 / max_ships。
-# 22 inbound_my_eta_min: 我方 inbound 最短 ETA / INBOUND_HORIZON；没有则为 1。
-# 23 inbound_my_eta_mean: 我方 inbound 平均 ETA / INBOUND_HORIZON；没有则为 1。
-# 24 inbound_enemy_eta_min: 敌方 inbound 最短 ETA / INBOUND_HORIZON；没有则为 1。
-# 25 inbound_enemy_eta_mean: 敌方 inbound 平均 ETA / INBOUND_HORIZON；没有则为 1。
+# 22 inbound_my_eta_min: 我方 inbound 最短 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
+# 23 inbound_my_eta_mean: 我方 inbound 船数加权平均 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
+# 24 inbound_enemy_eta_min: 敌方 inbound 最短 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
+# 25 inbound_enemy_eta_mean: 敌方 inbound 船数加权平均 ETA / DEFAULT_GARRISON_HORIZON；没有则为 1。
 ```
 
 旋转判定来自 `ROTATION_RADIUS_LIMIT`：`distance(initial_planet, center) + radius < limit`。
@@ -134,6 +134,13 @@ fleet_mask         # [B, P, max_fleet_tokens]
 # 5  source_ships: clip01(source 船数 / max_ships)，复制到每个 target 行。
 # 6  proto_score: Proto-style 目标评分 / 100.0。
 # 7  eta_max_bucket: 使用最大派兵档速度估算的 ETA / INBOUND_HORIZON。
+# 8  target_owner_at_eta_is_neutral: 按 ceil(eta_max_bucket) 从 garrison pre-combat 表取样。
+# 9  target_owner_at_eta_is_mine: 同上。
+# 10 target_owner_at_eta_is_enemy: 同上。
+# 11 target_ships_at_eta: 目标在 ETA 步生产后、到达结算前的驻军 / max_ships。
+# 12 my_arrivals_through_eta: garrison 到达表中 <= ETA 步的我方到达船数 / max_ships。
+# 13 enemy_arrivals_through_eta: garrison 到达表中 <= ETA 步的敌方到达船数 / max_ships。
+# 14 eta_out_of_garrison_horizon: eta_max_bucket 是否超过 DEFAULT_GARRISON_HORIZON。
 ```
 
 `proto_score(src, tgt)` 的实现：
@@ -347,7 +354,8 @@ rollout 和模型内部实际发射时会根据 `remaining_ships` 重新计算�
 
 ## inbound collision features
 
-`precompute_inbound()` 使用 `INBOUND_HORIZON = 60`，并把每支存活舰队分配给预测中第一个会碰撞的存活星球。
+`precompute_inbound_from_garrison()` 使用 `DEFAULT_GARRISON_HORIZON = 18`，并复用
+`garrison_jax.GarrisonStatus.arrivals_by_owner`。这张表已经按 planet / step / owner 聚合当前存活舰队的首次碰撞到达量。
 返回 `[P, 6]`：
 
 ```python
@@ -384,7 +392,7 @@ enemy_eta_mean
 
 ```python
 PLANET_NORMALIZE_INDICES = [5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
-RELATIVE_NORMALIZE_INDICES = [1, 2, 3, 4, 5, 6, 7]
+RELATIVE_NORMALIZE_INDICES = [1, 2, 3, 4, 5, 6, 7, 11, 12, 13]
 GLOBAL_NORMALIZE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 ```
 

@@ -7,7 +7,7 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "RL_2_current_checkpoint_only"
+run_name: "RL_2_current-0614"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 400
@@ -106,5 +106,5 @@ wandb:
   tags:
     - autoregressive
     - v1
-    - fixed_pool
+    - current
     - rtx4090

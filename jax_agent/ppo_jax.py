@@ -61,6 +61,8 @@ class AutoRollout(NamedTuple):
     fleet_mask: jnp.ndarray
     candidate_mask: jnp.ndarray
     source_mask: jnp.ndarray
+    source_action_mask: jnp.ndarray
+    target_action_mask: jnp.ndarray
     initial_ships: jnp.ndarray
     end_action: jnp.ndarray
     src_action: jnp.ndarray
@@ -294,6 +296,8 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
             batch["tgt_action"],
             batch["executed"],
             batch["initial_ships"],
+            source_action_mask=batch["source_action_mask"],
+            target_action_mask=batch["target_action_mask"],
             map_features=batch["map_features"],
             fleet_features=batch["fleet_features"],
             fleet_mask=batch["fleet_mask"],
@@ -399,6 +403,8 @@ def flatten_auto_rollout(rollout: AutoRollout, returns, advantages):
         "fleet_mask": flat(rollout.fleet_mask),
         "candidate_mask": flat(rollout.candidate_mask),
         "source_mask": flat(rollout.source_mask),
+        "source_action_mask": flat(rollout.source_action_mask),
+        "target_action_mask": flat(rollout.target_action_mask),
         "initial_ships": flat(rollout.initial_ships),
         "end_action": flat(rollout.end_action),
         "src_action": flat(rollout.src_action),

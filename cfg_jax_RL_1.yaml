@@ -7,7 +7,7 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "RL_1_fixed_pool"
+run_name: "RL_1_fixed_pool-0614"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 400
@@ -96,7 +96,7 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]
+  opponents: ["sigma", "tamrazov", "pool_ckpt900"]
 
 wandb:
   enabled: true

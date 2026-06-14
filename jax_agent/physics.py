@@ -250,10 +250,8 @@ def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
     i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
     path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
     paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos0 = jnp.take_along_axis(paths, i0_safe[..., None, None], axis=-2).squeeze(-2)
+    pos1 = jnp.take_along_axis(paths, i1_safe[..., None, None], axis=-2).squeeze(-2)
     pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
     weights = (match & valid_i0).astype(jnp.float32)
     has = weights.sum(axis=(-2, -1)) > 0.0
@@ -287,10 +285,8 @@ def comet_target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
     i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
     path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
     paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos0 = jnp.take_along_axis(paths, i0_safe[..., None, None], axis=-2).squeeze(-2)
+    pos1 = jnp.take_along_axis(paths, i1_safe[..., None, None], axis=-2).squeeze(-2)
     pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
     vel = jnp.where(has_i1[..., None], pos1 - pos0, jnp.zeros_like(pos0))
     weights = (match & valid_i0).astype(jnp.float32)
@@ -319,53 +315,68 @@ def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, sp
     """Verify that the target is the first engine collision at ``hit_turn``."""
     horizon = AIM_HORIZON
     turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
-    turns = turns_i.astype(jnp.float32)
     planets = state.planets
     planet_alive = state.planet_alive
     px_t, py_t = all_planet_pos_at_turns(state, horizon)
-    fx_prev = fx0[..., None] + (turns - 1.0) * speed[..., None] * cos_a[..., None]
-    fy_prev = fy0[..., None] + (turns - 1.0) * speed[..., None] * sin_a[..., None]
-    fx_cur = fx0[..., None] + turns * speed[..., None] * cos_a[..., None]
-    fy_cur = fy0[..., None] + turns * speed[..., None] * sin_a[..., None]
-    active_step = turns_i.reshape((1,) * hit_turn.ndim + (horizon,)) <= hit_turn[..., None]
-    in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
-    in_bounds_until_hit = (in_bounds | (~active_step)).all(axis=-1)
 
     src_axes = (None,) * (hit_turn.ndim - 1)
-    px_old = px_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    py_old = py_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    px_new = px_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
-    py_new = py_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
+    px_t = px_t[(slice(None),) + src_axes + (slice(None), slice(None))]
+    py_t = py_t[(slice(None),) + src_axes + (slice(None), slice(None))]
     radii = planets[(slice(None),) + src_axes + (slice(None), 4)]
-    alive = planet_alive[(slice(None),) + src_axes + (slice(None), None)]
-
-    move_d2 = point_segment_distance_sq(
-        px_old,
-        py_old,
-        fx_prev[..., None, :],
-        fy_prev[..., None, :],
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-    )
-    move_hit = (move_d2 < radii[..., None] ** 2) & alive & active_step[..., None, :]
-
-    sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-        px_old,
-        py_old,
-        px_new,
-        py_new,
-    )
-    sweep_hit = (sweep_d2 < radii[..., None] ** 2) & alive & sweep_active & active_step[..., None, :]
+    alive = planet_alive[(slice(None),) + src_axes + (slice(None),)]
 
     large = jnp.int32(2 * (horizon + 1) + 1)
-    move_keys = (2 * turns_i).reshape((1,) * (move_hit.ndim - 1) + (horizon,))
-    sweep_keys = (2 * turns_i + 1).reshape((1,) * (sweep_hit.ndim - 1) + (horizon,))
-    first_move = jnp.where(move_hit, move_keys, large).min(axis=-1)
-    first_sweep = jnp.where(sweep_hit, sweep_keys, large).min(axis=-1)
-    first_by_planet = jnp.minimum(first_move, first_sweep)
+    first_shape = jnp.broadcast_shapes(fx0.shape + (1,), radii.shape)
+    first_init = jnp.full(first_shape, large, dtype=jnp.int32)
+    in_bounds_init = jnp.ones_like(fx0, dtype=bool)
+
+    def scan_step(t, carry):
+        first_by_planet, in_bounds_until_hit = carry
+        turn_f = jnp.asarray(t, dtype=jnp.float32)
+        active_step = t <= hit_turn
+        fx_prev = fx0 + (turn_f - 1.0) * speed * cos_a
+        fy_prev = fy0 + (turn_f - 1.0) * speed * sin_a
+        fx_cur = fx0 + turn_f * speed * cos_a
+        fy_cur = fy0 + turn_f * speed * sin_a
+        in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
+        in_bounds_until_hit = in_bounds_until_hit & (in_bounds | (~active_step))
+
+        px_old = jnp.take(px_t, t - 1, axis=-1)
+        py_old = jnp.take(py_t, t - 1, axis=-1)
+        px_new = jnp.take(px_t, t, axis=-1)
+        py_new = jnp.take(py_t, t, axis=-1)
+        move_d2 = point_segment_distance_sq(
+            px_old,
+            py_old,
+            fx_prev[..., None],
+            fy_prev[..., None],
+            fx_cur[..., None],
+            fy_cur[..., None],
+        )
+        move_hit = (move_d2 < radii ** 2) & alive & active_step[..., None]
+
+        sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
+        sweep_d2 = point_segment_distance_sq(
+            fx_cur[..., None],
+            fy_cur[..., None],
+            px_old,
+            py_old,
+            px_new,
+            py_new,
+        )
+        sweep_hit = (sweep_d2 < radii ** 2) & alive & sweep_active & active_step[..., None]
+        step_first = jnp.minimum(
+            jnp.where(move_hit, jnp.asarray(2 * t, dtype=jnp.int32), large),
+            jnp.where(sweep_hit, jnp.asarray(2 * t + 1, dtype=jnp.int32), large),
+        )
+        return jnp.minimum(first_by_planet, step_first), in_bounds_until_hit
+
+    first_by_planet, in_bounds_until_hit = jax.lax.fori_loop(
+        1,
+        horizon + 1,
+        scan_step,
+        (first_init, in_bounds_init),
+    )
     first_planet = first_by_planet.argmin(axis=-1)
     first_key = first_by_planet.min(axis=-1)
     target_key_lo = 2 * hit_turn

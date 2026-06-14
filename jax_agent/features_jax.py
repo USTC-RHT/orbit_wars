@@ -19,7 +19,6 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .physics import aim_with_prediction_eta_jax
 from .fast_env import (
     BOARD_SIZE,
     CENTER,
@@ -35,6 +34,7 @@ from .fast_env import (
 )
 from .garrison_jax import (
     DEFAULT_GARRISON_HORIZON,
+    GarrisonStatus,
     garrison_status_jax,
     safe_drain_all_sources_jax,
     target_flip_status_from_garrison_jax,
@@ -112,6 +112,13 @@ class EncodedBatch(NamedTuple):
     fleet_mask: jnp.ndarray
 
 
+class FeatureAux(NamedTuple):
+    """Expensive per-state feature context that can be reused across views."""
+
+    garrison_status: GarrisonStatus
+    enemy_pressure: jnp.ndarray
+
+
 def target_count(params: FeatureParams) -> int:
     """目标槽位数量：slot 0 是 no-op，后面是所有星球。"""
     return params.max_planets + 1
@@ -122,7 +129,25 @@ def encode_batch(state: EnvState, params: FeatureParams) -> EncodedBatch:
     return jax.vmap(lambda s: encode_single(s, params))(state)
 
 
+def encode_batch_with_aux(state: EnvState, params: FeatureParams, aux: FeatureAux) -> EncodedBatch:
+    """Encode a batch while reusing precomputed per-state feature context."""
+    return jax.vmap(lambda s, a: encode_single_with_aux(s, params, a))(state, aux)
+
+
 def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
+    """编码单局棋盘，把每个星球位置都组织成一个候选 source 行。"""
+    return encode_single_with_aux(state, params, build_feature_aux(state, params))
+
+
+def build_feature_aux(state: EnvState, params: FeatureParams) -> FeatureAux:
+    """Compute expensive per-state feature context for one game."""
+    del params
+    garrison_status = garrison_status_jax(state, horizon=DEFAULT_GARRISON_HORIZON)
+    enemy_pressure = enemy_pressure_jax(state, horizon=float(DEFAULT_GARRISON_HORIZON), player_id=0)
+    return FeatureAux(garrison_status=garrison_status, enemy_pressure=enemy_pressure)
+
+
+def encode_single_with_aux(state: EnvState, params: FeatureParams, aux: FeatureAux) -> EncodedBatch:
     """编码单局棋盘，把每个星球位置都组织成一个候选 source 行。"""
     planets = state.planets
     alive = state.planet_alive
@@ -132,7 +157,7 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
     owned_mask = is_mine
     source_ids = planets[:, 0].astype(jnp.int32)
     global_f = build_global_features(state, params)
-    garrison_status = garrison_status_jax(state, horizon=DEFAULT_GARRISON_HORIZON)
+    garrison_status = aux.garrison_status
     safe_drain = safe_drain_all_sources_jax(
         garrison_status,
         source_ships,
@@ -142,7 +167,7 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
     inbound = precompute_inbound_from_garrison(state, garrison_status, params)
     fleet_f, fleet_m = build_fleet_features(state, params)
     future_px, future_py = planet_positions_over_horizon(state, ATTACK_REACHABILITY_HORIZON)
-    enemy_pressure = enemy_pressure_jax(state, horizon=float(DEFAULT_GARRISON_HORIZON), player_id=0)
+    enemy_pressure = aux.enemy_pressure
     if params.target_filter_enabled:
         flip_status = target_flip_status_from_garrison_jax(state, garrison_status, player_id=0)
         target_will_flip = flip_status.will_flip
@@ -364,12 +389,11 @@ def build_relative_features(
     is_friend = (owner == 0) & (~is_source)
     is_enemy = owner == 1
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
-    target_reachable = reachable_full_send_mask_jax(src, planets, future_px, future_py, send_ships)
+    target_reachable, cheap_eta_turns = reachable_full_send_eta_jax(src, planets, future_px, future_py, send_ships)
     attackable_by_ships = send_ships > planets[:, 5]
     target_valid = alive & (~is_source) & target_reachable & (is_friend | ((is_enemy | is_neutral) & attackable_by_ships))
-    physics_hit, physics_eta_turns = physics_target_hit_eta_jax(state, src, planets, target_valid, send_ships)
-    eta_turns = jnp.where(physics_hit, physics_eta_turns, INBOUND_HORIZON + 1.0)
-    physics_eta_norm = eta_turns / INBOUND_HORIZON
+    eta_turns = jnp.where(target_valid, cheap_eta_turns, INBOUND_HORIZON + 1.0)
+    eta_norm = eta_turns / INBOUND_HORIZON
     eta_garrison = relative_eta_garrison_features(garrison_status, eta_turns, params)
     target_ships_at_eta = eta_garrison[:, 3] * params.max_ships
     my_arrivals = eta_garrison[:, 4] * params.max_ships
@@ -392,7 +416,7 @@ def build_relative_features(
             clip01((planets[:, 5] + 1.0) / jnp.maximum(src[5], 1.0)),
             clip01(src[5] / params.max_ships) * jnp.ones_like(dist),
             proto,
-            physics_eta_norm,
+            eta_norm,
             eta_garrison[:, 0],
             eta_garrison[:, 1],
             eta_garrison[:, 2],
@@ -412,12 +436,13 @@ def build_relative_features(
     )
     relative_features = jnp.concatenate([noop_features, rel], axis=0)
 
-    # target head 阶段先做静态目标合法性剪枝：
+    # target head 阶段先做便宜目标先验：
     # - 目标必须存活且不能是 source 自身；
     # - 增援友方不要求船数优势；
     # - 攻击敌方/中立时要求 full-send 船数大于目标当前驻军；
-    # - 物理层必须能用 full-send 舰队命中，且首次碰撞对象就是目标。
-    per_planet_mask = target_valid & physics_hit
+    # - 便宜 reachability 认为 full-send 有可能够到。
+    # 精确物理命中/首次碰撞检查在采样选定 source 后按该 source 动态计算。
+    per_planet_mask = target_valid
     # slot 0 永远可选（no-op）
     mask = jnp.concatenate([jnp.asarray([True]), per_planet_mask])
     if params.target_filter_enabled:
@@ -427,28 +452,6 @@ def build_relative_features(
             enemy_pressure, src_idx, eta_turns, params,
         )
     return relative_features, mask, candidate_ids
-
-
-def physics_target_hit_eta_jax(
-    state: EnvState,
-    src: jnp.ndarray,
-    planets: jnp.ndarray,
-    target_valid: jnp.ndarray,
-    send_ships: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return exact full-send hit mask and integer hit ETA for every target slot."""
-
-    target_idx = jnp.arange(planets.shape[0], dtype=jnp.int32)
-    selected_ships = jnp.where(target_valid, send_ships, 0.0)
-    batched_state = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
-    _angle, hit, eta_turns = aim_with_prediction_eta_jax(
-        src[None, None, :],
-        planets[None, :, :],
-        target_idx[None, :],
-        batched_state,
-        selected_ships[None, :],
-    )
-    return hit[0] & target_valid, eta_turns[0]
 
 
 def apply_target_filter(
@@ -464,15 +467,17 @@ def apply_target_filter(
     eta_turns: jnp.ndarray,
     params: FeatureParams,
 ) -> jnp.ndarray:
-    """可选目标过滤：保留 no-op、进攻 top-k 和友方防守/前线增援 top-k。"""
+    """可选目标过滤：先按类别分数取全量 top-k，再与粗合法 mask 取交集。"""
 
     planet_mask = mask[1:]
     keep_planets = jnp.zeros((params.max_planets,), dtype=bool)
 
-    attack_score = jnp.where(planet_mask & is_attack, proto, -1e9)
+    attack_score = jnp.where(is_attack, proto, -1e9)
     attack_order = jnp.argsort(attack_score)[::-1]
     attack_k = min(params.attack_top_k, params.max_planets)
-    keep_planets = keep_planets.at[attack_order[:attack_k]].set(attack_score[attack_order[:attack_k]] > -1e8)
+    attack_keep = jnp.zeros((params.max_planets,), dtype=bool)
+    attack_keep = attack_keep.at[attack_order[:attack_k]].set(attack_score[attack_order[:attack_k]] > -1e8)
+    keep_planets = keep_planets | (planet_mask & attack_keep)
 
     defense_score_raw = friendly_defense_score_jax(
         target_will_flip,
@@ -482,10 +487,12 @@ def apply_target_filter(
         src_idx,
         eta_turns,
     )
-    defense_score = jnp.where(planet_mask & is_friend, defense_score_raw, -1e9)
+    defense_score = jnp.where(is_friend, defense_score_raw, -1e9)
     defense_order = jnp.argsort(defense_score)[::-1]
     defense_k = min(params.defense_top_k, params.max_planets)
-    keep_planets = keep_planets.at[defense_order[:defense_k]].set(defense_score[defense_order[:defense_k]] > 1e-6)
+    defense_keep = jnp.zeros((params.max_planets,), dtype=bool)
+    defense_keep = defense_keep.at[defense_order[:defense_k]].set(defense_score[defense_order[:defense_k]] > 1e-6)
+    keep_planets = keep_planets | (planet_mask & defense_keep)
     return jnp.concatenate([jnp.asarray([mask[0]]), keep_planets])
 
 
@@ -589,18 +596,21 @@ def relative_capture_floor_features(
     return floor_norm, surplus_norm
 
 
-def reachable_full_send_mask_jax(
+def reachable_full_send_eta_jax(
     src: jnp.ndarray,
     planets: jnp.ndarray,
     future_px: jnp.ndarray,
     future_py: jnp.ndarray,
     ships: jnp.ndarray,
-) -> jnp.ndarray:
-    """Producer-style cheap reachability mask for a full-send fleet, returned as ``[target]``."""
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Cheap full-send reachability and earliest approximate ETA, returned as ``[target]``."""
 
     horizon = int(future_px.shape[-1]) - 1
     if horizon <= 0:
-        return jnp.zeros((planets.shape[0],), dtype=bool)
+        return (
+            jnp.zeros((planets.shape[0],), dtype=bool),
+            jnp.full((planets.shape[0],), INBOUND_HORIZON + 1.0, dtype=jnp.float32),
+        )
 
     ax = future_px[:, :-1]
     ay = future_py[:, :-1]
@@ -611,9 +621,24 @@ def reachable_full_send_mask_jax(
     gap = src[4] + planets[:, 4] + LAUNCH_SURFACE_OFFSET + TARGET_HIT_SURFACE_OFFSET
     surface_dist = jnp.maximum(seg_dist - gap[:, None], 0.0)
     turns = jnp.arange(1, horizon + 1, dtype=jnp.float32)
-    min_required_speed = (surface_dist / turns[None, :]).min(axis=-1)
     speed = fleet_speed(jnp.maximum(ships, 1.0))
-    return (ships >= MIN_LAUNCH) & (min_required_speed <= speed * (1.0 + REACHABILITY_EPS))
+    reachable_by_turn = surface_dist <= (speed * turns[None, :] * (1.0 + REACHABILITY_EPS))
+    can_reach = (ships >= MIN_LAUNCH) & reachable_by_turn.any(axis=-1)
+    eta = jnp.min(jnp.where(reachable_by_turn, turns[None, :], INBOUND_HORIZON + 1.0), axis=-1)
+    return can_reach, jnp.where(can_reach, eta, INBOUND_HORIZON + 1.0)
+
+
+def reachable_full_send_mask_jax(
+    src: jnp.ndarray,
+    planets: jnp.ndarray,
+    future_px: jnp.ndarray,
+    future_py: jnp.ndarray,
+    ships: jnp.ndarray,
+) -> jnp.ndarray:
+    """Producer-style cheap reachability mask for a full-send fleet, returned as ``[target]``."""
+
+    reachable, _eta = reachable_full_send_eta_jax(src, planets, future_px, future_py, ships)
+    return reachable
 
 
 def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray:

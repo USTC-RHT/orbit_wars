@@ -192,6 +192,33 @@ def test_reachability_keeps_target_when_full_send_can_reach():
     assert bool(encoded.candidate_mask[0, 0, 2])
 
 
+def test_attack_topk_ranks_before_cheap_validity_intersection():
+    params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
+    state = empty_state(params)
+    planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
+    planets = planets.at[0].set(jnp.array([0, 0, 10.0, 10.0, 1.0, 1000.0, 0.0], dtype=jnp.float32))
+    planets = planets.at[1].set(jnp.array([1, 1, 12.0, 10.0, 1.0, 1.0, 5.0], dtype=jnp.float32))
+    planets = planets.at[2].set(jnp.array([2, 1, 25.0, 10.0, 1.0, 1.0, 0.0], dtype=jnp.float32))
+    state = state._replace(
+        planets=planets,
+        initial_planets=planets,
+        planet_alive=jnp.array([True, False, True, False]),
+    )
+    batched = jax.tree_util.tree_map(lambda x: x[None, ...] if getattr(x, "ndim", 0) > 0 else x[None], state)
+
+    top1 = encode_batch(
+        batched,
+        FeatureParams(max_planets=4, target_filter_enabled=True, attack_top_k=1, defense_top_k=0),
+    )
+    top2 = encode_batch(
+        batched,
+        FeatureParams(max_planets=4, target_filter_enabled=True, attack_top_k=2, defense_top_k=0),
+    )
+
+    assert not bool(top1.candidate_mask[0, 0, 3])
+    assert bool(top2.candidate_mask[0, 0, 3])
+
+
 def test_relative_eta_uses_exact_physics_hit_turn():
     params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
     state = empty_state(params)
@@ -219,7 +246,7 @@ def test_relative_eta_uses_exact_physics_hit_turn():
     assert jnp.allclose(encoded.relative_features[0, 0, 2, 7], eta_turns[0, 0] / INBOUND_HORIZON)
 
 
-def test_target_pre_mask_filters_sun_blocked_target():
+def test_dynamic_target_mask_filters_sun_blocked_target():
     params = EnvParams(max_planets=4, max_fleets=4, max_actions=1)
     state = empty_state(params)
     planets = jnp.zeros((params.max_planets, 7), dtype=jnp.float32)
@@ -235,7 +262,17 @@ def test_target_pre_mask_filters_sun_blocked_target():
 
     encoded = encode_batch(batched, fp)
 
-    assert not bool(encoded.candidate_mask[0, 0, 2])
+    from jax_agent.train_jax import selected_exact_target_mask_and_angles
+
+    target_mask, _angles = selected_exact_target_mask_and_angles(
+        batched,
+        encoded,
+        jnp.asarray([1], dtype=jnp.int32),
+        jnp.asarray([1000.0], dtype=jnp.float32),
+    )
+
+    assert bool(encoded.candidate_mask[0, 0, 2])
+    assert not bool(target_mask[0, 2])
 
 
 def test_planet_inbound_features_use_garrison_arrivals():

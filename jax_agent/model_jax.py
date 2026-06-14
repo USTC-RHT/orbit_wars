@@ -120,6 +120,8 @@ class AutoregressiveActorCritic(nn.Module):
         tgt_actions,
         executed,
         initial_ships,
+        source_action_mask=None,
+        target_action_mask=None,
         map_features=None,
         fleet_features=None,
         fleet_mask=None,
@@ -193,6 +195,8 @@ class AutoregressiveActorCritic(nn.Module):
             )
             src_budget = remaining >= 10.0
             src_mask = source_mine & src_budget
+            if source_action_mask is not None:
+                src_mask = src_mask & source_action_mask[:, step_i].astype(bool)
             src_logits = jnp.where(src_mask, src_logits, -1.0e9)
             src_logits = jnp.where(
                 jnp.arange(src_logits.shape[1])[None, :] == 0,
@@ -208,8 +212,11 @@ class AutoregressiveActorCritic(nn.Module):
             tgt_keys = key_proj + rel_for_src
             tgt_keys = tgt_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(tgt_keys), axis=-1, keepdims=True), 1e-12))
             tgt_logits = jnp.einsum("bh,bch->bc", q_tgt, tgt_keys) * pointer_logit_scale
-            src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-            tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
+            if target_action_mask is None:
+                src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
+                tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
+            else:
+                tgt_mask = target_action_mask[:, step_i].astype(bool)
             tgt_logits = jnp.where(tgt_mask, tgt_logits, -1.0e9)
 
             ships_sent = self._full_send_ships(remaining[batch_idx, src_safe])
@@ -316,6 +323,19 @@ class AutoregressiveActorCritic(nn.Module):
     @nn.compact
     def auto_tgt_logits(self, h_new, src_t, planet_out, relative_h, key_proj, candidate_mask):
         """在给定 src 后输出目标星球 logits。"""
+        batch_idx = jnp.arange(h_new.shape[0])
+        source_count = relative_h.shape[1]
+        src_safe = jnp.clip(src_t, 0, self.relative_count - 1)
+        src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
+        tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
+        return self._auto_tgt_logits_with_mask(h_new, src_t, planet_out, relative_h, key_proj, tgt_mask)
+
+    @nn.compact
+    def auto_tgt_logits_with_mask(self, h_new, src_t, planet_out, relative_h, key_proj, target_mask):
+        """在给定 src 后，用调用方提供的 target mask 输出目标 logits。"""
+        return self._auto_tgt_logits_with_mask(h_new, src_t, planet_out, relative_h, key_proj, target_mask.astype(bool))
+
+    def _auto_tgt_logits_with_mask(self, h_new, src_t, planet_out, relative_h, key_proj, target_mask):
         hidden = self.hidden_size
         batch_idx = jnp.arange(h_new.shape[0])
         source_count = relative_h.shape[1]
@@ -327,9 +347,7 @@ class AutoregressiveActorCritic(nn.Module):
         tgt_keys = key_proj + rel_for_src
         tgt_keys = tgt_keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(tgt_keys), axis=-1, keepdims=True), 1e-12))
         tgt_logits = jnp.einsum("bh,bch->bc", q_tgt, tgt_keys) * self._pointer_logit_scale()
-        src_candidate_mask = candidate_mask[batch_idx, jnp.clip(src_safe - 1, 0, source_count - 1)]
-        tgt_mask = src_candidate_mask & (jnp.arange(src_candidate_mask.shape[1])[None, :] != 0)
-        return jnp.where(tgt_mask, tgt_logits, -1.0e9)
+        return jnp.where(target_mask, tgt_logits, -1.0e9)
 
     @nn.compact
     def auto_token_embed(self, src_t, tgt_t, end_t, executed_t, step_i, planet_out):

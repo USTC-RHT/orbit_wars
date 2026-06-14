@@ -313,30 +313,46 @@ def _valid_logit_mask(logits: jnp.ndarray) -> jnp.ndarray:
     return jnp.isfinite(logits) & (logits > NEG_INF * 0.5)
 
 
-def selected_exact_target_mask_and_angles(state: EnvState, encoded, src_t: jnp.ndarray, ships: jnp.ndarray):
-    """Compute exact target mask only for the already selected source in each batch row."""
+def selected_exact_target_mask_and_angles(
+    state: EnvState,
+    encoded,
+    src_t: jnp.ndarray,
+    ships: jnp.ndarray,
+    feat_params: FeatureParams,
+):
+    """Compute exact target mask only for coarse candidates of the selected source."""
     b = encoded.planet_features.shape[0]
     p = encoded.source_mask.shape[-1]
+    candidate_count = (
+        min(p, max(1, int(feat_params.attack_top_k) + int(feat_params.defense_top_k)))
+        if feat_params.target_filter_enabled
+        else p
+    )
     batch_idx = jnp.arange(b)
     src_slot = jnp.clip(src_t - 1, 0, p - 1)
     src_planets = state.planets[batch_idx, src_slot]
-    target_idx = jnp.broadcast_to(jnp.arange(p, dtype=jnp.int32)[None, :], (b, p))
     cheap_target_mask = encoded.candidate_mask[batch_idx, src_slot, 1:].astype(bool)
+    candidate_score = jnp.where(cheap_target_mask, jnp.arange(p, 0, -1, dtype=jnp.int32)[None, :], 0)
+    candidate_idx = jax.lax.top_k(candidate_score, candidate_count)[1].astype(jnp.int32)
+    candidate_valid = jnp.take_along_axis(cheap_target_mask, candidate_idx, axis=-1)
+    target_planets = state.planets[batch_idx[:, None], candidate_idx]
     active_src = (src_t > 0) & (ships >= MIN_LAUNCH_SHIPS)
-    selected_ships = jnp.where(cheap_target_mask & active_src[:, None], ships[:, None], 0.0)
+    selected_ships = jnp.where(candidate_valid & active_src[:, None], ships[:, None], 0.0)
     angles, hit = aim_with_prediction_jax(
         src_planets[:, None, :],
-        state.planets,
-        target_idx,
+        target_planets,
+        candidate_idx,
         state,
         selected_ships,
     )
-    target_planet_mask = cheap_target_mask & hit & active_src[:, None]
+    candidate_hit = candidate_valid & hit & active_src[:, None]
+    target_planet_mask = jnp.zeros((b, p), dtype=bool).at[batch_idx[:, None], candidate_idx].set(candidate_hit)
     target_mask = jnp.concatenate(
         [jnp.zeros((b, 1), dtype=bool), target_planet_mask],
         axis=-1,
     )
-    return target_mask, angles
+    target_angles = jnp.zeros((b, p), dtype=jnp.float32).at[batch_idx[:, None], candidate_idx].set(angles)
+    return target_mask, target_angles
 
 
 def select_source_with_exact_targets(
@@ -384,7 +400,7 @@ def select_source_with_exact_targets(
             src_try_raw = jax.random.categorical(jax.random.fold_in(key_src, i), safe_src_logits, axis=-1).astype(jnp.int32)
         src_try = jnp.where(attempt_active, src_try_raw, 0)
         ships = full_send_amount(remaining[batch_idx, jnp.clip(src_try, 0, p)])
-        target_mask, target_angles = selected_exact_target_mask_and_angles(state, encoded, src_try, ships)
+        target_mask, target_angles = selected_exact_target_mask_and_angles(state, encoded, src_try, ships, feat_params)
         has_target = target_mask[:, 1:].any(axis=-1)
         accept = attempt_active & has_target
         chosen_src = jnp.where(accept, src_try, chosen_src)

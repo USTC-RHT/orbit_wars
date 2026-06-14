@@ -269,6 +269,7 @@ def test_dynamic_target_mask_filters_sun_blocked_target():
         encoded,
         jnp.asarray([1], dtype=jnp.int32),
         jnp.asarray([1000.0], dtype=jnp.float32),
+        fp,
     )
 
     assert bool(encoded.candidate_mask[0, 0, 2])

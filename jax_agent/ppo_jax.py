@@ -171,11 +171,16 @@ def categorical_entropy(logits):
 
 
 def safe_logits(logits):
-    """修复全非法 logits 行，避免 softmax/categorical 产生 NaN。"""
+    """修复全非法 logits 行，避免 softmax/categorical 产生 NaN。
+
+    Masked actions use ``NEG_INF``. They are still finite, so checking only
+    ``isfinite`` would miss rows where every action was masked out.
+    """
     _assert_all_finite("ppo/logits", logits)
-    invalid = ~jnp.isfinite(logits).any(axis=-1)
-    fixed = jnp.where(invalid[..., None], NEG_INF, logits)
-    return fixed.at[..., 0].set(jnp.where(invalid, 0.0, fixed[..., 0]))
+    valid = jnp.isfinite(logits) & (logits > NEG_INF * 0.5)
+    has_valid = valid.any(axis=-1)
+    fixed = jnp.where(valid, logits, NEG_INF)
+    return fixed.at[..., 0].set(jnp.where(has_valid, fixed[..., 0], 0.0))
 
 
 def _fire_entropy(logits):

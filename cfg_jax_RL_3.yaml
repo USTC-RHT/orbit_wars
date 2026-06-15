@@ -121,7 +121,7 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["ckpt_48900", "ckpt_32700", "tamrazov", "pool_ckpt900"]
+  opponents: ["tamrazov","pool_ckpt900","ckpt_48900", "ckpt_32700"]
 
 wandb:
   enabled: true

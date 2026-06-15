@@ -391,8 +391,8 @@ def build_relative_features(
     is_friend = (owner == 0) & (~is_source)
     is_enemy = owner == 1
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
-    target_reachable, cheap_eta_turns = reachable_full_send_eta_jax(src, planets, future_px, future_py, send_ships)
-    target_valid = alive & (~is_source) & target_reachable & (is_friend | is_enemy | is_neutral)
+    _target_reachable, cheap_eta_turns = reachable_full_send_eta_jax(src, planets, future_px, future_py, send_ships)
+    target_valid = alive & (~is_source) & (is_friend | is_enemy | is_neutral)
     eta_turns = jnp.where(target_valid, cheap_eta_turns, INBOUND_HORIZON + 1.0)
     eta_norm = eta_turns / INBOUND_HORIZON
     eta_garrison = relative_eta_garrison_features(garrison_status, eta_turns, params)

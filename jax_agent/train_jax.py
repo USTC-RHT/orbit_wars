@@ -48,7 +48,16 @@ from .fast_env import (  # noqa: E402
     select_from_bank,
     step_batch,
 )
-from .features_jax import FLEET_DIM, FeatureAux, FeatureParams, encode_batch, encode_batch_with_aux  # noqa: E402
+from .features_jax import (  # noqa: E402
+    ATTACK_REACHABILITY_HORIZON,
+    FLEET_DIM,
+    FeatureAux,
+    FeatureParams,
+    encode_batch,
+    encode_batch_with_aux,
+    planet_positions_over_horizon,
+    reachable_full_send_eta_jax,
+)
 from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
@@ -388,7 +397,15 @@ def post_discard_target_check(
         feasible_attack,
         jnp.ones_like(exact_hit, dtype=bool),
     )
-    return exact_hit & capture_ok, angle[:, 0]
+
+    def one_game(st, src_idx, tgt_idx, amount):
+        future_px, future_py = planet_positions_over_horizon(st, ATTACK_REACHABILITY_HORIZON)
+        src_planet = st.planets[src_idx]
+        reachable, _eta = reachable_full_send_eta_jax(src_planet, st.planets, future_px, future_py, amount)
+        return reachable[tgt_idx]
+
+    cheap_reachable = jax.vmap(one_game)(state, src_slot, tgt_slot, ships)
+    return exact_hit & capture_ok & cheap_reachable, angle[:, 0]
 
 
 def selected_target_is_valid_from_mask(target_mask: jnp.ndarray, batch_idx, tgt_t) -> jnp.ndarray:

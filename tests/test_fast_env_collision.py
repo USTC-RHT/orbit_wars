@@ -64,7 +64,7 @@ def test_rotating_planet_sweep_hits_fleet_under_strict_engine_collision():
 
 
 def test_aim_with_prediction_hits_rotating_target_within_60_steps():
-    from jax_agent.train_jax import aim_with_prediction_jax
+    from jax_agent.physics import aim_with_prediction_jax
 
     params = EnvParams(max_planets=4, max_fleets=8, max_actions=1)
     state = empty_state(params)

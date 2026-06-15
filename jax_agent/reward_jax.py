@@ -142,7 +142,13 @@ def neutral_capture_reward(prev: EnvState, cur: EnvState, params: RewardParams) 
     eta = dist / jnp.maximum(fleet_speed(ships_needed), 1e-6)  # 己方各星球到达时间
     eta = jnp.where(my_prev[:, :, None], eta, 1e9)
     nearest_eta = eta.min(axis=1)
-    bonus = params.neutral_capture_weight * jnp.exp(-nearest_eta / max(params.neutral_capture_eta_scale, 1e-6)) * early_factor[:, None]
+    prod_bonus = 1.0 + prev.planets[..., 6]
+    bonus = (
+        params.neutral_capture_weight
+        * prod_bonus
+        * jnp.exp(-nearest_eta / max(params.neutral_capture_eta_scale, 1e-6))
+        * early_factor[:, None]
+    )
     return jnp.where(captured, bonus, 0.0).sum(axis=-1)
 
 

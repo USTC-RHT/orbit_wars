@@ -662,6 +662,7 @@ def main() -> None:
         epochs=cfg.ppo.epochs,
         minibatch_size=min(cfg.ppo.minibatch_size, cfg.ppo.num_envs * cfg.ppo.rollout_steps * cfg.env.max_planets),
         norm_adv=cfg.ppo.norm_adv,
+        clip_vloss=getattr(cfg.ppo, "clip_vloss", True),
         target_kl=getattr(cfg.ppo, "target_kl", 0.05),
     )
     bank_path = Path(args.bank)

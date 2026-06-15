@@ -78,7 +78,7 @@ ppo:
   max_grad_norm: 0.5
   anneal_lr: true
   norm_adv: true
-  clip_vloss: true
+  clip_vloss: false
   target_kl: 0.02
 
 self_play_update_interval: 1

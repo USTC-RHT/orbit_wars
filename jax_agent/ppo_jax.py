@@ -44,6 +44,7 @@ class PPOParams:
     epochs: int = 4            # 每次 rollout 训练轮数
     minibatch_size: int = 4096 # 单个 minibatch 大小
     norm_adv: bool = True      # 是否对 advantage 做 batch 内平均方差归一化
+    clip_vloss: bool = True    # 是否对 value 更新使用 PPO-style value clipping
     target_kl: float = 0.05    # KL 早停阈值；epoch 平均 approx_kl > 1.5*target_kl 时停止剩余 epoch
 
 
@@ -337,8 +338,13 @@ def update_auto_minibatch(train_state: TrainState, batch: dict[str, jnp.ndarray]
         policy_loss = (l_end + l_src + l_tgt) / 3.0
 
         value = _assert_all_finite("ppo_auto/value", outputs.value)
-        value_pred = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
-        value_loss = jnp.square(batch["returns"] - value_pred).mean()
+        value_loss_unclipped = jnp.square(batch["returns"] - value)
+        if params.clip_vloss:
+            value_pred_clipped = batch["old_value"] + jnp.clip(value - batch["old_value"], -params.clip_coef, params.clip_coef)
+            value_loss_clipped = jnp.square(batch["returns"] - value_pred_clipped)
+            value_loss = jnp.maximum(value_loss_unclipped, value_loss_clipped).mean()
+        else:
+            value_loss = value_loss_unclipped.mean()
 
         ent_end = _fire_entropy(outputs.end_logits)
         ent_src = categorical_entropy(src_logits)

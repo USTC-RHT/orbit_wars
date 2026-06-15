@@ -11,7 +11,7 @@ seed: 42
 run_name: "jax_fixed_pool_0525_with_mask"
 device: auto
 save_dir: outputs
-checkpoint_every: 100
+checkpoint_every: 1000
 log_every: 1
 opponent: "pool"
 

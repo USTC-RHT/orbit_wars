@@ -17,7 +17,7 @@ seed: 42
 run_name: "RL_3_ckpt32700_resume_jax"
 device: auto
 save_dir: outputs
-checkpoint_every: 400
+checkpoint_every: 1000
 log_every: 1
 opponent: "pool"
 init_from_checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
@@ -115,7 +115,7 @@ eval:
   enabled: true
   every: 400
   nearest_every: 0
-  slow_every: 400
+  slow_every: 1000
   games: 20
   seed: 200000
   player: 1

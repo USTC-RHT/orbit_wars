@@ -53,7 +53,7 @@ from .fast_env import (  # noqa: E402
     select_from_bank,
     step_batch,
 )
-from .features_jax import FLEET_DIM, FeatureParams, encode_batch  # noqa: E402
+from .features_jax import FLEET_DIM, FeatureAux, FeatureParams, encode_batch, encode_batch_with_aux  # noqa: E402
 from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax, safe_drain_all_sources_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
@@ -66,6 +66,7 @@ from .ppo_jax import (
     ppo_update_auto,
     safe_logits,
 )  # noqa: E402
+from .pressure_jax import pressure_by_owner_jax  # noqa: E402
 from .reward_jax import RewardParams, reward_from_transition  # noqa: E402
 from .train_opponents import nearest_opponent_actions  # noqa: E402
 
@@ -205,6 +206,40 @@ def flip_state(state: EnvState) -> EnvState:
     )
 
 
+def _flip_owner_int(owner):
+    return jnp.where(owner == 0, 1, jnp.where(owner == 1, 0, owner)).astype(owner.dtype)
+
+
+def flip_garrison_status(status, planet_count: int):
+    """Flip a GarrisonStatus into the same canonical view as ``flip_state``."""
+    planet_perm = _mirror_planet_indices(planet_count)
+    arrivals = status.arrivals_by_owner[..., planet_perm, :, :]
+    return status._replace(
+        owner=_flip_owner_int(status.owner[..., planet_perm, :]),
+        ships=status.ships[..., planet_perm, :],
+        pre_combat_owner=_flip_owner_int(status.pre_combat_owner[..., planet_perm, :]),
+        pre_combat_ships=status.pre_combat_ships[..., planet_perm, :],
+        arrivals_by_owner=jnp.flip(arrivals, axis=-1),
+        alive=status.alive[..., planet_perm, :],
+    )
+
+
+def shared_selfplay_feature_aux(state: EnvState) -> tuple[FeatureAux, FeatureAux]:
+    """Build learner/opponent feature aux once for a self-play rollout step."""
+    status = garrison_status_jax(state, horizon=DEFAULT_GARRISON_HORIZON)
+    pressure_by_owner = pressure_by_owner_jax(state, horizon=float(DEFAULT_GARRISON_HORIZON))
+    planet_perm = _mirror_planet_indices(state.planets.shape[-2])
+    learner_aux = FeatureAux(
+        garrison_status=status,
+        enemy_pressure=pressure_by_owner[..., 1, :],
+    )
+    opponent_aux = FeatureAux(
+        garrison_status=flip_garrison_status(status, state.planets.shape[-2]),
+        enemy_pressure=pressure_by_owner[..., 0, planet_perm],
+    )
+    return learner_aux, opponent_aux
+
+
 def kaggle_obs_to_jax_state(obs, env_params: EnvParams) -> EnvState:
     """将 kaggle_environments 单步 observation 转换为 batch=1 的 EnvState。
 
@@ -273,14 +308,14 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
 
 
-def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_HORIZON):
+def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_HORIZON, garrison_status=None):
     """Use producer-style safe_drain as the policy's removable-ship budget.
 
     ``source_mask`` handles the first layer (can this planet be picked as a
     source at all), while ``source_ships`` becomes the dynamic amount budget used
     by the model's existing bucket mask and by the final emitted ship count.
     """
-    status = garrison_status_jax(state, horizon=horizon)
+    status = garrison_status if garrison_status is not None else garrison_status_jax(state, horizon=horizon)
     drain = safe_drain_all_sources_jax(
         status,
         source_ships=encoded.source_ships,
@@ -410,6 +445,7 @@ def auto_opponent_policy_actions(
     *,
     flip_state_fn,
     rng,
+    feature_aux=None,
 ):
     """自博弈训练用的冻结参数对手。
 
@@ -420,9 +456,13 @@ def auto_opponent_policy_actions(
     ``auto_deterministic_policy_actions`` 走 argmax。
     """
     flipped = flip_state_fn(state)
-    raw_enc = encode_batch(flipped, opp_fp)
+    raw_enc = encode_batch_with_aux(flipped, opp_fp, feature_aux) if feature_aux is not None else encode_batch(flipped, opp_fp)
     encoded = normalize_encoded(raw_enc, opp_ns, norm_params)
-    encoded = apply_safe_drain_budget(flipped, encoded)
+    encoded = apply_safe_drain_budget(
+        flipped,
+        encoded,
+        garrison_status=feature_aux.garrison_status if feature_aux is not None else None,
+    )
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
     initial_ships = jnp.concatenate(
@@ -797,12 +837,17 @@ def main() -> None:
     log_every = int(getattr(cfg, "log_every", 1))
     checkpoint_every = getattr(cfg, "checkpoint_every", 100)
 
+    def _copy_tree(tree):
+        return jax.tree_util.tree_map(lambda x: x, tree)
+
     # 冻结对手权重（初始与学习器相同，每 opponent_update_freq 步同步一次）
-    opponent_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    opponent_params = _copy_tree(train_state.params)
     # lag_snapshot 保存“上一个 interval 起点的策略”；新 lag_checkpoint/PFSP 接口到下一个
     # interval 时才发布，因此 lag 对手是真正间隔 pool_lag_interval 的 checkpoint。
-    lag_snapshot_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
-    lagged_params = jax.tree_util.tree_map(lambda x: x, train_state.params)
+    lag_snapshot_params = _copy_tree(train_state.params)
+    lag_snapshot_normalizer_state = _copy_tree(normalizer_state)
+    lagged_params = _copy_tree(train_state.params)
+    lagged_normalizer_state = _copy_tree(normalizer_state)
     snapshot_pool_entries: list[dict] = []  # snapshot pool 快照列表
     pool_entries: list[dict] = []
     if use_pool and pfsp_pool:
@@ -871,7 +916,7 @@ def main() -> None:
         print(f"[pool] mixed entries: {summary}")
 
     def _copy_params(params):
-        return jax.tree_util.tree_map(lambda x: x, params)
+        return _copy_tree(params)
 
     def _pfsp_sample(entries: list[dict]) -> dict:
         weights = [(1.0 - float(entry["winrate"]) + 0.1) ** 2 for entry in entries]
@@ -884,11 +929,12 @@ def main() -> None:
     def _pool_summary(entries: list[dict]) -> str:
         return ", ".join(f"{entry['id']}:{float(entry['winrate']):.2f}" for entry in entries)
 
-    def _add_lag_to_pool(update_idx: int, params) -> None:
+    def _add_lag_to_pool(update_idx: int, params, norm_state) -> None:
         pool_entries.append({
             "id": f"selfplay-lag-{max(update_idx - pool_lag_interval, 0):06d}",
             "type": "lag",
             "params": _copy_params(params),
+            "normalizer_state": _copy_tree(norm_state),
             "winrate": 0.5,
         })
         print(f"[pool] update={update_idx} 加入 50 步前 checkpoint，对手池: {_pool_summary(pool_entries)}")
@@ -997,7 +1043,7 @@ def main() -> None:
         if opponent_id == "selfplay-current":
             return _run_step(_jit_selfplay, ts, opponent_params, ns, st, ns, key, ent_scale)
         if opponent_id == "selfplay-lag":
-            return _run_step(_jit_selfplay, ts, lagged_params, ns, st, ns, key, ent_scale)
+            return _run_step(_jit_selfplay, ts, lagged_params, lagged_normalizer_state, st, ns, key, ent_scale)
         raise ValueError(f"Unknown training opponent: {opponent_id}")
 
     @jax.jit
@@ -1241,7 +1287,7 @@ def main() -> None:
                     snap = pool_rng.choice(snapshot_pool_entries)
                     selected_pool_id = snap["id"]
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, snap["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay, train_state, snap["params"], snap["normalizer_state"], state, normalizer_state, step_key, ent_scale)
                 else:
                     selected_pool_id = "selfplay-current"
                     train_state, state, normalizer_state, metrics = _run_step(
@@ -1257,7 +1303,15 @@ def main() -> None:
                         _jit_selfplay, train_state, opponent_params, normalizer_state, state, normalizer_state, step_key, ent_scale)
                 else:
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay, train_state, selected_pool_entry["params"], normalizer_state, state, normalizer_state, step_key, ent_scale)
+                        _jit_selfplay,
+                        train_state,
+                        selected_pool_entry["params"],
+                        selected_pool_entry.get("normalizer_state", normalizer_state),
+                        state,
+                        normalizer_state,
+                        step_key,
+                        ent_scale,
+                    )
         else:
             if self_play and update % opponent_update_freq == 1:
                 pass  # 上面已经同步过 current 对手。
@@ -1305,20 +1359,28 @@ def main() -> None:
         # snapshot pool：每 snapshot_interval 步存一个快照
         if use_pool and snapshot_pool and snapshot_interval > 0 and update % snapshot_interval == 0:
             snap_id = f"snap-{update:06d}"
-            snapshot_pool_entries.append({"id": snap_id, "params": _copy_params(train_state.params)})
+            snapshot_pool_entries.append({
+                "id": snap_id,
+                "params": _copy_params(train_state.params),
+                "normalizer_state": _copy_tree(normalizer_state),
+            })
             print(f"[pool] update={update} 存入快照 {snap_id}，快照池大小={len(snapshot_pool_entries)}")
 
         if use_pool and lagged_pool and pool_lag_interval > 0 and update % pool_lag_interval == 0:
             if fixed_pool:
                 lagged_params = _copy_params(train_state.params)
+                lagged_normalizer_state = _copy_tree(normalizer_state)
                 print(f"[pool] update={update} 同步 fixed_pool lagged 对手权重 (lag={pool_lag_interval})")
             elif lag_checkpoint_pool:
                 lagged_params = _copy_params(lag_snapshot_params)
+                lagged_normalizer_state = _copy_tree(lag_snapshot_normalizer_state)
                 lag_snapshot_params = _copy_params(train_state.params)
+                lag_snapshot_normalizer_state = _copy_tree(normalizer_state)
                 print(f"[pool] update={update} 发布 lag_checkpoint 对手权重 (lag={pool_lag_interval})")
             elif pfsp_pool:
-                _add_lag_to_pool(update, lag_snapshot_params)
+                _add_lag_to_pool(update, lag_snapshot_params, lag_snapshot_normalizer_state)
                 lag_snapshot_params = _copy_params(train_state.params)
+                lag_snapshot_normalizer_state = _copy_tree(normalizer_state)
 
         eval_metrics = {field: "" for field in eval_metric_fields}
         _do_nearest = eval_enabled and eval_nearest_interval > 0 and update % eval_nearest_interval == 0
@@ -1518,9 +1580,19 @@ def collect_rollout_auto(
     def body(carry, _):
         ts, st, ns, key = carry
         key, action_key, opp_key, reset_key = jax.random.split(key, 4)
-        raw_encoded = encode_batch(st, feat_params)
+        if opponent_kind == "selfplay":
+            learner_aux, opponent_aux = shared_selfplay_feature_aux(st)
+            raw_encoded = encode_batch_with_aux(st, feat_params, learner_aux)
+        else:
+            learner_aux = None
+            opponent_aux = None
+            raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
+        encoded = apply_safe_drain_budget(
+            st,
+            encoded,
+            garrison_status=learner_aux.garrison_status if learner_aux is not None else None,
+        )
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
         if opponent_kind == "selfplay":
@@ -1529,11 +1601,12 @@ def collect_rollout_auto(
                 opponent_params,
                 model,
                 feat_params,
-                ns,
+                opponent_normalizer_state,
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,
                 rng=opp_key,
+                feature_aux=opponent_aux,
             )
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
@@ -2029,10 +2102,8 @@ def comet_target_pos_at_time_jax(state: EnvState, target_idx, turns):
     i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
     path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
     paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos0 = jnp.take_along_axis(paths, i0_safe[..., None, None], axis=-2).squeeze(-2)
+    pos1 = jnp.take_along_axis(paths, i1_safe[..., None, None], axis=-2).squeeze(-2)
     pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
     weights = (match & valid_i0).astype(jnp.float32)
     has = weights.sum(axis=(-2, -1)) > 0.0
@@ -2066,10 +2137,8 @@ def comet_target_pos_velocity_at_time_jax(state: EnvState, target_idx, turns):
     i1_safe = jnp.clip(i1, 0, MAX_COMET_PATH - 1)
     path_shape = (state.planets.shape[0], 1) + one_shape + (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, MAX_COMET_PATH, 2)
     paths = state.comet_paths.reshape(path_shape)
-    one0 = jax.nn.one_hot(i0_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    one1 = jax.nn.one_hot(i1_safe, MAX_COMET_PATH, dtype=jnp.float32)
-    pos0 = (one0[..., None] * paths).sum(axis=-2)
-    pos1 = (one1[..., None] * paths).sum(axis=-2)
+    pos0 = jnp.take_along_axis(paths, i0_safe[..., None, None], axis=-2).squeeze(-2)
+    pos1 = jnp.take_along_axis(paths, i1_safe[..., None, None], axis=-2).squeeze(-2)
     pos = jnp.where(has_i1[..., None], pos0 + frac[..., None] * (pos1 - pos0), pos0)
     vel = jnp.where(has_i1[..., None], pos1 - pos0, jnp.zeros_like(pos0))
     weights = (match & valid_i0).astype(jnp.float32)
@@ -2098,54 +2167,68 @@ def target_max_turns_jax(state: EnvState, target_idx, horizon: int):
 def target_is_first_collision_jax(src, target_idx, state: EnvState, fx0, fy0, speed, cos_a, sin_a, hit_turn):
     """按引擎阶段验证候选回合的第一碰撞对象就是目标。"""
     horizon = AIM_HORIZON
-    turns_i = jnp.arange(1, horizon + 1, dtype=jnp.int32)
-    turns = turns_i.astype(jnp.float32)
     planets = state.planets
     planet_alive = state.planet_alive
     px_t, py_t = all_planet_pos_at_turns(state, horizon)
-    fx_prev = fx0[..., None] + (turns - 1.0) * speed[..., None] * cos_a[..., None]
-    fy_prev = fy0[..., None] + (turns - 1.0) * speed[..., None] * sin_a[..., None]
-    fx_cur = fx0[..., None] + turns * speed[..., None] * cos_a[..., None]
-    fy_cur = fy0[..., None] + turns * speed[..., None] * sin_a[..., None]
-    active_step = turns_i.reshape((1,) * hit_turn.ndim + (horizon,)) <= hit_turn[..., None]
-    in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
-    in_bounds_until_hit = (in_bounds | (~active_step)).all(axis=-1)
 
     src_axes = (None,) * (hit_turn.ndim - 1)
-    px_old = px_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    py_old = py_t[(slice(None),) + src_axes + (slice(None), slice(None, -1))]
-    px_new = px_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
-    py_new = py_t[(slice(None),) + src_axes + (slice(None), slice(1, None))]
+    px_t = px_t[(slice(None),) + src_axes + (slice(None), slice(None))]
+    py_t = py_t[(slice(None),) + src_axes + (slice(None), slice(None))]
     radii = planets[(slice(None),) + src_axes + (slice(None), 4)]
-    alive = planet_alive[(slice(None),) + src_axes + (slice(None), None)]
-
-    move_d2 = point_segment_distance_sq(
-        px_old,
-        py_old,
-        fx_prev[..., None, :],
-        fy_prev[..., None, :],
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-    )
-    move_hit = (move_d2 < radii[..., None] ** 2) & alive & active_step[..., None, :]
-
-    sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
-    sweep_d2 = point_segment_distance_sq(
-        fx_cur[..., None, :],
-        fy_cur[..., None, :],
-        px_old,
-        py_old,
-        px_new,
-        py_new,
-    )
-    sweep_hit = (sweep_d2 < radii[..., None] ** 2) & alive & sweep_active & active_step[..., None, :]
+    alive = planet_alive[(slice(None),) + src_axes + (slice(None),)]
 
     large = jnp.int32(2 * (horizon + 1) + 1)
-    move_keys = (2 * turns_i).reshape((1,) * (move_hit.ndim - 1) + (horizon,))
-    sweep_keys = (2 * turns_i + 1).reshape((1,) * (sweep_hit.ndim - 1) + (horizon,))
-    first_move = jnp.where(move_hit, move_keys, large).min(axis=-1)
-    first_sweep = jnp.where(sweep_hit, sweep_keys, large).min(axis=-1)
-    first_by_planet = jnp.minimum(first_move, first_sweep)
+    first_shape = jnp.broadcast_shapes(fx0.shape + (1,), radii.shape)
+    first_init = jnp.full(first_shape, large, dtype=jnp.int32)
+    in_bounds_init = jnp.ones_like(fx0, dtype=bool)
+
+    def scan_step(t, carry):
+        first_by_planet, in_bounds_until_hit = carry
+        turn_f = jnp.asarray(t, dtype=jnp.float32)
+        active_step = t <= hit_turn
+        fx_prev = fx0 + (turn_f - 1.0) * speed * cos_a
+        fy_prev = fy0 + (turn_f - 1.0) * speed * sin_a
+        fx_cur = fx0 + turn_f * speed * cos_a
+        fy_cur = fy0 + turn_f * speed * sin_a
+        in_bounds = (fx_cur >= 0.0) & (fx_cur <= 100.0) & (fy_cur >= 0.0) & (fy_cur <= 100.0)
+        in_bounds_until_hit = in_bounds_until_hit & (in_bounds | (~active_step))
+
+        px_old = jnp.take(px_t, t - 1, axis=-1)
+        py_old = jnp.take(py_t, t - 1, axis=-1)
+        px_new = jnp.take(px_t, t, axis=-1)
+        py_new = jnp.take(py_t, t, axis=-1)
+        move_d2 = point_segment_distance_sq(
+            px_old,
+            py_old,
+            fx_prev[..., None],
+            fy_prev[..., None],
+            fx_cur[..., None],
+            fy_cur[..., None],
+        )
+        move_hit = (move_d2 < radii ** 2) & alive & active_step[..., None]
+
+        sweep_active = ((px_new - px_old) ** 2 + (py_new - py_old) ** 2) > 1e-9
+        sweep_d2 = point_segment_distance_sq(
+            fx_cur[..., None],
+            fy_cur[..., None],
+            px_old,
+            py_old,
+            px_new,
+            py_new,
+        )
+        sweep_hit = (sweep_d2 < radii ** 2) & alive & sweep_active & active_step[..., None]
+        step_first = jnp.minimum(
+            jnp.where(move_hit, jnp.asarray(2 * t, dtype=jnp.int32), large),
+            jnp.where(sweep_hit, jnp.asarray(2 * t + 1, dtype=jnp.int32), large),
+        )
+        return jnp.minimum(first_by_planet, step_first), in_bounds_until_hit
+
+    first_by_planet, in_bounds_until_hit = jax.lax.fori_loop(
+        1,
+        horizon + 1,
+        scan_step,
+        (first_init, in_bounds_init),
+    )
     first_planet = first_by_planet.argmin(axis=-1)
     first_key = first_by_planet.min(axis=-1)
     target_key_lo = 2 * hit_turn

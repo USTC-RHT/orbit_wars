@@ -7,7 +7,7 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "RL_1_fixed_pool"
+run_name: "RL_1_fixed_pool-0615"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 400

@@ -323,6 +323,7 @@ class ExternalScriptJaxEvalOpponent:
     metric_prefix: str
     agent_dir: Path
     seed_offset: int = 0
+    reload_each_game: bool = True
 
     def exists(self) -> bool:
         return (self.agent_dir / "main.py").exists()
@@ -342,6 +343,8 @@ class ExternalScriptJaxEvalOpponent:
 
         opponent = ExternalScriptOpponent(self.agent_dir)
         wins = losses = draws = 0
+        if not self.reload_each_game:
+            opponent.reset_env(0, ctx.base_seed + self.seed_offset)
 
         @jax.jit
         def infer(st):
@@ -355,7 +358,8 @@ class ExternalScriptJaxEvalOpponent:
 
         for game_idx in range(ctx.num_games):
             seed = ctx.base_seed + self.seed_offset + game_idx
-            opponent.reset_env(0, seed)
+            if self.reload_each_game:
+                opponent.reset_env(0, seed)
             env = kag_make("orbit_wars", configuration={"seed": seed, "randomSeed": seed}, debug=False)
             env.reset(num_agents=2)
             states = env.step([[], []])
@@ -470,6 +474,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             metric_prefix="pool_ckpt900",
             agent_dir=agents_root / "mine" / "jax-pool-0514-resume-ckpt900",
             seed_offset=31337,
+            reload_each_game=False,
         ))
     return opponents
 

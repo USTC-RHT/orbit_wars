@@ -33,6 +33,7 @@ env:
   target_filter_enabled: true
   attack_top_k: 10
   defense_top_k: 5
+  safe_drain_hard_mask: true
 
 reward:
   terminal_weight: 1.0

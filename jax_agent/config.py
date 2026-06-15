@@ -26,6 +26,7 @@ class EnvConfig:
     target_filter_enabled: bool = False
     attack_top_k: int = 6
     defense_top_k: int = 3
+    safe_drain_hard_mask: bool = True
 
 
 @dataclass(slots=True)

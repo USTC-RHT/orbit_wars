@@ -1,0 +1,113 @@
+# 4090/4090D 24GB training config for the V1 autoregressive actor.
+#
+# Launch:
+#   python -m jax_agent.train_jax --config cfg_jax_fixed_pool_4090.yaml
+#
+# Aggressive 24GB GPU profile. If this OOMs, first reduce num_envs to 128,
+# then reduce rollout_steps to 64.
+
+seed: 42
+run_name: "RL_1_fixed_pool_with_safe_drain-0615"
+device: auto
+save_dir: ../kaggle
+checkpoint_every: 400
+log_every: 1
+opponent: "pool"
+
+env:
+  board_size: 100.0
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: true
+  attack_top_k: 10
+  defense_top_k: 5
+  safe_drain_hard_mask: true
+
+reward:
+  terminal_weight: 1.0
+  ships_weight: 0.0
+  production_weight: 0.0
+  planet_weight: 0.0
+  time_penalty: 0.0
+  launch_penalty: 0.0
+  neutral_capture_weight: 0.0
+  neutral_capture_eta_scale: 12.0
+  neutral_capture_early_steps: 150
+  enemy_capture_weight: 0.0
+  lose_planet_penalty: 0.0
+  wasted_attack_penalty: 0.0
+  step_clip: 0.0
+
+model:
+  actor_type: autoregressive
+  hidden_size: 128
+  use_cnn: true
+  use_transformer: true
+  num_transformer_layers: 2
+  num_heads: 4
+  max_fleet_tokens: 40
+  fleet_selection: impact
+  max_action_tokens: 12
+  end_bias_init: -3.0
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+ppo:
+  rollout_steps: 64
+  num_envs: 128
+  total_updates: 50000
+  epochs: 4
+  minibatch_size: 2048
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  ent_coef_fire: 0.005
+  ent_coef_target: 0.01
+  ent_coef_amount: 0.005
+  ent_schedule: linear
+  ent_min_ratio: 0.2
+  lr: 5e-5
+  lr_schedule: warmup_cosine
+  warmup_updates: 50
+  min_lr_ratio: 0.1
+  max_grad_norm: 0.5
+  anneal_lr: true
+  norm_adv: true
+  clip_vloss: true
+  target_kl: 0.02
+
+self_play_update_interval: 50
+pool_mode: fixed_pool
+pool_start_phase: 1
+pool_lag_interval: 50
+promote_nearest_win_rate: 1.0
+promote_consecutive_evals: 2
+
+eval:
+  enabled: true
+  every: 1000
+  nearest_every: 50
+  slow_every: 400
+  games: 20
+  seed: 200000
+  player: 1
+  opponents: ["nearest", "tamrazov", "pool_ckpt900", "ckpt_48900", "ckpt_32700"]
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"
+  group: "autoregressive-4090"
+  tags:
+    - autoregressive
+    - v1
+    - fixed_pool
+    - rtx4090

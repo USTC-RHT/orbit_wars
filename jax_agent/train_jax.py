@@ -299,13 +299,22 @@ def jax_actions_to_kaggle(actions_arr) -> list:
     return [[float(r[0]), float(r[1]), int(r[2])] for r in arr if float(r[2]) > 0]
 
 
-def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_HORIZON, garrison_status=None):
+def apply_safe_drain_budget(
+    state: EnvState,
+    encoded,
+    horizon: int = SAFE_DRAIN_HORIZON,
+    garrison_status=None,
+    *,
+    enabled: bool = True,
+):
     """Use producer-style safe_drain as the policy's removable-ship budget.
 
     ``source_mask`` handles the first layer (can this planet be picked as a
     source at all), while ``source_ships`` becomes the dynamic amount budget used
     by the model's existing bucket mask and by the final emitted ship count.
     """
+    if not enabled:
+        return encoded
     status = garrison_status if garrison_status is not None else garrison_status_jax(state, horizon=horizon)
     drain = safe_drain_all_sources_jax(
         status,
@@ -320,7 +329,16 @@ def apply_safe_drain_budget(state: EnvState, encoded, horizon: int = SAFE_DRAIN_
     return encoded._replace(source_ships=budget, source_mask=source_mask)
 
 
-def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
+def auto_deterministic_policy_actions(
+    train_state,
+    model,
+    state,
+    feat_params,
+    norm_state,
+    norm_params,
+    *,
+    safe_drain_hard_mask: bool = True,
+):
     """评估用贪心自回归策略。
 
     逻辑与 auto_policy_sample 对齐，但所有 head 都使用 argmax，不采样。
@@ -328,7 +346,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
     """
     raw_enc = encode_batch(state, feat_params)
     encoded = normalize_encoded(raw_enc, norm_state, norm_params)
-    encoded = apply_safe_drain_budget(state, encoded)
+    encoded = apply_safe_drain_budget(state, encoded, enabled=safe_drain_hard_mask)
     b = encoded.planet_features.shape[0]
     k = model.max_action_tokens
     initial_ships = jnp.concatenate(
@@ -437,6 +455,7 @@ def auto_opponent_policy_actions(
     flip_state_fn,
     rng,
     feature_aux=None,
+    safe_drain_hard_mask: bool = True,
 ):
     """自博弈训练用的冻结参数对手。
 
@@ -453,6 +472,7 @@ def auto_opponent_policy_actions(
         flipped,
         encoded,
         garrison_status=feature_aux.garrison_status if feature_aux is not None else None,
+        enabled=safe_drain_hard_mask,
     )
     b = encoded.planet_features.shape[0]
     k = max_action_tokens
@@ -566,6 +586,7 @@ def main() -> None:
     feat_params = FeatureParams.from_train_config(cfg)
     norm_params = NormalizerParams.from_train_config(cfg)
     reward_params = RewardParams.from_train_config(cfg)
+    safe_drain_hard_mask = bool(getattr(cfg.env, "safe_drain_hard_mask", True))
     ent_coef_fire = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_fire", -1.0) < 0.0 else cfg.ppo.ent_coef_fire
     ent_coef_target = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_target", -1.0) < 0.0 else cfg.ppo.ent_coef_target
     ent_coef_amount = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_amount", -1.0) < 0.0 else cfg.ppo.ent_coef_amount
@@ -627,7 +648,15 @@ def main() -> None:
     normalizer_state = init_normalizer()
 
     def deterministic_policy_actions(ts, st, fp, ns, np):  # noqa: E501
-        return auto_deterministic_policy_actions(ts, model, st, fp, ns, np)
+        return auto_deterministic_policy_actions(
+            ts,
+            model,
+            st,
+            fp,
+            ns,
+            np,
+            safe_drain_hard_mask=safe_drain_hard_mask,
+        )
 
     start_update = 1
 
@@ -995,6 +1024,7 @@ def main() -> None:
             ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "nearest",
             max_action_tokens=max_action_tokens,
+            safe_drain_hard_mask=safe_drain_hard_mask,
         )
     )
     _jit_selfplay = jax.jit(
@@ -1002,6 +1032,7 @@ def main() -> None:
             ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
             max_action_tokens=max_action_tokens,
+            safe_drain_hard_mask=safe_drain_hard_mask,
         )
     )
     _jit_step = jax.jit(
@@ -1010,6 +1041,7 @@ def main() -> None:
             reward_params, ppo_params, model, cfg.ppo.rollout_steps,
             "selfplay" if self_play else "nearest",
             max_action_tokens=max_action_tokens,
+            safe_drain_hard_mask=safe_drain_hard_mask,
         )
     )
 
@@ -1041,7 +1073,7 @@ def main() -> None:
     def _jit_external_sample(ts, st, ns, key):
         raw_encoded = encode_batch(st, feat_params)
         encoded, ns = update_and_normalize(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
+        encoded = apply_safe_drain_budget(st, encoded, enabled=safe_drain_hard_mask)
         sample = auto_policy_sample(ts, model, st, encoded, key, feat_params, max_action_tokens)
         b = encoded.planet_features.shape[0]
         row = AutoRollout(
@@ -1076,7 +1108,7 @@ def main() -> None:
     def _jit_external_value(ts, st, ns):
         raw_encoded = encode_batch(st, feat_params)
         encoded = normalize_encoded(raw_encoded, ns, norm_params)
-        encoded = apply_safe_drain_budget(st, encoded)
+        encoded = apply_safe_drain_budget(st, encoded, enabled=safe_drain_hard_mask)
         b = encoded.planet_features.shape[0]
         k = max_action_tokens
         initial_ships = jnp.concatenate(
@@ -1561,6 +1593,7 @@ def collect_rollout_auto(
     rollout_steps: int,
     opponent_kind: str = "nearest",
     max_action_tokens: int = 16,
+    safe_drain_hard_mask: bool = True,
 ):
     """收集状态级自回归 rollout。
 
@@ -1583,6 +1616,7 @@ def collect_rollout_auto(
             st,
             encoded,
             garrison_status=learner_aux.garrison_status if learner_aux is not None else None,
+            enabled=safe_drain_hard_mask,
         )
         sample = auto_policy_sample(ts, model, st, encoded, action_key, feat_params, max_action_tokens)
         learner_actions = sample["actions"]
@@ -1598,6 +1632,7 @@ def collect_rollout_auto(
                 flip_state_fn=flip_state,
                 rng=opp_key,
                 feature_aux=opponent_aux,
+                safe_drain_hard_mask=safe_drain_hard_mask,
             )
         else:
             opponent_actions = nearest_opponent_actions(st, player=1, params=feat_params)
@@ -1643,7 +1678,7 @@ def collect_rollout_auto(
     )
     last_raw_encoded = encode_batch(state, feat_params)
     last_encoded = normalize_encoded(last_raw_encoded, normalizer_state, norm_params)
-    last_encoded = apply_safe_drain_budget(state, last_encoded)
+    last_encoded = apply_safe_drain_budget(state, last_encoded, enabled=safe_drain_hard_mask)
     b = last_encoded.planet_features.shape[0]
     k = max_action_tokens
     last_initial_ships = jnp.concatenate([jnp.zeros((b, 1), dtype=last_encoded.source_ships.dtype), last_encoded.source_ships], axis=1)

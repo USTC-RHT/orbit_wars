@@ -10,7 +10,7 @@ seed: 42
 run_name: "jax_fixed_pool_with_mask-0609"
 device: auto
 save_dir: ../kaggle
-checkpoint_every: 400
+checkpoint_every: 1000
 log_every: 1
 opponent: "pool"
 
@@ -95,7 +95,7 @@ eval:
   enabled: true
   every: 1000
   nearest_every: 50
-  slow_every: 400
+  slow_every: 1000
   games: 20
   seed: 200000
   player: 1

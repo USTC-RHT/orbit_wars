@@ -9,7 +9,7 @@ seed: 42
 run_name: "RL_1_fixed_pool-no_amount_head-production_only-0615"
 device: auto
 save_dir: ../kaggle
-checkpoint_every: 400
+checkpoint_every: 1000
 log_every: 1
 opponent: "pool"
 

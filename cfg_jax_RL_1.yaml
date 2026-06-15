@@ -6,7 +6,7 @@
 # Original fixed_pool_with_tgtmask-0526 training config.
 
 seed: 42
-run_name: "fixed_pool_with_tgtmask-0526"
+run_name: "fixed_pool_tgtmask_post_discard_attack-0615"
 device: auto
 save_dir: ../kaggle
 checkpoint_every: 100

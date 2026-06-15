@@ -73,6 +73,7 @@ class FeatureParams:
     target_filter_enabled: bool = False  # 是否启用 Proto-guided 目标过滤
     attack_top_k: int = 6         # 最多保留 K 个进攻候选
     defense_top_k: int = 3        # 最多保留 K 个防守/输送候选
+    post_discard_capture_check: bool = False
     max_fleet_tokens: int = MAX_FLEET_TOKENS
     fleet_selection: str = "size"  # size=大舰队优先；impact=2P-Improve 威胁/机会优先
 
@@ -87,6 +88,7 @@ class FeatureParams:
             target_filter_enabled=bool(cfg.env.target_filter_enabled),
             attack_top_k=int(cfg.env.attack_top_k),
             defense_top_k=int(cfg.env.defense_top_k),
+            post_discard_capture_check=bool(getattr(cfg.env, "post_discard_capture_check", False)),
             max_fleet_tokens=int(getattr(model_cfg, "max_fleet_tokens", MAX_FLEET_TOKENS)),
             fleet_selection=str(getattr(model_cfg, "fleet_selection", "size")),
         )
@@ -390,8 +392,7 @@ def build_relative_features(
     is_enemy = owner == 1
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
     target_reachable, cheap_eta_turns = reachable_full_send_eta_jax(src, planets, future_px, future_py, send_ships)
-    attackable_by_ships = send_ships > planets[:, 5]
-    target_valid = alive & (~is_source) & target_reachable & (is_friend | ((is_enemy | is_neutral) & attackable_by_ships))
+    target_valid = alive & (~is_source) & target_reachable & (is_friend | is_enemy | is_neutral)
     eta_turns = jnp.where(target_valid, cheap_eta_turns, INBOUND_HORIZON + 1.0)
     eta_norm = eta_turns / INBOUND_HORIZON
     eta_garrison = relative_eta_garrison_features(garrison_status, eta_turns, params)
@@ -438,10 +439,8 @@ def build_relative_features(
 
     # target head 阶段先做便宜目标先验：
     # - 目标必须存活且不能是 source 自身；
-    # - 增援友方不要求船数优势；
-    # - 攻击敌方/中立时要求 full-send 船数大于目标当前驻军；
     # - 便宜 reachability 认为 full-send 有可能够到。
-    # 精确物理命中/首次碰撞检查在采样选定 source 后按该 source 动态计算。
+    # 精确物理命中/首次碰撞检查和能否打下目标在采样后事后丢弃。
     per_planet_mask = target_valid
     # slot 0 永远可选（no-op）
     mask = jnp.concatenate([jnp.asarray([True]), per_planet_mask])

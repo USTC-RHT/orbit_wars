@@ -58,6 +58,7 @@ def _load_model(ckpt_path: Path):
         "target_filter_enabled": bool(cfg.env.target_filter_enabled),
         "attack_top_k": int(cfg.env.attack_top_k),
         "defense_top_k": int(cfg.env.defense_top_k),
+        "post_discard_capture_check": bool(getattr(cfg.env, "post_discard_capture_check", False)),
         "hidden_size": int(cfg.model.hidden_size),
         "use_cnn": bool(cfg.model.use_cnn),
         "max_fleet_tokens": max_fleet_tokens,

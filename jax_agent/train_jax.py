@@ -52,7 +52,7 @@ from .features_jax import FLEET_DIM, FeatureAux, FeatureParams, encode_batch, en
 from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
-from .physics import aim_with_prediction_jax  # noqa: E402
+from .physics import aim_with_prediction_eta_jax  # noqa: E402
 from .pressure_jax import pressure_by_owner_jax  # noqa: E402
 from .ppo_jax import (
     AutoRollout,
@@ -313,113 +313,82 @@ def _valid_logit_mask(logits: jnp.ndarray) -> jnp.ndarray:
     return jnp.isfinite(logits) & (logits > NEG_INF * 0.5)
 
 
-def selected_exact_target_mask_and_angles(
-    state: EnvState,
-    encoded,
-    src_t: jnp.ndarray,
-    ships: jnp.ndarray,
-    feat_params: FeatureParams,
-):
-    """Compute exact target mask only for coarse candidates of the selected source."""
+def selected_coarse_target_mask(encoded, src_t: jnp.ndarray, feat_params: FeatureParams) -> jnp.ndarray:
+    """Return the coarse candidate mask for a selected source.
+
+    This is intentionally only the feature-stage target mask. Exact physics
+    validation and tactical capture feasibility are handled after target
+    sampling so that the target head is not forced onto the next-best target.
+    """
     b = encoded.planet_features.shape[0]
-    p = encoded.source_mask.shape[-1]
-    candidate_count = (
-        min(p, max(1, int(feat_params.attack_top_k) + int(feat_params.defense_top_k)))
-        if feat_params.target_filter_enabled
-        else p
-    )
     batch_idx = jnp.arange(b)
-    src_slot = jnp.clip(src_t - 1, 0, p - 1)
-    src_planets = state.planets[batch_idx, src_slot]
-    cheap_target_mask = encoded.candidate_mask[batch_idx, src_slot, 1:].astype(bool)
-    candidate_score = jnp.where(cheap_target_mask, jnp.arange(p, 0, -1, dtype=jnp.int32)[None, :], 0)
-    candidate_idx = jax.lax.top_k(candidate_score, candidate_count)[1].astype(jnp.int32)
-    candidate_valid = jnp.take_along_axis(cheap_target_mask, candidate_idx, axis=-1)
-    target_planets = state.planets[batch_idx[:, None], candidate_idx]
-    active_src = (src_t > 0) & (ships >= MIN_LAUNCH_SHIPS)
-    selected_ships = jnp.where(candidate_valid & active_src[:, None], ships[:, None], 0.0)
-    angles, hit = aim_with_prediction_jax(
-        src_planets[:, None, :],
-        target_planets,
-        candidate_idx,
-        state,
-        selected_ships,
-    )
-    candidate_hit = candidate_valid & hit & active_src[:, None]
-    target_planet_mask = jnp.zeros((b, p), dtype=bool).at[batch_idx[:, None], candidate_idx].set(candidate_hit)
-    target_mask = jnp.concatenate(
-        [jnp.zeros((b, 1), dtype=bool), target_planet_mask],
-        axis=-1,
-    )
-    target_angles = jnp.zeros((b, p), dtype=jnp.float32).at[batch_idx[:, None], candidate_idx].set(angles)
-    return target_mask, target_angles
+    src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
+    target_mask = encoded.candidate_mask[batch_idx, src_slot].astype(bool)
+    target_mask = target_mask & (jnp.arange(target_mask.shape[-1])[None, :] != 0)
+    return jnp.where((src_t > 0)[:, None], target_mask, jnp.zeros_like(target_mask))
 
 
-def select_source_with_exact_targets(
+def select_source_with_coarse_targets(
     src_logits: jnp.ndarray,
     key_src,
     active: jnp.ndarray,
-    state: EnvState,
     encoded,
-    remaining: jnp.ndarray,
     feat_params: FeatureParams,
     *,
     deterministic: bool = False,
 ):
-    """Pick a source, retrying within the token when exact target physics rejects it."""
-    b = encoded.planet_features.shape[0]
-    p = feat_params.max_planets
+    """Pick a source using only source legality and coarse target availability."""
+    source_mask = _valid_logit_mask(src_logits)
+    found = active & source_mask.any(axis=-1)
+    safe_src_logits = safe_logits(src_logits)
+    if deterministic:
+        src_raw = jnp.argmax(safe_src_logits, axis=-1).astype(jnp.int32)
+    else:
+        src_raw = jax.random.categorical(key_src, safe_src_logits, axis=-1).astype(jnp.int32)
+    src_t = jnp.where(found, src_raw, 0)
+    target_mask = selected_coarse_target_mask(encoded, src_t, feat_params)
+    return src_t, safe_src_logits, source_mask, target_mask, found
+
+
+def post_discard_target_check(
+    state: EnvState,
+    src_t: jnp.ndarray,
+    tgt_t: jnp.ndarray,
+    ships: jnp.ndarray,
+    feat_params: FeatureParams,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Validate selected src/tgt after sampling and return (execute_ok, angle).
+
+    Exact hit validation is always post-sampling. Optional capture feasibility
+    additionally rejects non-friendly targets where full-send is unlikely to
+    beat current defenders plus enemy production through the exact ETA.
+    """
+    b = state.planets.shape[0]
     batch_idx = jnp.arange(b)
-    blocked = jnp.zeros_like(src_logits, dtype=bool)
-    chosen_src = jnp.zeros((b,), dtype=jnp.int32)
-    chosen_src_logits = jnp.zeros_like(src_logits)
-    chosen_source_mask = jnp.zeros_like(src_logits, dtype=bool)
-    chosen_target_mask = jnp.zeros((b, p + 1), dtype=bool)
-    chosen_target_angles = jnp.zeros((b, p), dtype=jnp.float32)
-    found = jnp.zeros((b,), dtype=bool)
-
-    def has_available_source(blocked_mask, found_mask):
-        masked_logits = jnp.where(blocked_mask, NEG_INF, src_logits)
-        source_mask = _valid_logit_mask(masked_logits)
-        return (active & (~found_mask) & source_mask.any(axis=-1)).any()
-
-    def cond(carry):
-        i, blocked, _chosen_src, _chosen_src_logits, _chosen_source_mask, _chosen_target_mask, _chosen_target_angles, found = carry
-        return (i < p) & has_available_source(blocked, found)
-
-    def attempt(carry):
-        i, blocked, chosen_src, chosen_src_logits, chosen_source_mask, chosen_target_mask, chosen_target_angles, found = carry
-        masked_logits = jnp.where(blocked, NEG_INF, src_logits)
-        source_mask = _valid_logit_mask(masked_logits)
-        has_source = source_mask.any(axis=-1)
-        attempt_active = active & (~found) & has_source
-        safe_src_logits = safe_logits(masked_logits)
-        if deterministic:
-            src_try_raw = jnp.argmax(safe_src_logits, axis=-1).astype(jnp.int32)
-        else:
-            src_try_raw = jax.random.categorical(jax.random.fold_in(key_src, i), safe_src_logits, axis=-1).astype(jnp.int32)
-        src_try = jnp.where(attempt_active, src_try_raw, 0)
-        ships = full_send_amount(remaining[batch_idx, jnp.clip(src_try, 0, p)])
-        target_mask, target_angles = selected_exact_target_mask_and_angles(state, encoded, src_try, ships, feat_params)
-        has_target = target_mask[:, 1:].any(axis=-1)
-        accept = attempt_active & has_target
-        chosen_src = jnp.where(accept, src_try, chosen_src)
-        chosen_src_logits = jnp.where(accept[:, None], safe_src_logits, chosen_src_logits)
-        chosen_source_mask = jnp.where(accept[:, None], source_mask, chosen_source_mask)
-        chosen_target_mask = jnp.where(accept[:, None], target_mask, chosen_target_mask)
-        chosen_target_angles = jnp.where(accept[:, None], target_angles, chosen_target_angles)
-        failed = attempt_active & (~has_target) & (src_try > 0)
-        failed_onehot = jax.nn.one_hot(jnp.clip(src_try, 0, p), p + 1, dtype=jnp.float32).astype(bool)
-        blocked = blocked | (failed_onehot & failed[:, None])
-        found = found | accept
-        return i + 1, blocked, chosen_src, chosen_src_logits, chosen_source_mask, chosen_target_mask, chosen_target_angles, found
-
-    _i, _blocked, chosen_src, chosen_src_logits, chosen_source_mask, chosen_target_mask, chosen_target_angles, found = jax.lax.while_loop(
-        cond,
-        attempt,
-        (jnp.asarray(0, dtype=jnp.int32), blocked, chosen_src, chosen_src_logits, chosen_source_mask, chosen_target_mask, chosen_target_angles, found),
+    src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
+    tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
+    src_planets = state.planets[batch_idx, src_slot]
+    tgt_planets = state.planets[batch_idx, tgt_slot]
+    angle, hit, eta_turns = aim_with_prediction_eta_jax(
+        src_planets[:, None, :],
+        tgt_planets[:, None, :],
+        tgt_slot[:, None],
+        state,
+        ships[:, None],
     )
-    return chosen_src, chosen_src_logits, chosen_source_mask, chosen_target_mask, chosen_target_angles, found
+    exact_hit = hit[:, 0]
+    target_owner = tgt_planets[:, 1].astype(jnp.int32)
+    enemy_target = target_owner == 1
+    non_friendly = target_owner != 0
+    enemy_growth = jnp.where(enemy_target, eta_turns[:, 0] * tgt_planets[:, 6], 0.0)
+    required = tgt_planets[:, 5] + enemy_growth
+    feasible_attack = ships > required
+    capture_ok = jnp.where(
+        bool(feat_params.post_discard_capture_check) & non_friendly,
+        feasible_attack,
+        jnp.ones_like(exact_hit, dtype=bool),
+    )
+    return exact_hit & capture_ok, angle[:, 0]
 
 
 def selected_target_is_valid_from_mask(target_mask: jnp.ndarray, batch_idx, tgt_t) -> jnp.ndarray:
@@ -467,13 +436,11 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         tv = ~ended
         no_valid_source = ~has_valid_logits(src_logits_t)
         end_t = tv & ((jax.nn.sigmoid(end_logits_t) > 0.5) | no_valid_source)
-        src_t, _src_logits_final, _source_action_mask, target_action_mask, target_angles, found_src = select_source_with_exact_targets(
+        src_t, _src_logits_final, _source_action_mask, target_action_mask, found_src = select_source_with_coarse_targets(
             src_logits_t,
             jax.random.PRNGKey(0),
             tv & (~end_t),
-            state,
             encoded,
-            remaining,
             feat_params,
             deterministic=True,
         )
@@ -490,10 +457,10 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
         ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)])
-        angle = target_angles[batch_idx, tgt_slot]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
         tgt_valid = selected_target_is_valid_from_mask(target_action_mask, batch_idx, tgt_t)
-        exec_t = tv & (~end_t) & src_valid & tgt_valid
+        post_ok, angle = post_discard_target_check(state, src_t, tgt_t, ships, feat_params)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & post_ok
 
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -573,13 +540,11 @@ def auto_opponent_policy_actions(
         sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
         no_valid_source = ~has_valid_logits(src_logits_t)
         end_t = tv & (sampled_end | no_valid_source)
-        src_t, _src_logits_final, _source_action_mask, target_action_mask, target_angles, found_src = select_source_with_exact_targets(
+        src_t, _src_logits_final, _source_action_mask, target_action_mask, found_src = select_source_with_coarse_targets(
             src_logits_t,
             key_src,
             tv & (~end_t),
-            flipped,
             encoded,
-            remaining,
             opp_fp,
             deterministic=False,
         )
@@ -595,10 +560,10 @@ def auto_opponent_policy_actions(
         src_slot = jnp.clip(src_t - 1, 0, opp_fp.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, opp_fp.max_planets - 1)
         ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, opp_fp.max_planets)])
-        angle = target_angles[batch_idx, tgt_slot]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
         tgt_valid = selected_target_is_valid_from_mask(target_action_mask, batch_idx, tgt_t)
-        exec_t = tv & (~end_t) & src_valid & tgt_valid
+        post_ok, angle = post_discard_target_check(flipped, src_t, tgt_t, ships, opp_fp)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & post_ok
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
             [jnp.where(exec_t, source_ids, 0.0), jnp.where(exec_t, angle, 0.0), jnp.where(exec_t, ships, 0.0)],
@@ -1803,13 +1768,11 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         sampled_end = jax.random.uniform(key_end, (b,)) < jax.nn.sigmoid(end_logits_t)
         no_valid_source = ~has_valid_logits(src_logits_t)
         end_t = tv & (sampled_end | no_valid_source)
-        src_t, src_logits_final, source_mask_t, target_mask_t, target_angles, found_src = select_source_with_exact_targets(
+        src_t, src_logits_final, source_mask_t, target_mask_t, found_src = select_source_with_coarse_targets(
             src_logits_t,
             key_src,
             tv & (~end_t),
-            state,
             encoded,
-            remaining,
             feat_params,
             deterministic=False,
         )
@@ -1832,10 +1795,10 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         src_slot = jnp.clip(src_t - 1, 0, feat_params.max_planets - 1)
         tgt_slot = jnp.clip(tgt_t - 1, 0, feat_params.max_planets - 1)
         ships = full_send_amount(remaining[batch_idx, jnp.clip(src_t, 0, feat_params.max_planets)])
-        angle = target_angles[batch_idx, tgt_slot]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot] & (ships >= MIN_LAUNCH_SHIPS)
         tgt_valid = selected_target_is_valid_from_mask(target_mask_t, batch_idx, tgt_t)
-        exec_t = tv & (~end_t) & src_valid & tgt_valid
+        post_ok, angle = post_discard_target_check(state, src_t, tgt_t, ships, feat_params)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & post_ok
         invalid_t = tv & (~end_t) & (~exec_t)
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(

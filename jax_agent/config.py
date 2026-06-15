@@ -25,6 +25,7 @@ class EnvConfig:
     target_filter_enabled: bool = False
     attack_top_k: int = 6
     defense_top_k: int = 3
+    post_discard_capture_check: bool = False
 
 
 @dataclass(slots=True)

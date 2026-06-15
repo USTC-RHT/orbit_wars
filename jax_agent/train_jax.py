@@ -48,7 +48,16 @@ from .fast_env import (  # noqa: E402
     select_from_bank,
     step_batch,
 )
-from .features_jax import FLEET_DIM, FeatureAux, FeatureParams, encode_batch, encode_batch_with_aux  # noqa: E402
+from .features_jax import (  # noqa: E402
+    ATTACK_REACHABILITY_HORIZON,
+    FLEET_DIM,
+    FeatureAux,
+    FeatureParams,
+    encode_batch,
+    encode_batch_with_aux,
+    planet_positions_over_horizon,
+    reachable_full_send_eta_jax,
+)
 from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax, safe_drain_all_sources_jax  # noqa: E402
 from .model_jax import AutoregressiveActorCritic  # noqa: E402
 from .normalization_jax import NormalizerParams, init_normalizer, normalize_encoded, update_and_normalize  # noqa: E402
@@ -329,6 +338,28 @@ def apply_safe_drain_budget(
     return encoded._replace(source_ships=budget, source_mask=source_mask)
 
 
+def post_discard_attackable_by_ships(tgt_planets: jnp.ndarray, ships: jnp.ndarray) -> jnp.ndarray:
+    """Allow friendly transfers; require attacks to exceed current target ships."""
+    target_owner = tgt_planets[:, 1].astype(jnp.int32)
+    non_friendly = target_owner != 0
+    return jnp.where(non_friendly, ships > tgt_planets[:, 5], jnp.ones_like(ships, dtype=bool))
+
+
+def post_discard_reachable(state: EnvState, src_t: jnp.ndarray, tgt_t: jnp.ndarray, ships: jnp.ndarray, feat_params: FeatureParams) -> jnp.ndarray:
+    """Apply the former cheap reachability mask after action sampling."""
+    del feat_params
+    src_slot = jnp.clip(src_t - 1, 0, state.planets.shape[1] - 1)
+    tgt_slot = jnp.clip(tgt_t - 1, 0, state.planets.shape[1] - 1)
+
+    def one_game(st, src_idx, tgt_idx, amount):
+        future_px, future_py = planet_positions_over_horizon(st, ATTACK_REACHABILITY_HORIZON)
+        src_planet = st.planets[src_idx]
+        reachable, _eta = reachable_full_send_eta_jax(src_planet, st.planets, future_px, future_py, amount)
+        return reachable[tgt_idx]
+
+    return jax.vmap(one_game)(state, src_slot, tgt_slot, ships)
+
+
 def auto_deterministic_policy_actions(
     train_state,
     model,
@@ -414,7 +445,9 @@ def auto_deterministic_policy_actions(
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        reachable = post_discard_reachable(state, src_t, tgt_t, ships, feat_params)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable & reachable
 
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -535,7 +568,9 @@ def auto_opponent_policy_actions(
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        reachable = post_discard_reachable(flipped, src_t, tgt_t, ships, opp_fp)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable & reachable
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
             [jnp.where(exec_t, source_ids, 0.0), jnp.where(exec_t, angle, 0.0), jnp.where(exec_t, ships, 0.0)],
@@ -1829,7 +1864,9 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit
+        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        reachable = post_discard_reachable(state, src_t, tgt_t, ships, feat_params)
+        exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable & reachable
         invalid_t = tv & (~end_t) & (~exec_t)
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(

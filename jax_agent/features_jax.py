@@ -399,13 +399,9 @@ def build_relative_features(
     is_friend = (owner == 0) & (~is_source)
     is_enemy = owner == 1
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
-    reachable_amount = reachable_amount_mask_jax(src, planets, future_px, future_py, ship_buckets)
-    reachable_positive = reachable_amount & valid_buckets[None, :]
-    target_reachable = reachable_positive.any(axis=-1)
     send_ships = max_bucket
     _full_reachable, cheap_eta_turns = reachable_full_send_eta_jax(src, planets, future_px, future_py, send_ships)
-    attackable_by_ships = send_ships > planets[:, 5]
-    target_valid = alive & (~is_source) & target_reachable & (is_friend | ((is_enemy | is_neutral) & attackable_by_ships))
+    target_valid = alive & (~is_source) & (is_friend | is_enemy | is_neutral)
     eta_turns = jnp.where(target_valid, cheap_eta_turns, INBOUND_HORIZON + 1.0)
     eta_max = eta_turns / INBOUND_HORIZON  # 最快到达时间归一化
     eta_garrison = relative_eta_garrison_features(garrison_status, eta_turns, params)
@@ -450,11 +446,11 @@ def build_relative_features(
     )
     relative_features = jnp.concatenate([noop_features, rel], axis=0)
 
-    # target head 阶段先做静态目标合法性剪枝：
+    # target head 阶段只做静态目标合法性剪枝：
     # - 目标必须存活且不能是 source 自身；
-    # - 增援友方不要求船数优势；
-    # - 攻击敌方/中立时要求 source 当前船数大于目标驻军。
-    per_planet_amount = reachable_positive
+    # - 所有非 source 的友方/敌方/中立星球都可作为候选。
+    # cheap reachability 和攻击船数优势不参与 pre-mask；不合格动作在采样后丢弃。
+    per_planet_amount = jnp.broadcast_to(valid_buckets[None, :], (params.max_planets, params.ship_bucket_count))
     per_planet_mask = target_valid
     # slot 0 永远可选（no-op）
     mask = jnp.concatenate([jnp.asarray([True]), per_planet_mask])

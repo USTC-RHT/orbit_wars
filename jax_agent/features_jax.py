@@ -318,12 +318,11 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     )
     relative_features = jnp.concatenate([noop_features, rel], axis=0)
 
-    # target head 阶段先做静态目标合法性剪枝：
+    # target head 阶段只做静态目标合法性剪枝：
     # - 目标必须存活且不能是 source 自身；
-    # - 增援友方不要求船数优势；
-    # - 攻击敌方/中立时要求 source 当前船数大于目标驻军。
-    attackable_by_ships = src[5] > planets[:, 5]
-    target_valid = alive & (~is_source) & (is_friend | ((is_enemy | is_neutral) & attackable_by_ships))
+    # - 所有非 source 的友方/敌方/中立星球都可作为候选。
+    # 攻击船数优势不参与 pre-mask；不合格动作在采样后丢弃。
+    target_valid = alive & (~is_source) & (is_friend | is_enemy | is_neutral)
     positive_amount = valid_buckets
     per_planet_amount = jnp.broadcast_to(positive_amount[None, :], (params.max_planets, params.ship_bucket_count))
     per_planet_mask = target_valid

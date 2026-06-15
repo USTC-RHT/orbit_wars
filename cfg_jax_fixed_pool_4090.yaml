@@ -7,10 +7,10 @@
 # then reduce rollout_steps to 64.
 
 seed: 42
-run_name: "jax_fixed_pool_with_mask-0609"
+run_name: "fixed_pool_with_tgtmask-0526"
 device: auto
 save_dir: ../kaggle
-checkpoint_every: 400
+checkpoint_every: 100
 log_every: 1
 opponent: "pool"
 
@@ -47,8 +47,8 @@ model:
   use_transformer: true
   num_transformer_layers: 2
   num_heads: 4
-  max_fleet_tokens: 40
-  fleet_selection: impact
+  max_fleet_tokens: 16
+  fleet_selection: size
   max_action_tokens: 12
   end_bias_init: -3.0
 
@@ -58,8 +58,8 @@ state_norm:
   eps: 1.0e-8
 
 ppo:
-  rollout_steps: 64
-  num_envs: 128
+  rollout_steps: 128
+  num_envs: 160
   total_updates: 50000
   epochs: 4
   minibatch_size: 2048

@@ -1,10 +1,9 @@
 # 4090/4090D 24GB training config for the V1 autoregressive actor.
 #
 # Launch:
-#   python -m jax_agent.train_jax --config cfg_jax_fixed_pool_4090.yaml
+#   python -m jax_agent.train_jax --config cfg_jax_RL_1.yaml
 #
-# Aggressive 24GB GPU profile. If this OOMs, first reduce num_envs to 128,
-# then reduce rollout_steps to 64.
+# Original fixed_pool_with_tgtmask-0526 training config.
 
 seed: 42
 run_name: "fixed_pool_with_tgtmask-0526"

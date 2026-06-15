@@ -49,8 +49,8 @@ model:
   num_heads: 4
   max_fleet_tokens: 40
   fleet_selection: impact
-  max_action_tokens: 6
-  end_bias_init: 0.0
+  max_action_tokens: 4
+  end_bias_init: 1.0
 
 state_norm:
   enabled: true
@@ -93,7 +93,7 @@ eval:
   enabled: true
   every: 1000
   nearest_every: 50
-  slow_every: 400
+  slow_every: 1000
   games: 20
   seed: 200000
   player: 1

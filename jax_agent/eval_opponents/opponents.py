@@ -427,17 +427,17 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             seed_offset=15485863,
         ))
     if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
-        opponents.append(JaxCheckpointEvalOpponent(
-            name="ckpt_048900",
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
             metric_prefix="ckpt_48900",
-            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_048900.pkl",
+            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
             seed_offset=32452843,
         ))
     if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
-        opponents.append(JaxCheckpointEvalOpponent(
-            name="ckpt_032700",
+        opponents.append(ExternalScriptJaxEvalOpponent(
+            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
             metric_prefix="ckpt_32700",
-            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_032700.pkl",
+            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
             seed_offset=49979687,
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:

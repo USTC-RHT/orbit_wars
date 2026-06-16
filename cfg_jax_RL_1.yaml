@@ -9,7 +9,7 @@ seed: 42
 run_name: "fixed_pool_tgtmask_post_discard_attack-0615"
 device: auto
 save_dir: ../kaggle
-checkpoint_every: 100
+checkpoint_every: 1000
 log_every: 1
 opponent: "pool"
 
@@ -93,7 +93,7 @@ eval:
   enabled: true
   every: 1000
   nearest_every: 50
-  slow_every: 400
+  slow_every: 1000
   games: 20
   seed: 200000
   player: 1

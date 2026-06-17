@@ -1403,6 +1403,7 @@ def main() -> None:
                 bank=bank,
                 env_params=env_params,
                 feat_params=feat_params,
+                checkpoint_feat_params=pre_mask_opponent_feat_params,
                 normalizer_state=normalizer_state,
                 norm_params=norm_params,
                 num_games=eval_games,

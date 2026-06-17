@@ -3,17 +3,17 @@
 # current self-play, ckpt_032700, ckpt_048900.
 #
 # Launch:
-#   conda run -n orbit-wars-lab bash -lc 'cd /home/dministrator/kaggle/rl-agent && PYTHONPATH=. python -m jax_agent.train_jax --config cfg_jax_RL_1_resume32700_mixed_self_32700_48900.yaml'
+#   PYTHONPATH=. python -m jax_agent.train_jax --config cfg_jax_RL_1_resume32700_mixed_self_32700_48900.yaml
 
 seed: 42
 run_name: "fixed_pool_tgtmask_post_discard-resume32700-0617"
 device: auto
-save_dir: ../kaggle
+save_dir: outputs
 checkpoint_every: 500
 log_every: 1
 opponent: "pool"
 
-init_from_checkpoint: /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+init_from_checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
 start_update_from_checkpoint: true
 
 env:
@@ -96,12 +96,12 @@ opponent_pool:
   - name: ckpt_32700
     type: jax_checkpoint
     weight: 1.0
-    checkpoint: /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
+    checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
     opponent_feature_mode: pre_mask
   - name: ckpt_48900
     type: jax_checkpoint
     weight: 1.0
-    checkpoint: /home/dministrator/kaggle/checkpoint/fixed_pool_with_tgtmask-0526_jax/ckpt_048900.pkl
+    checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_048900.pkl
     opponent_feature_mode: pre_mask
 
 eval:

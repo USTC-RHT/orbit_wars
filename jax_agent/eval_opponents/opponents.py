@@ -75,6 +75,7 @@ class EvalContext:
     bank: EnvState
     env_params: EnvParams
     feat_params: Any
+    checkpoint_feat_params: Any | None
     normalizer_state: Any
     norm_params: Any
     num_games: int
@@ -240,6 +241,7 @@ class JaxCheckpointEvalOpponent:
     metric_prefix: str
     checkpoint_path: Path
     seed_offset: int = 0
+    feature_mode: str = "current"
 
     def exists(self) -> bool:
         return self.checkpoint_path.exists()
@@ -259,6 +261,7 @@ class JaxCheckpointEvalOpponent:
             jnp.asarray,
             ckpt.get("normalizer_state", ctx.normalizer_state),
         )
+        opp_feat_params = ctx.checkpoint_feat_params if self.feature_mode == "pre_mask" else ctx.feat_params
 
         _rng, reset_key = jax.random.split(jax.random.fold_in(ctx.rng, self.seed_offset))
         state = ctx.reset_from_bank(ctx.bank, reset_key, ctx.num_games)
@@ -279,7 +282,7 @@ class JaxCheckpointEvalOpponent:
                 opp_acts = ctx.deterministic_policy_actions(
                     opp_train_state,
                     st,
-                    ctx.feat_params,
+                    opp_feat_params,
                     opp_normalizer_state,
                     ctx.norm_params,
                 )
@@ -296,7 +299,7 @@ class JaxCheckpointEvalOpponent:
                 opp_acts = ctx.deterministic_policy_actions(
                     opp_train_state,
                     opp_st,
-                    ctx.feat_params,
+                    opp_feat_params,
                     opp_normalizer_state,
                     ctx.norm_params,
                 )
@@ -428,6 +431,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             metric_prefix="ckpt_48900",
             checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_048900.pkl",
             seed_offset=32452843,
+            feature_mode="pre_mask",
         ))
     if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
         opponents.append(JaxCheckpointEvalOpponent(
@@ -435,6 +439,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             metric_prefix="ckpt_32700",
             checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_032700.pkl",
             seed_offset=49979687,
+            feature_mode="pre_mask",
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:
         opponents.append(ExternalScriptJaxEvalOpponent(

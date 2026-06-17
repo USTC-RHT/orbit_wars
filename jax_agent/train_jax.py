@@ -702,6 +702,9 @@ def main() -> None:
         with ckpt_path.open("rb") as f:
             return pickle.load(f), ckpt_path
 
+    def _to_jax_tree(tree):
+        return jax.tree_util.tree_map(jnp.asarray, tree)
+
     def _assert_param_compatible(ckpt_params, ckpt_path: Path) -> None:
         expected_leaves, expected_tree = jax.tree_util.tree_flatten(train_state.params)
         loaded_leaves, loaded_tree = jax.tree_util.tree_flatten(ckpt_params)
@@ -719,19 +722,35 @@ def main() -> None:
             )
 
     init_ckpt = getattr(cfg, "init_from_checkpoint", None)
+    resume_ckpt: dict[str, Any] | None = None
     if init_ckpt:
         ckpt, ckpt_path = _load_checkpoint(init_ckpt)
+        resume_ckpt = ckpt
         ckpt_params = ckpt["params"]
         _assert_param_compatible(ckpt_params, ckpt_path)
-        train_state = train_state.replace(params=jax.tree_util.tree_map(jnp.asarray, ckpt_params))
+        train_state = train_state.replace(params=_to_jax_tree(ckpt_params))
+        restored_fields = ["params"]
+        if "opt_state" in ckpt:
+            train_state = train_state.replace(opt_state=_to_jax_tree(ckpt["opt_state"]))
+            restored_fields.append("opt_state")
+        if "train_state_step" in ckpt:
+            train_state = train_state.replace(step=jnp.asarray(ckpt["train_state_step"]))
+            restored_fields.append("train_state_step")
         if "normalizer_state" in ckpt:
-            normalizer_state = jax.tree_util.tree_map(jnp.asarray, ckpt["normalizer_state"])
+            normalizer_state = _to_jax_tree(ckpt["normalizer_state"])
+            restored_fields.append("normalizer_state")
+        if "rng" in ckpt:
+            rng = jnp.asarray(ckpt["rng"])
+            restored_fields.append("rng")
+        if "env_state" in ckpt:
+            state = _to_jax_tree(ckpt["env_state"])
+            restored_fields.append("env_state")
         if getattr(cfg, "start_update_from_checkpoint", True):
             start_update = int(ckpt.get("update", 0)) + 1
         print(
             f"[init] loaded checkpoint {ckpt_path} "
             f"(ckpt_update={ckpt.get('update', 'unknown')}, start_update={start_update}); "
-            "optimizer state is freshly initialized"
+            f"restored {', '.join(restored_fields)}"
         )
 
     run_dir = Path(cfg.save_dir) / f"{cfg.run_name}_jax"
@@ -901,6 +920,35 @@ def main() -> None:
     lagged_normalizer_state = _copy_tree(normalizer_state)
     snapshot_pool_entries: list[dict] = []  # snapshot pool 快照列表
     pool_entries: list[dict] = []
+    if resume_ckpt is not None:
+        trainer_state = resume_ckpt.get("trainer_state", {})
+        restored_trainer_fields: list[str] = []
+        if "opponent_params" in trainer_state:
+            opponent_params = _to_jax_tree(trainer_state["opponent_params"])
+            restored_trainer_fields.append("opponent_params")
+        if "lag_snapshot_params" in trainer_state:
+            lag_snapshot_params = _to_jax_tree(trainer_state["lag_snapshot_params"])
+            restored_trainer_fields.append("lag_snapshot_params")
+        if "lag_snapshot_normalizer_state" in trainer_state:
+            lag_snapshot_normalizer_state = _to_jax_tree(trainer_state["lag_snapshot_normalizer_state"])
+            restored_trainer_fields.append("lag_snapshot_normalizer_state")
+        if "lagged_params" in trainer_state:
+            lagged_params = _to_jax_tree(trainer_state["lagged_params"])
+            restored_trainer_fields.append("lagged_params")
+        if "lagged_normalizer_state" in trainer_state:
+            lagged_normalizer_state = _to_jax_tree(trainer_state["lagged_normalizer_state"])
+            restored_trainer_fields.append("lagged_normalizer_state")
+        if "pool_phase" in trainer_state:
+            pool_phase = int(trainer_state["pool_phase"])
+            restored_trainer_fields.append("pool_phase")
+        if "recent_nearest_win_rates" in trainer_state:
+            recent_nearest_win_rates = [float(v) for v in trainer_state["recent_nearest_win_rates"]]
+            restored_trainer_fields.append("recent_nearest_win_rates")
+        if "pool_rng_state" in trainer_state:
+            pool_rng.setstate(trainer_state["pool_rng_state"])
+            restored_trainer_fields.append("pool_rng_state")
+        if restored_trainer_fields:
+            print(f"[init] restored trainer state: {', '.join(restored_trainer_fields)}")
     if use_pool and pfsp_pool:
         pool_entries = [{"id": "selfplay-current", "type": "current", "params": None, "winrate": 0.5}]
         if pool_include_nearest:
@@ -1580,8 +1628,23 @@ def main() -> None:
             ckpt_path = run_dir / f"ckpt_{update:06d}.pkl"
             with open(ckpt_path, "wb") as f:
                 pickle.dump({
+                    "resume_version": 2,
                     "params": jax.device_get(train_state.params),
+                    "opt_state": jax.device_get(train_state.opt_state),
+                    "train_state_step": jax.device_get(train_state.step),
                     "normalizer_state": jax.device_get(normalizer_state),
+                    "rng": jax.device_get(rng),
+                    "env_state": jax.device_get(state),
+                    "trainer_state": {
+                        "opponent_params": jax.device_get(opponent_params),
+                        "lag_snapshot_params": jax.device_get(lag_snapshot_params),
+                        "lag_snapshot_normalizer_state": jax.device_get(lag_snapshot_normalizer_state),
+                        "lagged_params": jax.device_get(lagged_params),
+                        "lagged_normalizer_state": jax.device_get(lagged_normalizer_state),
+                        "pool_phase": int(pool_phase),
+                        "recent_nearest_win_rates": list(recent_nearest_win_rates),
+                        "pool_rng_state": pool_rng.getstate(),
+                    },
                     "update": update,
                     "cfg": cfg,
                 }, f)

@@ -409,7 +409,30 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
     agents_root = root / "agents"
     external_root = agents_root / "external"
+    mine_root = agents_root / "mine"
     opponents: list[JaxEvalOpponent] = []
+
+    def packaged_onnx_checkpoint(
+        *,
+        metric_prefix: str,
+        agent_dir_name: str,
+        seed_offset: int,
+    ) -> JaxEvalOpponent:
+        root_dir = root.resolve()
+        agent_dir = (mine_root / agent_dir_name).resolve()
+        try:
+            agent_dir.relative_to(root_dir)
+        except ValueError as exc:
+            raise ValueError(f"Packaged ONNX opponent must live under rl-agent: {agent_dir}") from exc
+        if not (agent_dir / "main.py").exists():
+            raise FileNotFoundError(f"Packaged ONNX opponent not found under rl-agent: {agent_dir / 'main.py'}")
+        return ExternalScriptJaxEvalOpponent(
+            name=agent_dir_name,
+            metric_prefix=metric_prefix,
+            agent_dir=agent_dir,
+            seed_offset=seed_offset,
+        )
+
     if "nearest" in enabled:
         opponents.append(NearestJaxEvalOpponent())
     if "sigma" in enabled or "sigmaborov-reinforce" in enabled:
@@ -426,18 +449,18 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=external_root / "slawekbiel-producer",
             seed_offset=15485863,
         ))
+    # ckpt_32700/48900 are evaluated through their packaged ONNX agents so the
+    # checkpoint-time target-mask/action semantics are restored exactly.
     if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
-        opponents.append(ExternalScriptJaxEvalOpponent(
-            name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+        opponents.append(packaged_onnx_checkpoint(
             metric_prefix="ckpt_48900",
-            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
+            agent_dir_name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
             seed_offset=32452843,
         ))
     if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
-        opponents.append(ExternalScriptJaxEvalOpponent(
-            name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+        opponents.append(packaged_onnx_checkpoint(
             metric_prefix="ckpt_32700",
-            agent_dir=agents_root / "mine" / "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
+            agent_dir_name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
             seed_offset=49979687,
         ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:

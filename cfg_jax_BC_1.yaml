@@ -1,0 +1,54 @@
+# Per-planet behavioral cloning config.
+#
+# Launch:
+#   python -m jax_agent.train_bc_jax --config cfg_jax_BC_1.yaml
+
+seed: 42
+run_name: "bc_feature_rows_fight_full"
+save_dir: /mnt/f/kaggle-orbit-wars-data/bc_runs
+log_every: 1
+checkpoint_every: 1
+
+env:
+  board_size: 100.0
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: false
+  attack_top_k: 10
+  defense_top_k: 5
+
+model:
+  actor_type: per_planet
+  hidden_size: 128
+  use_cnn: true
+  use_transformer: false
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+eval:
+  enabled: false
+  every: 1
+  games: 2
+  seed: 300000
+  opponent: nearest
+  bank: /mnt/f/kaggle-orbit-wars-data/state_banks/rl_agent_bc_eval_bank.npz
+  bank_size: 16
+
+bc:
+  dataset_glob: /mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full/bc_feature_rows_*.npz
+  epochs: 5
+  batch_size: 512
+  lr: 3.0e-4
+  weight_decay: 0.0
+  val_fraction: 0.1
+  noop_keep_ratio: 0.25
+  noop_weight: 1.0
+  fire_weight: 1.0
+  target_weight: 1.0
+  amount_weight: 0.5

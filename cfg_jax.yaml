@@ -47,12 +47,12 @@ reward:
 
 model:
   actor_type: autoregressive
-  hidden_size: 128
+  hidden_size: 512
   use_cnn: true
   use_transformer: true
-  num_transformer_layers: 2
-  num_heads: 4
-  max_fleet_tokens: 16
+  num_transformer_layers: 5
+  num_heads: 8
+  max_fleet_tokens: 32
   fleet_selection: size
   max_action_tokens: 12
   end_bias_init: -3.0
@@ -66,8 +66,8 @@ ppo:
   rollout_steps: 128
   num_envs: 160
   total_updates: 50000
-  epochs: 4
-  minibatch_size: 2048
+  epochs: 1
+  minibatch_size: 1024
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.2

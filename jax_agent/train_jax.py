@@ -284,6 +284,20 @@ def maybe_post_discard_attackable(tgt_planets: jnp.ndarray, ships: jnp.ndarray, 
     return jnp.ones_like(ships, dtype=bool)
 
 
+def legacy_target_mask_feature_params(feat_params: FeatureParams) -> FeatureParams:
+    """Feature/action semantics used by the target-mask checkpoint agents.
+
+    The ckpt_032700/ckpt_048900 agents were trained before post-discard target
+    filtering. Their target head masked attack targets in advance with
+    ``source_ships > target_ships`` and did not repeat that check at execution.
+    """
+    return replace(
+        feat_params,
+        target_attack_ships_pre_mask=True,
+        post_discard_attackable_check=False,
+    )
+
+
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
     """评估用贪心自回归策略。
 
@@ -523,11 +537,7 @@ def main() -> None:
         max_actions=cfg.env.max_planets,
     )
     feat_params = FeatureParams.from_train_config(cfg)
-    pre_mask_opponent_feat_params = replace(
-        feat_params,
-        target_attack_ships_pre_mask=True,
-        post_discard_attackable_check=False,
-    )
+    legacy_target_mask_feat_params = legacy_target_mask_feature_params(feat_params)
     norm_params = NormalizerParams.from_train_config(cfg)
     reward_params = RewardParams.from_train_config(cfg)
     ent_coef_fire = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_fire", -1.0) < 0.0 else cfg.ppo.ent_coef_fire
@@ -888,15 +898,27 @@ def main() -> None:
                     or entry.get("mask_mode")
                     or "current"
                 ).lower().replace("-", "_")
-                if opponent_feature_mode not in {"current", "pre_mask", "premask", "target_mask"}:
+                if opponent_feature_mode not in {
+                    "current",
+                    "legacy_target_mask",
+                    "pre_mask",
+                    "premask",
+                    "target_mask",
+                }:
                     raise ValueError(
                         f"opponent_pool[{idx}] unsupported opponent_feature_mode={opponent_feature_mode!r}"
                     )
+                legacy_mode = opponent_feature_mode in {
+                    "legacy_target_mask",
+                    "pre_mask",
+                    "premask",
+                    "target_mask",
+                }
                 mixed_entries.append({
                     "id": name,
                     "type": "jax-checkpoint",
                     "weight": weight,
-                    "opponent_feature_mode": "pre_mask" if opponent_feature_mode in {"pre_mask", "premask", "target_mask"} else "current",
+                    "opponent_feature_mode": "legacy_target_mask" if legacy_mode else "current",
                     "params": jax.tree_util.tree_map(jnp.asarray, ckpt_params),
                     "normalizer_state": jax.tree_util.tree_map(
                         jnp.asarray,
@@ -1028,7 +1050,7 @@ def main() -> None:
     )
     _jit_selfplay_premask_opponent = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, pre_mask_opponent_feat_params, norm_params,
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, legacy_target_mask_feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
             max_action_tokens=max_action_tokens,
         )
@@ -1289,7 +1311,7 @@ def main() -> None:
                 elif selected_type == "jax-checkpoint":
                     checkpoint_jit = (
                         _jit_selfplay_premask_opponent
-                        if selected_pool_entry.get("opponent_feature_mode") == "pre_mask"
+                        if selected_pool_entry.get("opponent_feature_mode") == "legacy_target_mask"
                         else _jit_selfplay
                     )
                     train_state, state, normalizer_state, metrics = _run_step(
@@ -1403,7 +1425,7 @@ def main() -> None:
                 bank=bank,
                 env_params=env_params,
                 feat_params=feat_params,
-                checkpoint_feat_params=pre_mask_opponent_feat_params,
+                legacy_target_mask_feat_params=legacy_target_mask_feat_params,
                 normalizer_state=normalizer_state,
                 norm_params=norm_params,
                 num_games=eval_games,

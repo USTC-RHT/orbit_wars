@@ -97,12 +97,12 @@ opponent_pool:
     type: jax_checkpoint
     weight: 1.0
     checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
-    opponent_feature_mode: pre_mask
+    opponent_feature_mode: legacy_target_mask
   - name: ckpt_48900
     type: jax_checkpoint
     weight: 1.0
     checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_048900.pkl
-    opponent_feature_mode: pre_mask
+    opponent_feature_mode: legacy_target_mask
 
 eval:
   enabled: true

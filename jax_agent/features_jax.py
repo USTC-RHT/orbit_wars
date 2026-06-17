@@ -59,6 +59,8 @@ class FeatureParams:
     target_filter_enabled: bool = False  # 是否启用 Proto-guided 目标过滤
     attack_top_k: int = 6         # 最多保留 K 个进攻候选
     defense_top_k: int = 3        # 最多保留 K 个防守/输送候选
+    target_attack_ships_pre_mask: bool = False
+    post_discard_attackable_check: bool = True
     max_fleet_tokens: int = MAX_FLEET_TOKENS
     fleet_selection: str = "size"  # size=大舰队优先；impact=2P-Improve 威胁/机会优先
 
@@ -74,6 +76,8 @@ class FeatureParams:
             target_filter_enabled=bool(cfg.env.target_filter_enabled),
             attack_top_k=int(cfg.env.attack_top_k),
             defense_top_k=int(cfg.env.defense_top_k),
+            target_attack_ships_pre_mask=bool(getattr(cfg.env, "target_attack_ships_pre_mask", False)),
+            post_discard_attackable_check=bool(getattr(cfg.env, "post_discard_attackable_check", True)),
             max_fleet_tokens=int(getattr(model_cfg, "max_fleet_tokens", MAX_FLEET_TOKENS)),
             fleet_selection=str(getattr(model_cfg, "fleet_selection", "size")),
         )
@@ -318,11 +322,13 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     )
     relative_features = jnp.concatenate([noop_features, rel], axis=0)
 
-    # target head 阶段只做静态目标合法性剪枝：
+    # target head 阶段默认只做静态目标合法性剪枝：
     # - 目标必须存活且不能是 source 自身；
     # - 所有非 source 的友方/敌方/中立星球都可作为候选。
-    # 攻击船数优势不参与 pre-mask；不合格动作在采样后丢弃。
-    target_valid = alive & (~is_source) & (is_friend | is_enemy | is_neutral)
+    # 旧 target-mask checkpoint 使用攻击船数优势 pre-mask，续训时可通过配置恢复。
+    attackable_by_ships = src[5] > planets[:, 5]
+    attack_valid = jnp.where(params.target_attack_ships_pre_mask, attackable_by_ships, jnp.ones_like(alive, dtype=bool))
+    target_valid = alive & (~is_source) & (is_friend | ((is_enemy | is_neutral) & attack_valid))
     positive_amount = valid_buckets
     per_planet_amount = jnp.broadcast_to(positive_amount[None, :], (params.max_planets, params.ship_bucket_count))
     per_planet_mask = target_valid

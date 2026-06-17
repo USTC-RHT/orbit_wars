@@ -26,6 +26,8 @@ class EnvConfig:
     target_filter_enabled: bool = False
     attack_top_k: int = 6
     defense_top_k: int = 3
+    target_attack_ships_pre_mask: bool = False
+    post_discard_attackable_check: bool = True
 
 
 @dataclass(slots=True)

@@ -15,6 +15,7 @@ import pickle
 import random
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,12 @@ def post_discard_attackable_by_ships(tgt_planets: jnp.ndarray, ships: jnp.ndarra
     return jnp.where(non_friendly, ships > tgt_planets[:, 5], jnp.ones_like(ships, dtype=bool))
 
 
+def maybe_post_discard_attackable(tgt_planets: jnp.ndarray, ships: jnp.ndarray, feat_params: FeatureParams) -> jnp.ndarray:
+    if bool(getattr(feat_params, "post_discard_attackable_check", True)):
+        return post_discard_attackable_by_ships(tgt_planets, ships)
+    return jnp.ones_like(ships, dtype=bool)
+
+
 def auto_deterministic_policy_actions(train_state, model, state, feat_params, norm_state, norm_params):
     """评估用贪心自回归策略。
 
@@ -352,7 +359,7 @@ def auto_deterministic_policy_actions(train_state, model, state, feat_params, no
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        attackable = maybe_post_discard_attackable(tgt_planets, ships, feat_params)
         exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable
 
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
@@ -466,7 +473,7 @@ def auto_opponent_policy_actions(
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        attackable = maybe_post_discard_attackable(tgt_planets, ships, opp_fp)
         exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)
         action_t = jnp.stack(
@@ -516,6 +523,11 @@ def main() -> None:
         max_actions=cfg.env.max_planets,
     )
     feat_params = FeatureParams.from_train_config(cfg)
+    pre_mask_opponent_feat_params = replace(
+        feat_params,
+        target_attack_ships_pre_mask=True,
+        post_discard_attackable_check=False,
+    )
     norm_params = NormalizerParams.from_train_config(cfg)
     reward_params = RewardParams.from_train_config(cfg)
     ent_coef_fire = cfg.ppo.ent_coef if getattr(cfg.ppo, "ent_coef_fire", -1.0) < 0.0 else cfg.ppo.ent_coef_fire
@@ -870,10 +882,21 @@ def main() -> None:
                 ckpt, ckpt_path = _load_checkpoint(str(ckpt_value))
                 ckpt_params = ckpt["params"]
                 _assert_param_compatible(ckpt_params, ckpt_path)
+                opponent_feature_mode = str(
+                    entry.get("opponent_feature_mode")
+                    or entry.get("feature_mode")
+                    or entry.get("mask_mode")
+                    or "current"
+                ).lower().replace("-", "_")
+                if opponent_feature_mode not in {"current", "pre_mask", "premask", "target_mask"}:
+                    raise ValueError(
+                        f"opponent_pool[{idx}] unsupported opponent_feature_mode={opponent_feature_mode!r}"
+                    )
                 mixed_entries.append({
                     "id": name,
                     "type": "jax-checkpoint",
                     "weight": weight,
+                    "opponent_feature_mode": "pre_mask" if opponent_feature_mode in {"pre_mask", "premask", "target_mask"} else "current",
                     "params": jax.tree_util.tree_map(jnp.asarray, ckpt_params),
                     "normalizer_state": jax.tree_util.tree_map(
                         jnp.asarray,
@@ -898,7 +921,12 @@ def main() -> None:
         if not mixed_entries:
             raise ValueError("pool_mode='mixed' opponent_pool has no positive-weight entries")
         total_weight = sum(float(entry["weight"]) for entry in mixed_entries)
-        summary = ", ".join(f"{entry['id']}={float(entry['weight']) / total_weight:.2f}" for entry in mixed_entries)
+        def _mixed_entry_summary(entry: dict[str, Any]) -> str:
+            mode = entry.get("opponent_feature_mode")
+            suffix = f"[{mode}]" if mode else ""
+            return f"{entry['id']}{suffix}={float(entry['weight']) / total_weight:.2f}"
+
+        summary = ", ".join(_mixed_entry_summary(entry) for entry in mixed_entries)
         print(f"[pool] mixed entries: {summary}")
 
     def _copy_params(params):
@@ -986,21 +1014,28 @@ def main() -> None:
     max_action_tokens = int(getattr(cfg.model, "max_action_tokens", 16))
     _jit_nearest = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "nearest",
             max_action_tokens=max_action_tokens,
         )
     )
     _jit_selfplay = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, feat_params, norm_params,
+            reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
+            max_action_tokens=max_action_tokens,
+        )
+    )
+    _jit_selfplay_premask_opponent = jax.jit(
+        lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, pre_mask_opponent_feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps, "selfplay",
             max_action_tokens=max_action_tokens,
         )
     )
     _jit_step = jax.jit(
         lambda ts, opp_p, opp_ns, st, ns, key: collect_rollout_auto(
-            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, norm_params,
+            ts, opp_p, opp_ns, st, ns, key, bank, env_params, feat_params, feat_params, norm_params,
             reward_params, ppo_params, model, cfg.ppo.rollout_steps,
             "selfplay" if self_play else "nearest",
             max_action_tokens=max_action_tokens,
@@ -1252,8 +1287,13 @@ def main() -> None:
                         ent_scale,
                     )
                 elif selected_type == "jax-checkpoint":
+                    checkpoint_jit = (
+                        _jit_selfplay_premask_opponent
+                        if selected_pool_entry.get("opponent_feature_mode") == "pre_mask"
+                        else _jit_selfplay
+                    )
                     train_state, state, normalizer_state, metrics = _run_step(
-                        _jit_selfplay,
+                        checkpoint_jit,
                         train_state,
                         selected_pool_entry["params"],
                         selected_pool_entry["normalizer_state"],
@@ -1545,6 +1585,7 @@ def collect_rollout_auto(
     bank,
     env_params,
     feat_params,
+    opponent_feat_params,
     norm_params,
     reward_params,
     ppo_params,
@@ -1571,8 +1612,8 @@ def collect_rollout_auto(
                 st,
                 opponent_params,
                 model,
-                feat_params,
-                ns,
+                opponent_feat_params,
+                opponent_normalizer_state,
                 norm_params,
                 max_action_tokens,
                 flip_state_fn=flip_state,
@@ -1772,7 +1813,7 @@ def auto_policy_sample(train_state, model, state, encoded, rng, feat_params: Fea
         aim_hit = aim_hit[:, 0]
         src_valid = (src_t > 0) & encoded.source_mask[batch_idx, src_slot]
         tgt_valid = tgt_t > 0
-        attackable = post_discard_attackable_by_ships(tgt_planets, ships)
+        attackable = maybe_post_discard_attackable(tgt_planets, ships, feat_params)
         exec_t = tv & (~end_t) & src_valid & tgt_valid & aim_hit & attackable
         invalid_t = tv & (~end_t) & (~exec_t)
         source_ids = encoded.source_ids[batch_idx, src_slot].astype(jnp.float32)

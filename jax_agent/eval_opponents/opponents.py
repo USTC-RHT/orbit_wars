@@ -449,6 +449,8 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=external_root / "slawekbiel-producer",
             seed_offset=15485863,
         ))
+    # ckpt_32700/48900 are evaluated through their packaged ONNX agents so the
+    # checkpoint-time target-mask/action semantics are restored exactly.
     if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
         opponents.append(packaged_onnx_checkpoint(
             metric_prefix="ckpt_48900",

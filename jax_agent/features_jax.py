@@ -4,9 +4,9 @@
 
 设计原则：
 - 每颗我方星球独立对应一行决策（source）。
-- 每行决策包含：planet_features（星球自身）、relative_features（source-target 相对特征）、
+- 每行决策包含：self_features（自身）、candidate_features（全图目标 no-op + P 颗星球）、
   global_features（全局态势）、map_features（CNN 小地图）。
-- 特征维度：PLANET=26 / RELATIVE=8 / GLOBAL=11。
+- 特征维度与 PyTorch 版严格对齐：SELF=18 / CANDIDATE=26 / GLOBAL=11。
 - precompute_inbound 使用 60 步轨迹预测，支持旋转星球和彗星路径。
 - encode_batch: vmap over 单局；encode_single: vmap over 来源星球。
 """
@@ -34,17 +34,14 @@ from .fast_env import (
 )
 
 
-# 特征向量维度（JAX 主训练路径使用；修改时需要同步 model/normalizer/docs）
-PLANET_DIM = 26         # 星球局部特征维度
-RELATIVE_DIM = 8     # source-target 相对特征维度
+# 特征向量维度（与 PyTorch 版 src/features.py 严格对齐，修改时必须同步更新）
+SELF_DIM = 18         # 来源星球自身特征维度
+CANDIDATE_DIM = 26    # 单个目标候选星球特征维度
 GLOBAL_DIM = 11       # 全局局势特征维度
-FLEET_DIM = 28        # 单支舰队 token 特征维度
-MAX_FLEET_TOKENS = 32 # 每个 source 选择进入 Transformer 的舰队 token 数
-MAP_CHANNELS = 6      # CNN 小地图通道数（来源星/友方/敌方/中立/我方飞船强度/敌方飞船强度）
+MAP_CHANNELS = 6      # CNN 小地图通道数（来源星/友方/敌方/中立/友方舰队/敌方舰队）
 MAP_GRID_SIZE = 8     # CNN 小地图分辨率（8x8）
-INBOUND_HORIZON = 60.0  # 预测舰队未来 N 回合内命中的星球
+INBOUND_HORIZON = 60.0  # 预测舰队第局 N 回合内贫心星球
 MIN_LAUNCH = 10.0     # 最小发射船数：驻军不足此数时禁止全部档位
-LOCAL_PLANET_RADIUS = 25.0  # 局部星球密度统计半径
 SHIP_RATIOS = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtype=jnp.float32)  # 派兵比例档位
 
 
@@ -52,21 +49,16 @@ SHIP_RATIOS = jnp.asarray([0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00], dtyp
 class FeatureParams:
     """特征编码参数（编译时固定，安全传入 jit/vmap）。"""
     max_planets: int = 64         # 星球槽位数（应等于 EnvParams.max_planets）
-    ship_bucket_count: int = 8    # 派兵档位数量
+    ship_bucket_count: int = 8    # 派兵树位数量
     max_ships: float = 500.0      # 归一化基准船数上限
     max_production: float = 5.0   # 归一化基准生产力上限
     episode_steps: int = 500      # 归一化基准回合数
     target_filter_enabled: bool = False  # 是否启用 Proto-guided 目标过滤
     attack_top_k: int = 6         # 最多保留 K 个进攻候选
     defense_top_k: int = 3        # 最多保留 K 个防守/输送候选
-    target_attack_ships_pre_mask: bool = False
-    post_discard_attackable_check: bool = True
-    max_fleet_tokens: int = MAX_FLEET_TOKENS
-    fleet_selection: str = "size"  # size=大舰队优先；impact=2P-Improve 威胁/机会优先
 
     @classmethod
     def from_train_config(cls, cfg) -> "FeatureParams":
-        model_cfg = getattr(cfg, "model", None)
         return cls(
             max_planets=int(cfg.env.max_planets),
             ship_bucket_count=int(cfg.env.ship_bucket_count),
@@ -76,21 +68,12 @@ class FeatureParams:
             target_filter_enabled=bool(cfg.env.target_filter_enabled),
             attack_top_k=int(cfg.env.attack_top_k),
             defense_top_k=int(cfg.env.defense_top_k),
-            target_attack_ships_pre_mask=bool(getattr(cfg.env, "target_attack_ships_pre_mask", False)),
-            post_discard_attackable_check=bool(getattr(cfg.env, "post_discard_attackable_check", True)),
-            max_fleet_tokens=int(getattr(model_cfg, "max_fleet_tokens", MAX_FLEET_TOKENS)),
-            fleet_selection=str(getattr(model_cfg, "fleet_selection", "size")),
         )
 
 
 class EncodedBatch(NamedTuple):
-    """网络输入张量集合。
-
-    candidate_mask 控制目标选择，amount_mask 控制派兵档位，
-    source_mask 控制哪些星球可以作为发射来源。
-    """
-    planet_features: jnp.ndarray
-    relative_features: jnp.ndarray
+    self_features: jnp.ndarray
+    candidate_features: jnp.ndarray
     global_features: jnp.ndarray
     map_features: jnp.ndarray
     candidate_mask: jnp.ndarray
@@ -100,22 +83,17 @@ class EncodedBatch(NamedTuple):
     candidate_ids: jnp.ndarray
     ship_buckets: jnp.ndarray
     source_mask: jnp.ndarray
-    fleet_features: jnp.ndarray
-    fleet_mask: jnp.ndarray
 
 
 def target_count(params: FeatureParams) -> int:
-    """目标槽位数量：slot 0 是 no-op，后面是所有星球。"""
     return params.max_planets + 1
 
 
 def encode_batch(state: EnvState, params: FeatureParams) -> EncodedBatch:
-    """批量编码 EnvState，外层 batch 通过 vmap 并行。"""
     return jax.vmap(lambda s: encode_single(s, params))(state)
 
 
 def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
-    """编码单局棋盘，把每个星球位置都组织成一个候选 source 行。"""
     planets = state.planets
     alive = state.planet_alive
     owner = planets[:, 1].astype(jnp.int32)
@@ -125,15 +103,14 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
     source_ships = planets[:, 5]
     global_f = build_global_features(state, params)
     inbound = precompute_inbound(state, params)
-    fleet_f, fleet_m = build_fleet_features(state, params)
 
     def source_row(src_idx):
-        return build_source_decision(state, src_idx, global_f, inbound, fleet_f, fleet_m, params)
+        return build_source_decision(state, src_idx, global_f, inbound, params)
 
     rows = jax.vmap(source_row)(jnp.arange(params.max_planets))
     return EncodedBatch(
-        planet_features=rows.planet_features,
-        relative_features=rows.relative_features,
+        self_features=rows.self_features,
+        candidate_features=rows.candidate_features,
         global_features=rows.global_features,
         map_features=rows.map_features,
         candidate_mask=rows.candidate_mask,
@@ -143,28 +120,17 @@ def encode_single(state: EnvState, params: FeatureParams) -> EncodedBatch:
         candidate_ids=rows.candidate_ids,
         ship_buckets=rows.ship_buckets,
         source_mask=source_mask,
-        fleet_features=rows.fleet_features,
-        fleet_mask=rows.fleet_mask,
     )
 
 
-def build_source_decision(
-    state: EnvState,
-    src_idx: jnp.ndarray,
-    global_f: jnp.ndarray,
-    inbound: jnp.ndarray,
-    fleet_f: jnp.ndarray,
-    fleet_m: jnp.ndarray,
-    params: FeatureParams,
-) -> EncodedBatch:
-    """构造某个 source 星球对应的一行决策输入。"""
+def build_source_decision(state: EnvState, src_idx: jnp.ndarray, global_f: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams) -> EncodedBatch:
     src = state.planets[src_idx]
-    planet_f = build_planet_features(state, src_idx, inbound, params)
-    rel_f, cand_mask, amount_mask, candidate_ids, ship_buckets = build_relative_features(state, src_idx, inbound, params)
+    self_f = build_self_features(state, src_idx, inbound, params)
+    cand_f, cand_mask, amount_mask, candidate_ids, ship_buckets = build_candidate_features(state, src_idx, inbound, params)
     map_f = build_map_features(state, src_idx, params)
     return EncodedBatch(
-        planet_features=planet_f,
-        relative_features=rel_f,
+        self_features=self_f,
+        candidate_features=cand_f,
         global_features=global_f,
         map_features=map_f,
         candidate_mask=cand_mask,
@@ -174,58 +140,50 @@ def build_source_decision(
         candidate_ids=candidate_ids,
         ship_buckets=ship_buckets,
         source_mask=(src[1].astype(jnp.int32) == 0) & state.planet_alive[src_idx],
-        fleet_features=fleet_f,
-        fleet_mask=fleet_m,
     )
 
 
-def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
-    """构建星球局部特征（PLANET_DIM=26）。
+def build_self_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
+    """构建来源星球的自身特征（SELF_DIM=18）。
 
     各维语义（与 FEATURES.md 对应）：
       0: is_planet=1.0（占位）
-      1: is_alive
-      2-4: is_neutral / is_mine / is_enemy
-      5-6: x/y 归一化坐标
-      7: radius / 5
-      8: ships / max_ships (clamp)
-      9: production / max_production
-      10-12: is_static / is_rotating_planet / is_comet_planet
-      13: 到太阳距离 / board_size
-      14-16: 最近我方/敌方/中立星球距离 / board_size
-      17-19: R=25 内我方/敌方/中立星球数量 / max_planets
-      20-25: inbound[src] = (my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean)
+      1-2: x/y 归一化坐标
+      3: radius / 5
+      4: ships / max_ships (clamp)
+      5: production / max_production
+      6: is_rotating (0/1)
+      7: 到太阳距离 / board_size
+      8-9: 我方/敌方星球数 / max_planets
+      10: 我方星球总船归一化
+      11: （敌方舰队船 - 我方舰队船）归一化
+      12-17: inbound[src] = (my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean)
     """
     src = state.planets[src_idx]
-    alive = state.planet_alive[src_idx]
-    owner = src[1].astype(jnp.int32)
-    is_comet = comet_planet_mask(state)[src_idx]
-    is_rotating_planet = (is_rotating(src) > 0.5) & (~is_comet)
-    is_static_planet = alive & (~is_rotating_planet) & (~is_comet)
-    topo = planet_local_topology_features(state, src_idx, params)
+    planets = state.planets
+    alive = state.planet_alive
+    owner = planets[:, 1].astype(jnp.int32)
+    my_planets = alive & (owner == 0)
+    enemy_planets = alive & (owner == 1)
+    my_fleets = state.fleet_alive & (state.fleets[:, 1].astype(jnp.int32) == 0)
+    enemy_fleets = state.fleet_alive & (state.fleets[:, 1].astype(jnp.int32) == 1)
+    # 敌方舰队假威减我方：正表示我方适应默防压力
+    fleet_delta = jnp.where(enemy_fleets, state.fleets[:, 6], 0.0).sum() - jnp.where(my_fleets, state.fleets[:, 6], 0.0).sum()
     inb = inbound[src_idx]  # 预测的到达该星球的舰队信息
     return jnp.asarray(
         [
             1.0,
-            alive.astype(jnp.float32),
-            (owner == -1).astype(jnp.float32),
-            (owner == 0).astype(jnp.float32),
-            (owner == 1).astype(jnp.float32),
             src[2] / BOARD_SIZE,
             src[3] / BOARD_SIZE,
             src[4] / 5.0,
             clip01(src[5] / params.max_ships),
             src[6] / params.max_production,
-            is_static_planet.astype(jnp.float32),
-            is_rotating_planet.astype(jnp.float32),
-            is_comet.astype(jnp.float32),
+            is_rotating(src),
             distance_to_sun(src) / BOARD_SIZE,
-            topo[0],
-            topo[1],
-            topo[2],
-            topo[3],
-            topo[4],
-            topo[5],
+            my_planets.sum() / params.max_planets,
+            enemy_planets.sum() / params.max_planets,
+            jnp.where(my_planets, planets[:, 5], 0.0).sum() / (params.max_planets * params.max_ships),
+            fleet_delta / (params.max_planets * params.max_ships),
             clip01(inb[0] / params.max_ships),
             clip01(inb[1] / params.max_ships),
             inb[2],
@@ -237,50 +195,13 @@ def build_planet_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.nd
     )
 
 
-def planet_local_topology_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
-    """统计 source 周围的最近距离和局部星球密度。"""
-    planets = state.planets
-    src = planets[src_idx]
-    alive = state.planet_alive
-    owner = planets[:, 1].astype(jnp.int32)
-    not_self = jnp.arange(params.max_planets) != src_idx
-    valid = alive & not_self
-    dx = planets[:, 2] - src[2]
-    dy = planets[:, 3] - src[3]
-    dist = jnp.sqrt(dx * dx + dy * dy)
+def build_candidate_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams):
+    """构建全图目标候选特征、mask 和派兵档位（CANDIDATE_DIM=26）。
 
-    my_mask = valid & (owner == 0)
-    enemy_mask = valid & (owner == 1)
-    neutral_mask = valid & (owner == -1)
-
-    def nearest(mask):
-        any_mask = mask.any()
-        nearest_dist = jnp.where(mask, dist, 1.0e9).min()
-        return jnp.where(any_mask, nearest_dist / BOARD_SIZE, 1.0)
-
-    def count_in_radius(mask):
-        return (mask & (dist <= LOCAL_PLANET_RADIUS)).sum() / params.max_planets
-
-    return jnp.asarray(
-        [
-            nearest(my_mask),
-            nearest(enemy_mask),
-            nearest(neutral_mask),
-            count_in_radius(my_mask),
-            count_in_radius(enemy_mask),
-            count_in_radius(neutral_mask),
-        ],
-        dtype=jnp.float32,
-    )
-
-
-def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.ndarray, params: FeatureParams):
-    """构建 source-target 相对特征、mask 和派兵档位（RELATIVE_DIM=8）。
-
-    返回：(relative_features[P+1, 8], candidate_mask[P+1], amount_mask[P+1, B], candidate_ids[P+1], ship_buckets[B])
+    返回：(features[P+1, 26], candidate_mask[P+1], amount_mask[P+1, B], candidate_ids[P+1], ship_buckets[B])
     - slot 0 固定为 no-op（不发射）
     - slot 1..P 对应所有星球（包括来源星球自身，不过 mask=False）
-    amount mask 只负责约束正数派兵；是否值得以少打多交给策略和奖励学习。
+    攻击/中立必须发超过驻军的船，进攻组 amount mask 只开放足够多的档位。
     """
     src = state.planets[src_idx]
     planets = state.planets
@@ -293,7 +214,8 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     max_bucket = jnp.maximum(ship_buckets.max(), 1.0)
     spd_max = fleet_speed(max_bucket)  # 最大档位对应的舰队速度，用于 eta 归一化
 
-    noop_features = jnp.zeros((1, RELATIVE_DIM), dtype=jnp.float32)
+    # slot 0：no-op，dim0=1 表示 is_noop，其余继续置 0
+    noop_features = jnp.zeros((1, CANDIDATE_DIM), dtype=jnp.float32).at[0, 0].set(1.0)
     src_x = src[2]
     src_y = src[3]
     dx = planets[:, 2] - src_x
@@ -304,34 +226,50 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
     is_neutral = owner == -1
     is_friend = (owner == 0) & (~is_source)
     is_enemy = owner == 1
+    is_comet = comet_planet_mask(state)
     proto = proto_score(src, planets) / 100.0          # Proto-V15 目标评分
     eta_max = dist / jnp.maximum(spd_max, 1e-6) / INBOUND_HORIZON  # 最快到达时间归一化
     defense_pressure = compute_defense_pressure(planets, inbound)  # 是否需要增援
-    rel = jnp.stack(
+    cand = jnp.stack(
         [
+            jnp.zeros_like(dist),
+            alive.astype(jnp.float32),
             is_source.astype(jnp.float32),
+            is_neutral.astype(jnp.float32),
+            is_friend.astype(jnp.float32),
+            is_enemy.astype(jnp.float32),
+            planets[:, 2] / BOARD_SIZE,
+            planets[:, 3] / BOARD_SIZE,
             dx / BOARD_SIZE,
             dy / BOARD_SIZE,
             dist / BOARD_SIZE,
+            planets[:, 4] / 5.0,
+            clip01(planets[:, 5] / params.max_ships),
+            planets[:, 6] / params.max_production,
+            jax.vmap(is_rotating)(planets),
+            is_comet.astype(jnp.float32),
             clip01((planets[:, 5] + 1.0) / jnp.maximum(src[5], 1.0)),
             clip01(src[5] / params.max_ships) * jnp.ones_like(dist),
+            clip01(inbound[:, 0] / params.max_ships),
+            clip01(inbound[:, 1] / params.max_ships),
+            inbound[:, 2],
+            inbound[:, 3],
+            inbound[:, 4],
+            inbound[:, 5],
             proto,
             eta_max,
         ],
         axis=-1,
     )
-    relative_features = jnp.concatenate([noop_features, rel], axis=0)
+    features = jnp.concatenate([noop_features, cand], axis=0)
 
-    # target head 阶段默认只做静态目标合法性剪枝：
-    # - 目标必须存活且不能是 source 自身；
-    # - 所有非 source 的友方/敌方/中立星球都可作为候选。
-    # 旧 target-mask checkpoint 使用攻击船数优势 pre-mask，续训时可通过配置恢复。
-    attackable_by_ships = src[5] > planets[:, 5]
-    attack_valid = jnp.where(params.target_attack_ships_pre_mask, attackable_by_ships, jnp.ones_like(alive, dtype=bool))
-    target_valid = alive & (~is_source) & (is_friend | ((is_enemy | is_neutral) & attack_valid))
+    # 候选星球合法性 mask：必须存活、不是自身、来源有足够船、存在合法档位
+    can_send = alive & (~is_source) & (src[5] >= MIN_LAUNCH) & valid_buckets.any()
     positive_amount = valid_buckets
-    per_planet_amount = jnp.broadcast_to(positive_amount[None, :], (params.max_planets, params.ship_bucket_count))
-    per_planet_mask = target_valid
+    # 进攻明星时只开放能压制驻军的派兵档位；增援友方时任意正数均可
+    enough = ship_buckets[None, :] > planets[:, 5:6]
+    per_planet_amount = jnp.where(is_friend[:, None], positive_amount[None, :], enough & positive_amount[None, :])
+    per_planet_mask = can_send & per_planet_amount.any(axis=-1)
     # slot 0 永远可选（no-op）
     mask = jnp.concatenate([jnp.asarray([True]), per_planet_mask])
     amount_mask = jnp.concatenate([jnp.ones((1, params.ship_bucket_count), dtype=bool), per_planet_amount], axis=0)
@@ -341,7 +279,7 @@ def build_relative_features(state: EnvState, src_idx: jnp.ndarray, inbound: jnp.
         mask = apply_target_filter(mask, is_friend, is_enemy | is_neutral, proto, defense_pressure, params)
         amount_mask = amount_mask & mask[:, None]
         amount_mask = amount_mask.at[0, :].set(True)
-    return relative_features, mask, amount_mask, candidate_ids, ship_buckets
+    return features, mask, amount_mask, candidate_ids, ship_buckets
 
 
 def apply_target_filter(
@@ -352,7 +290,7 @@ def apply_target_filter(
     defense_pressure: jnp.ndarray,
     params: FeatureParams,
 ) -> jnp.ndarray:
-    """可选目标过滤：保留 no-op、评分最高的进攻目标和最需要防守的友方目标。"""
+    """Mirror Python target_filter: no-op + top proto attacks + top defense friends."""
 
     planet_mask = mask[1:]
     keep_planets = jnp.zeros((params.max_planets,), dtype=bool)
@@ -370,7 +308,6 @@ def apply_target_filter(
 
 
 def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray:
-    """构建全局态势特征，给 decoder/critic 提供局面摘要。"""
     planets = state.planets
     alive = state.planet_alive
     owner = planets[:, 1].astype(jnp.int32)
@@ -398,18 +335,22 @@ def build_global_features(state: EnvState, params: FeatureParams) -> jnp.ndarray
     )
 
 
-def predict_fleet_targets(state: EnvState, horizon: int = int(INBOUND_HORIZON)) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """预测每支舰队在前瞻窗口内第一个会撞到的星球。
+def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
+    """JAX port of src.features.precompute_inbound for planet/fleet arrays.
 
-    返回：
-      target_idx: [F] 星球槽位下标，只有 target_valid=True 时有意义。
-      target_valid: [F] 该舰队是否会在 horizon 内撞到存活星球。
-      target_t: [F] 第一次命中的整数回合，用浮点数表示。
+    Returns [P, 6]:
+      my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean
+
+    This mirrors the Python feature path for regular/rotating planets and
+    comet path lookup by path_index + T.
     """
+
+    horizon = int(INBOUND_HORIZON)
     fleets = state.fleets
     planets = state.planets
     f_alive = state.fleet_alive
     p_alive = state.planet_alive
+    fleet_count = fleets.shape[0]
     planet_count = planets.shape[0]
 
     ts = jnp.arange(horizon + 1, dtype=jnp.float32)
@@ -471,23 +412,6 @@ def predict_fleet_targets(state: EnvState, horizon: int = int(INBOUND_HORIZON)) 
     fleet_target = first_key_fp.argmin(axis=1)
     fleet_valid = fleet_first_key < large_key
     fleet_first_t = (fleet_first_key // 2).astype(jnp.float32)
-    fleet_target = jnp.clip(fleet_target, 0, planet_count - 1)
-    return fleet_target, fleet_valid, fleet_first_t
-
-
-def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
-    """预估未来一段时间内每个星球会收到的我方/敌方舰队压力。
-
-    返回 [P, 6]：
-      my_ships, enemy_ships, my_eta_min, my_eta_mean, enemy_eta_min, enemy_eta_mean。
-    普通星球、旋转星球和彗星都按 fast_env 的轨迹规则查表或预测。
-    """
-
-    fleets = state.fleets
-    planets = state.planets
-    p_alive = state.planet_alive
-    planet_count = planets.shape[0]
-    fleet_target, fleet_valid, fleet_first_t = predict_fleet_targets(state)
     target_onehot = jax.nn.one_hot(fleet_target, planet_count, dtype=jnp.float32)
     selected = target_onehot * fleet_valid[:, None].astype(jnp.float32)
     owner = fleets[:, 1].astype(jnp.int32)
@@ -496,7 +420,7 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
 
     my_ships = (my_sel * fleets[:, 6:7]).sum(axis=0)
     enemy_ships = (enemy_sel * fleets[:, 6:7]).sum(axis=0)
-    norm = INBOUND_HORIZON
+    norm = float(horizon)
     my_count = my_sel.sum(axis=0)
     enemy_count = enemy_sel.sum(axis=0)
     t = fleet_first_t[:, None]
@@ -555,133 +479,7 @@ def compute_defense_pressure(planets: jnp.ndarray, inbound: jnp.ndarray) -> jnp.
     return jnp.where(enemy_inbound > 0.0, enemy_inbound - projected_defense, 0.0)
 
 
-def build_fleet_features(state: EnvState, params: FeatureParams) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """构建单局 top-K 舰队 token，用于 Transformer 编码。"""
-    fleets = state.fleets
-    alive = state.fleet_alive
-    fleet_target, fleet_target_valid, fleet_target_t = predict_fleet_targets(state)
-    dist_center = jnp.sqrt((fleets[:, 2] - CENTER) ** 2 + (fleets[:, 3] - CENTER) ** 2)
-    if params.fleet_selection == "impact":
-        score = fleet_impact_score(state, params, fleet_target, fleet_target_valid, fleet_target_t, dist_center)
-    else:
-        score = jnp.where(alive, -fleets[:, 6] + 0.01 * dist_center, jnp.inf)
-    order = jnp.argsort(score)[: params.max_fleet_tokens]
-    sel = fleets[order]
-    sel_alive = alive[order]
-    owner = sel[:, 1].astype(jnp.int32)
-    from_id = sel[:, 5].astype(jnp.int32)
-    planet_match = (state.planets[:, None, 0].astype(jnp.int32) == from_id[None, :]) & state.planet_alive[:, None]
-    from_slot = jnp.argmax(planet_match, axis=0)
-    has_from = planet_match.any(axis=0)
-    from_planets = state.planets[from_slot]
-    speed = fleet_speed(jnp.maximum(sel[:, 6], 1.0))
-    target_idx = fleet_target[order]
-    target_valid = sel_alive & fleet_target_valid[order]
-    target_planets = state.planets[target_idx]
-    target_owner = target_planets[:, 1].astype(jnp.int32)
-    target_dx = target_planets[:, 2] - sel[:, 2]
-    target_dy = target_planets[:, 3] - sel[:, 3]
-    target_dist = jnp.sqrt(target_dx * target_dx + target_dy * target_dy)
-    target_eta = fleet_target_t[order] / INBOUND_HORIZON
-
-    planet_owner = state.planets[:, 1].astype(jnp.int32)
-    planet_alive = state.planet_alive
-    dx_planet = state.planets[:, None, 2] - sel[None, :, 2]
-    dy_planet = state.planets[:, None, 3] - sel[None, :, 3]
-    dist_planet = jnp.sqrt(dx_planet * dx_planet + dy_planet * dy_planet)
-
-    def nearest_dist(mask):
-        d = jnp.where(mask[:, None], dist_planet, jnp.inf).min(axis=0)
-        return jnp.where(jnp.isfinite(d), d / BOARD_SIZE, 1.0)
-
-    dist_from_origin = jnp.sqrt((sel[:, 2] - from_planets[:, 2]) ** 2 + (sel[:, 3] - from_planets[:, 3]) ** 2)
-    launch_offset = from_planets[:, 4] + 0.1
-    launch_age = jnp.maximum(dist_from_origin - launch_offset, 0.0) / jnp.maximum(speed, 1e-6)
-    features = jnp.stack(
-        [
-            (owner == 0).astype(jnp.float32),
-            sel[:, 2] / BOARD_SIZE,
-            sel[:, 3] / BOARD_SIZE,
-            jnp.cos(sel[:, 4]),
-            jnp.sin(sel[:, 4]),
-            clip01(sel[:, 6] / params.max_ships),
-            speed / 6.0,
-            clip01(launch_age / params.episode_steps),
-            jnp.where(has_from, from_planets[:, 2] / BOARD_SIZE, 0.0),
-            jnp.where(has_from, from_planets[:, 3] / BOARD_SIZE, 0.0),
-            (has_from & (from_planets[:, 1].astype(jnp.int32) == 0)).astype(jnp.float32),
-            jnp.where(has_from, clip01(from_planets[:, 5] / params.max_ships), 0.0),
-            jnp.where(has_from, dist_from_origin / BOARD_SIZE, 0.0),
-            nearest_dist(planet_alive & (planet_owner == 1)),
-            nearest_dist(planet_alive & (planet_owner == -1)),
-            nearest_dist(planet_alive & (planet_owner == 0)),
-            target_valid.astype(jnp.float32),
-            (target_valid & (target_owner == 0)).astype(jnp.float32),
-            (target_valid & (target_owner == 1)).astype(jnp.float32),
-            (target_valid & (target_owner == -1)).astype(jnp.float32),
-            jnp.where(target_valid, target_planets[:, 2] / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_planets[:, 3] / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, clip01(target_planets[:, 5] / params.max_ships), 0.0),
-            jnp.where(target_valid, target_planets[:, 6] / params.max_production, 0.0),
-            jnp.where(target_valid, target_dx / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_dy / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_dist / BOARD_SIZE, 0.0),
-            jnp.where(target_valid, target_eta, 0.0),
-        ],
-        axis=-1,
-    )
-    return jnp.where(sel_alive[:, None], features, 0.0), sel_alive
-
-
-def fleet_impact_score(
-    state: EnvState,
-    params: FeatureParams,
-    fleet_target: jnp.ndarray,
-    fleet_target_valid: jnp.ndarray,
-    fleet_target_t: jnp.ndarray,
-    dist_center: jnp.ndarray,
-) -> jnp.ndarray:
-    """2P-Improve fleet top-K：优先保留威胁、进攻机会、紧迫 ETA 和高价值目标。"""
-
-    fleets = state.fleets
-    alive = state.fleet_alive
-    owner = fleets[:, 1].astype(jnp.int32)
-    safe_target = jnp.clip(fleet_target, 0, state.planets.shape[0] - 1)
-    target_planets = state.planets[safe_target]
-    target_owner = target_planets[:, 1].astype(jnp.int32)
-    target_valid = alive & fleet_target_valid
-
-    target_is_mine = target_valid & (target_owner == 0)
-    target_is_enemy = target_valid & (target_owner == 1)
-    target_is_neutral = target_valid & (target_owner == -1)
-    is_my_fleet = owner == 0
-    is_enemy_fleet = owner == 1
-
-    eta_norm = jnp.clip(fleet_target_t / INBOUND_HORIZON, 0.0, 1.0)
-    urgency = jnp.where(target_valid, 1.0 - eta_norm, 0.0)
-    ships_norm = clip01(fleets[:, 6] / params.max_ships)
-    target_prod_norm = jnp.where(target_valid, target_planets[:, 6] / params.max_production, 0.0)
-    target_ships_norm = jnp.where(target_valid, clip01(target_planets[:, 5] / params.max_ships), 0.0)
-
-    enemy_to_my = is_enemy_fleet & target_is_mine
-    my_to_attack = is_my_fleet & (target_is_enemy | target_is_neutral)
-    enemy_to_neutral = is_enemy_fleet & target_is_neutral
-    my_reinforce = is_my_fleet & target_is_mine
-    importance = (
-        3.0 * enemy_to_my.astype(jnp.float32)
-        + 1.6 * my_to_attack.astype(jnp.float32)
-        + 0.8 * enemy_to_neutral.astype(jnp.float32)
-        + 0.7 * my_reinforce.astype(jnp.float32)
-        + 1.2 * urgency
-        + 1.0 * ships_norm
-        + 0.8 * target_prod_norm
-        + 0.4 * target_ships_norm
-    )
-    return jnp.where(alive, -importance + 1.0e-4 * dist_center / BOARD_SIZE, jnp.inf)
-
-
 def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
-    """构建 source 周围的 8x8 小地图，作为 src head 的局部空间提示。"""
     grid = jnp.zeros((MAP_CHANNELS, MAP_GRID_SIZE, MAP_GRID_SIZE), dtype=jnp.float32)
     planets = state.planets
     owner = planets[:, 1].astype(jnp.int32)
@@ -689,9 +487,9 @@ def build_map_features(state: EnvState, src_idx: jnp.ndarray, params: FeaturePar
     channels = jnp.where(idx == src_idx, 0, jnp.where(owner == 0, 1, jnp.where(owner == -1, 3, 2)))
     values = state.planet_alive.astype(jnp.float32)
     grid = _accum_many(grid, channels, planets[:, 2], planets[:, 3], values)
-    ship_channels = jnp.where(state.fleets[:, 1].astype(jnp.int32) == 0, 4, 5)
-    ship_values = clip01(state.fleets[:, 6] / params.max_ships) * state.fleet_alive.astype(jnp.float32)
-    return _accum_many(grid, ship_channels, state.fleets[:, 2], state.fleets[:, 3], ship_values)
+    f_channels = jnp.where(state.fleets[:, 1].astype(jnp.int32) == 0, 4, 5)
+    f_values = clip01(state.fleets[:, 6] / params.max_ships) * state.fleet_alive.astype(jnp.float32)
+    return _accum_many(grid, f_channels, state.fleets[:, 2], state.fleets[:, 3], f_values)
 
 
 def _accum_many(grid, channels, x, y, values):
@@ -703,7 +501,6 @@ def _accum_many(grid, channels, x, y, values):
 
 
 def build_ship_buckets(src_ships: jnp.ndarray, params: FeatureParams) -> jnp.ndarray:
-    """按当前 source 船数生成可选派兵档位；不足最小发射数则全为 0。"""
     ratios = SHIP_RATIOS[: params.ship_bucket_count]
     s = jnp.floor(src_ships)
     raw = jnp.clip(jnp.round(s * ratios), MIN_LAUNCH, s)
@@ -735,14 +532,14 @@ def clip01(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def flatten_sources(encoded: EncodedBatch) -> EncodedBatch:
-    b, p = encoded.planet_features.shape[:2]
+    b, p = encoded.self_features.shape[:2]
 
     def flat(x):
         return x.reshape((b * p,) + x.shape[2:])
 
     return EncodedBatch(
-        planet_features=flat(encoded.planet_features),
-        relative_features=flat(encoded.relative_features),
+        self_features=flat(encoded.self_features),
+        candidate_features=flat(encoded.candidate_features),
         global_features=flat(encoded.global_features),
         map_features=flat(encoded.map_features),
         candidate_mask=flat(encoded.candidate_mask),
@@ -752,8 +549,6 @@ def flatten_sources(encoded: EncodedBatch) -> EncodedBatch:
         candidate_ids=flat(encoded.candidate_ids),
         ship_buckets=flat(encoded.ship_buckets),
         source_mask=flat(encoded.source_mask),
-        fleet_features=flat(encoded.fleet_features),
-        fleet_mask=flat(encoded.fleet_mask),
     )
 
 

@@ -1,4 +1,4 @@
-# 4090/4090D 24GB training config for the V1 autoregressive actor.
+# 4090/4090D 24GB training config for the per-planet ActorCritic actor.
 #
 # Launch:
 #   python -m jax_agent.train_jax --config cfg_jax_RL_1.yaml
@@ -40,16 +40,10 @@ reward:
   step_clip: 0.0
 
 model:
-  actor_type: autoregressive
+  actor_type: per_planet
   hidden_size: 128
   use_cnn: true
-  use_transformer: true
-  num_transformer_layers: 2
-  num_heads: 4
-  max_fleet_tokens: 16
-  fleet_selection: size
-  max_action_tokens: 12
-  end_bias_init: -3.0
+  use_transformer: false
 
 state_norm:
   enabled: true
@@ -103,9 +97,9 @@ wandb:
   enabled: true
   project: "orbit-wars-rl"
   mode: "online"
-  group: "autoregressive-4090"
+  group: "per-planet-4090"
   tags:
-    - autoregressive
-    - v1
+    - per-planet
+    - torch-agent-style
     - fixed_pool
     - rtx4090

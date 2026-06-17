@@ -16,6 +16,9 @@
 | [系统架构](System-Architecture.md) | 本地赛事平台前后端架构全图 |
 | [Agent 全览](Agent-Zoo.md) | 11 个 Agent 横向对比与策略解析 |
 | [RL Agent 设计](RL-Agent.md) | PPO 强化学习 Agent 的特征、网络与训练 |
+| [Behavioral Cloning 训练要点](BC-Training-Notes.md) | 基于强 replay 做监督学习预训练的原则、标签、loss 与避坑 |
+| [Kaggle BC 讨论帖中文翻译](BC-Discussion-Translation.md) | 用户提供的 BC / imitation learning 讨论帖原文翻译 |
+| [模仿学习落地计划](Imitation-Learning-Plan.md) | 从 replay 数据集到 BC checkpoint，再接 PPO/self-play 的实施路线 |
 | [开发指南](Development-Guide.md) | 环境搭建、快速启动、自定义 Agent |
 | [评估与排行榜](Evaluation.md) | TrueSkill 评分、本地锦标赛、提交流程 |
 

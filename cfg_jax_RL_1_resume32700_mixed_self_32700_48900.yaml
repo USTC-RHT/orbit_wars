@@ -1,20 +1,20 @@
-# Resume target-mask post-discard training from the fixed_pool_with_tgtmask-0526
-# ckpt_032700 checkpoint. Opponents are sampled uniformly from:
-# current self-play, ckpt_032700, ckpt_048900.
+# Per-planet ActorCritic config after switching jax_agent back to the
+# torch-agent-style fire/target/amount architecture. The old autoregressive
+# ckpt_032700/ckpt_048900 checkpoints are not shape-compatible with this model.
 #
 # Launch:
 #   PYTHONPATH=. python -m jax_agent.train_jax --config cfg_jax_RL_1_resume32700_mixed_self_32700_48900.yaml
 
 seed: 42
-run_name: "fixed_pool_tgtmask_post_discard-resume32700-0617"
+run_name: "perplanet_actorcritic-0617"
 device: auto
 save_dir: outputs
 checkpoint_every: 500
 log_every: 1
 opponent: "pool"
 
-init_from_checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
-start_update_from_checkpoint: true
+init_from_checkpoint:
+start_update_from_checkpoint: false
 
 env:
   board_size: 100.0
@@ -45,16 +45,10 @@ reward:
   step_clip: 0.0
 
 model:
-  actor_type: autoregressive
+  actor_type: per_planet
   hidden_size: 128
   use_cnn: true
-  use_transformer: true
-  num_transformer_layers: 2
-  num_heads: 4
-  max_fleet_tokens: 16
-  fleet_selection: size
-  max_action_tokens: 12
-  end_bias_init: -3.0
+  use_transformer: false
 
 state_norm:
   enabled: true
@@ -93,16 +87,6 @@ opponent_pool:
   - name: self
     type: self
     weight: 1.0
-  - name: ckpt_32700
-    type: jax_checkpoint
-    weight: 1.0
-    checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_032700.pkl
-    opponent_feature_mode: legacy_target_mask
-  - name: ckpt_48900
-    type: jax_checkpoint
-    weight: 1.0
-    checkpoint: checkpoints/fixed_pool_with_tgtmask-0526_jax/ckpt_048900.pkl
-    opponent_feature_mode: legacy_target_mask
 
 eval:
   enabled: true
@@ -112,16 +96,16 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["ckpt_32700", "ckpt_48900"]
+  opponents: ["nearest", "sigma", "tamrazov"]
 
 wandb:
   enabled: true
   project: "orbit-wars-rl"
   mode: "online"
-  group: "autoregressive-4090"
+  group: "per-planet-4090"
   tags:
-    - autoregressive
-    - v1
+    - per-planet
+    - torch-agent-style
     - target-mask-post-discard
     - resume32700
     - mixed-self-32700-48900

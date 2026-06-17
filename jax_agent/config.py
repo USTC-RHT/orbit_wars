@@ -1,4 +1,4 @@
-"""JAX 自回归训练的配置 dataclass 和 YAML 加载工具。"""
+"""JAX per-planet actor-critic training config and YAML loader."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ class ModelConfig:
     hidden_size: int = 128
     use_cnn: bool = False
     use_transformer: bool = False
-    actor_type: str = "autoregressive"
+    actor_type: str = "per_planet"
     max_action_tokens: int = 16
     end_bias_init: float = -2.0
     num_transformer_layers: int = 2

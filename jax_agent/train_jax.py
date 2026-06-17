@@ -569,8 +569,8 @@ def main() -> None:
     )
     normalizer_state = init_normalizer()
 
-    def deterministic_policy_actions(ts, st, fp, ns, np):  # noqa: E501
-        return auto_deterministic_policy_actions(ts, model, st, fp, ns, np)
+    def deterministic_policy_actions(ts, st, fp, ns, np, policy_model=None):  # noqa: E501
+        return auto_deterministic_policy_actions(ts, policy_model or model, st, fp, ns, np)
 
     start_update = 1
 

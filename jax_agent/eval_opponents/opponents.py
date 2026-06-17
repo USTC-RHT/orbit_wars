@@ -15,11 +15,47 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..features_jax import FLEET_DIM
 from ..fast_env import EnvParams, EnvState, step_batch
+from ..model_jax import AutoregressiveActorCritic
 
 
 EvalResult = dict[str, float | int]
 _AGENT_LOCAL_PACKAGES = ("jax_agent", "orbit_lite", "flatbuffers")
+
+
+def _cfg_get(root: Any, *path: str, default: Any = None) -> Any:
+    value = root
+    for name in path:
+        if value is None:
+            return default
+        if isinstance(value, dict):
+            value = value.get(name, default)
+        else:
+            value = getattr(value, name, default)
+    return value
+
+
+def _checkpoint_model(ctx: "EvalContext", ckpt: dict[str, Any]):
+    cfg = ckpt.get("cfg", ckpt.get("config"))
+    model_cfg = _cfg_get(cfg, "model")
+    if model_cfg is None:
+        return ctx.model
+    return AutoregressiveActorCritic(
+        planet_dim=int(getattr(ctx.model, "planet_dim")),
+        relative_dim=int(getattr(ctx.model, "relative_dim")),
+        global_dim=int(getattr(ctx.model, "global_dim")),
+        relative_count=int(getattr(ctx.model, "relative_count")),
+        ship_bucket_count=int(getattr(ctx.model, "ship_bucket_count")),
+        hidden_size=int(_cfg_get(model_cfg, "hidden_size", default=getattr(ctx.model, "hidden_size", 128))),
+        use_cnn=bool(_cfg_get(model_cfg, "use_cnn", default=getattr(ctx.model, "use_cnn", False))),
+        fleet_dim=int(getattr(ctx.model, "fleet_dim", FLEET_DIM)),
+        max_fleet_tokens=int(_cfg_get(model_cfg, "max_fleet_tokens", default=getattr(ctx.model, "max_fleet_tokens", 32))),
+        num_transformer_layers=int(_cfg_get(model_cfg, "num_transformer_layers", default=getattr(ctx.model, "num_transformer_layers", 2))),
+        num_heads=int(_cfg_get(model_cfg, "num_heads", default=getattr(ctx.model, "num_heads", 4))),
+        max_action_tokens=int(_cfg_get(model_cfg, "max_action_tokens", default=getattr(ctx.model, "max_action_tokens", 16))),
+        end_bias_init=float(_cfg_get(model_cfg, "end_bias_init", default=getattr(ctx.model, "end_bias_init", -2.0))),
+    )
 
 
 def _local_package_roots(agent_dir: Path) -> dict[str, Path]:
@@ -254,7 +290,8 @@ class JaxCheckpointEvalOpponent:
         with self.checkpoint_path.open("rb") as f:
             ckpt = pickle.load(f)
         opp_params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
-        opp_train_state = ctx.train_state.replace(params=opp_params)
+        opp_model = _checkpoint_model(ctx, ckpt)
+        opp_train_state = ctx.train_state.replace(apply_fn=opp_model.apply, params=opp_params)
         opp_normalizer_state = jax.tree_util.tree_map(
             jnp.asarray,
             ckpt.get("normalizer_state", ctx.normalizer_state),
@@ -282,6 +319,7 @@ class JaxCheckpointEvalOpponent:
                     ctx.feat_params,
                     opp_normalizer_state,
                     ctx.norm_params,
+                    opp_model,
                 )
                 joint = jnp.stack([opp_acts, learner_acts], axis=1)
             else:
@@ -299,6 +337,7 @@ class JaxCheckpointEvalOpponent:
                     ctx.feat_params,
                     opp_normalizer_state,
                     ctx.norm_params,
+                    opp_model,
                 )
                 opp_acts = ctx.flip_actions(opp_acts)
                 joint = jnp.stack([learner_acts, opp_acts], axis=1)

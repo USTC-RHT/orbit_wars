@@ -576,8 +576,22 @@ def main() -> None:
                     )
                     continue
 
-                replay_meta = replay_metadata(replay, row)
-                board_rows, stats = process_replay(replay, env_params, args)
+                try:
+                    replay_meta = replay_metadata(replay, row)
+                    board_rows, stats = process_replay(replay, env_params, args)
+                except Exception as exc:
+                    append_jsonl(
+                        replay_audit,
+                        {
+                            "event": "replay_error",
+                            "stage": "process_replay",
+                            "time": time.time(),
+                            "row": row,
+                            "rewards": replay.get("rewards") if isinstance(replay, dict) else None,
+                            "error": repr(exc),
+                        },
+                    )
+                    continue
                 for key, value in stats.items():
                     if key == "rows":
                         total["board_rows"] += int(value)

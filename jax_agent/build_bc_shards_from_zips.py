@@ -691,7 +691,23 @@ def main() -> None:
                         },
                     )
                     continue
-                replay_rows, stats = process_replay(replay, params, args)
+                try:
+                    replay_rows, stats = process_replay(replay, params, args)
+                except Exception as exc:
+                    append_jsonl(
+                        replay_audit,
+                        {
+                            "event": "replay_error",
+                            "stage": "process_replay",
+                            "time": time.time(),
+                            "zip_path": zip_path,
+                            "json_name": row.get("json_name"),
+                            "episode_id": row.get("episode_id"),
+                            "rewards": replay.get("rewards") if isinstance(replay, dict) else None,
+                            "error": repr(exc),
+                        },
+                    )
+                    continue
                 for key, value in stats.items():
                     if key == "rows":
                         continue

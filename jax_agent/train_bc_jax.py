@@ -17,7 +17,7 @@ import pickle
 import sys
 import time
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Mapping, NamedTuple
 
 import flax.linen as nn
 import jax
@@ -33,6 +33,24 @@ if str(REPO_ROOT) not in sys.path:
 
 
 NEG_INF = -1.0e9
+TRAIN_ARRAY_KEYS = (
+    "feature__fight_planet",
+    "feature__fight_relative",
+    "feature__global",
+    "feature__map",
+    "feature__candidate_mask",
+    "feature__amount_mask",
+    "label__fire",
+    "label__target",
+    "label__amount",
+)
+NORMALIZER_ARRAY_KEYS = (
+    "feature__fight_planet",
+    "feature__fight_relative",
+    "feature__global",
+    "feature__map",
+    "feature__candidate_mask",
+)
 
 
 class FeatureRowBatch(NamedTuple):
@@ -95,6 +113,11 @@ def split_paths(paths: list[Path], val_fraction: float) -> tuple[list[Path], lis
     train_paths = paths[:-val_count] if val_count else paths
     val_paths = paths[-val_count:] if val_count else paths[-1:]
     return train_paths, val_paths
+
+
+def load_shard_arrays(path: Path, keys: tuple[str, ...] = TRAIN_ARRAY_KEYS) -> dict[str, np.ndarray]:
+    with np.load(path) as data:
+        return {name: np.asarray(data[name]) for name in keys}
 
 
 class MLP(nn.Module):
@@ -205,7 +228,7 @@ def zeros_stats() -> dict[str, np.ndarray]:
     }
 
 
-def accumulate_stats(stats: dict[str, np.ndarray], data: np.lib.npyio.NpzFile) -> None:
+def accumulate_stats(stats: dict[str, np.ndarray], data: Mapping[str, np.ndarray]) -> None:
     planet = data["feature__fight_planet"].astype(np.float64)
     stats["planet_sum"] += planet.sum(axis=0)
     stats["planet_sumsq"] += np.square(planet).sum(axis=0)
@@ -260,8 +283,7 @@ def finalize_normalizer(stats: dict[str, np.ndarray], eps: float = 1e-6) -> dict
 def compute_normalizer(paths: list[Path]) -> dict[str, np.ndarray]:
     stats = zeros_stats()
     for path in paths:
-        with np.load(path) as data:
-            accumulate_stats(stats, data)
+        accumulate_stats(stats, load_shard_arrays(path, NORMALIZER_ARRAY_KEYS))
     return finalize_normalizer(stats)
 
 
@@ -292,7 +314,7 @@ def normalize_batch(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> Fea
     return batch._replace(planet=planet, relative=relative, global_features=global_features, map_features=map_features)
 
 
-def batch_from_npz(data: np.lib.npyio.NpzFile, idx: np.ndarray) -> FeatureRowBatch:
+def batch_from_arrays(data: Mapping[str, np.ndarray], idx: np.ndarray) -> FeatureRowBatch:
     return FeatureRowBatch(
         planet=jnp.asarray(data["feature__fight_planet"][idx], dtype=jnp.float32),
         relative=jnp.asarray(data["feature__fight_relative"][idx], dtype=jnp.float32),
@@ -413,7 +435,7 @@ def make_eval_step(model, weights):
 
 
 def epoch_indices(
-    data: np.lib.npyio.NpzFile,
+    data: Mapping[str, np.ndarray],
     rng,
     train: bool,
     noop_keep_ratio: float,
@@ -451,33 +473,33 @@ def run_epoch(
     sums: dict[str, float] = {}
     count = 0
     for path in paths:
-        with np.load(path) as data:
-            order, rng = epoch_indices(
-                data,
-                rng,
-                train=train,
-                noop_keep_ratio=noop_keep_ratio,
-                max_rows_per_shard=max_rows_per_shard,
-            )
-            if len(order) == 0:
+        data = load_shard_arrays(path)
+        order, rng = epoch_indices(
+            data,
+            rng,
+            train=train,
+            noop_keep_ratio=noop_keep_ratio,
+            max_rows_per_shard=max_rows_per_shard,
+        )
+        if len(order) == 0:
+            continue
+        starts = range(0, len(order) - batch_size + 1, batch_size)
+        if len(order) < batch_size:
+            starts = range(0, 1)
+        for start in starts:
+            idx = order[start : start + batch_size]
+            if len(idx) < batch_size and count > 0:
                 continue
-            starts = range(0, len(order) - batch_size + 1, batch_size)
-            if len(order) < batch_size:
-                starts = range(0, 1)
-            for start in starts:
-                idx = order[start : start + batch_size]
-                if len(idx) < batch_size and count > 0:
-                    continue
-                batch = normalize_batch(batch_from_npz(data, idx), normalizer)
-                if train:
-                    train_state, metrics = step_fn(train_state, batch)
-                else:
-                    metrics = step_fn(train_state, batch)
-                metrics = jax.device_get(metrics)
-                batch_rows = int(len(idx))
-                count += batch_rows
-                for key, value in metrics.items():
-                    sums[key] = sums.get(key, 0.0) + float(value) * batch_rows
+            batch = normalize_batch(batch_from_arrays(data, idx), normalizer)
+            if train:
+                train_state, metrics = step_fn(train_state, batch)
+            else:
+                metrics = step_fn(train_state, batch)
+            metrics = jax.device_get(metrics)
+            batch_rows = int(len(idx))
+            count += batch_rows
+            for key, value in metrics.items():
+                sums[key] = sums.get(key, 0.0) + float(value) * batch_rows
     return train_state, rng, {k: v / max(count, 1) for k, v in sums.items()}
 
 
@@ -531,9 +553,9 @@ def main() -> None:
         flush=True,
     )
 
-    with np.load(train_paths[0]) as sample_data:
-        sample_idx = np.arange(min(batch_size, int(sample_data["label__fire"].shape[0])))
-        sample_batch = normalize_batch(batch_from_npz(sample_data, sample_idx), normalizer)
+    sample_data = load_shard_arrays(train_paths[0])
+    sample_idx = np.arange(min(batch_size, int(sample_data["label__fire"].shape[0])))
+    sample_batch = normalize_batch(batch_from_arrays(sample_data, sample_idx), normalizer)
 
     ship_bucket_count = int(sample_batch.amount_mask.shape[-1])
     model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)

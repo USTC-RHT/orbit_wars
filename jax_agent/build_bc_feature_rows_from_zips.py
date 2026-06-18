@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-size", type=int, default=32768)
     parser.add_argument("--compression", choices=["compressed", "store"], default="compressed")
     parser.add_argument("--feature-dtype", choices=["float32", "float16"], default="float32")
-    parser.add_argument("--board-batch-size", type=int, default=1)
+    parser.add_argument("--board-batch-size", type=int, default=64)
     parser.add_argument("--noop-mode", choices=["all", "none", "stride"], default="all")
     parser.add_argument("--noop-stride", type=int, default=0, help="Only used when --noop-mode=stride.")
     parser.add_argument("--noop-row-keep-ratio", type=float, default=1.0, help="Deterministically keep this fraction of non-fire feature rows.")
@@ -145,8 +145,51 @@ def new_buffer() -> dict[str, list[np.ndarray]]:
         "label__target": [],
         "label__amount": [],
         "meta__episode_id": [],
+        "meta__replay_id": [],
         "meta__step": [],
         "meta__source_slot": [],
+        "meta__episode_steps": [],
+        "meta__player0_name": [],
+        "meta__player1_name": [],
+        "meta__winner_name": [],
+    }
+
+
+def replay_metadata(replay: dict[str, Any], manifest_row: dict[str, str]) -> dict[str, Any]:
+    info = replay.get("info") if isinstance(replay, dict) else {}
+    info = info if isinstance(info, dict) else {}
+    team_names = info.get("TeamNames") if isinstance(info.get("TeamNames"), list) else []
+    agents = info.get("Agents") if isinstance(info.get("Agents"), list) else []
+
+    def player_name(index: int) -> str:
+        if index < len(team_names) and team_names[index]:
+            return str(team_names[index])
+        if index < len(agents) and isinstance(agents[index], dict) and agents[index].get("Name"):
+            return str(agents[index]["Name"])
+        return f"player_{index}"
+
+    names = [player_name(0), player_name(1)]
+    rewards = replay.get("rewards") if isinstance(replay, dict) else None
+    winner_name = "unknown"
+    if isinstance(rewards, list) and rewards:
+        pair_rewards = rewards[:2]
+        best = max(pair_rewards)
+        winners = [idx for idx, reward in enumerate(pair_rewards) if reward == best and reward > 0]
+        if len(winners) == 1:
+            winner_name = names[winners[0]]
+        elif len(winners) > 1:
+            winner_name = "|".join(names[idx] for idx in winners)
+        else:
+            winner_name = "draw"
+
+    episode_id = str(manifest_row.get("episode_id") or info.get("EpisodeId") or replay.get("id") or "")
+    return {
+        "episode_id": episode_id,
+        "replay_id": str(replay.get("id", "")),
+        "episode_steps": len(replay.get("steps") or []),
+        "player0_name": names[0],
+        "player1_name": names[1],
+        "winner_name": winner_name,
     }
 
 
@@ -273,9 +316,15 @@ def append_feature_rows(
     max_ships: float,
     row_count: int,
     noop_row_keep_ratio: float,
+    replay_id: str = "",
+    episode_steps: int = 0,
+    player0_name: str = "",
+    player1_name: str = "",
+    winner_name: str = "",
     limit: int | None = None,
 ) -> int:
     fire, target, amount = per_planet_labels_np(labels, max_planets)
+    encoded, fight_extras = jax.device_get((encoded, fight_extras))
     source_mask = np.asarray(encoded.source_mask, dtype=bool)
     source_valid = np.asarray(labels.get("source_valid", np.ones((max_planets,), dtype=bool)), dtype=bool)
     source_slots = np.asarray(encoded.source_slots, dtype=np.int32)
@@ -288,34 +337,65 @@ def append_feature_rows(
     fight_relative = np.asarray(fight_extras.relative)
     bucket_count = int(np.asarray(encoded.ship_buckets).shape[-1])
 
-    rows = 0
-    for row_i, src in enumerate(source_slots[: int(row_count)]):
-        if limit is not None and rows >= limit:
-            break
-        src = int(src)
-        if not bool(source_mask[row_i]) or not bool(source_valid[src]):
-            continue
-        if not bool(fire[src]) and not keep_noop_row(episode_id, step, src, noop_row_keep_ratio):
-            continue
-        ship_buckets = bc_ship_buckets_np(float(source_ships[row_i]), bucket_count)
-        candidate_mask, amount_mask = bc_masks_np(state, int(src), ship_buckets)
-        buffer["feature__source_id"].append(np.asarray(source_ids[row_i], dtype=np.int32))
-        buffer["feature__source_ships"].append(np.asarray(source_ships[row_i], dtype=np.float32))
-        buffer["feature__candidate_ids"].append(candidate_ids[row_i])
-        buffer["feature__ship_buckets"].append(ship_buckets)
-        buffer["feature__candidate_mask"].append(candidate_mask)
-        buffer["feature__amount_mask"].append(amount_mask)
-        buffer["feature__global"].append(global_features[row_i])
-        buffer["feature__map"].append(encoded_map[row_i])
-        buffer["feature__fight_planet"].append(fight_planet[row_i])
-        buffer["feature__fight_relative"].append(fight_relative[row_i])
-        buffer["label__fire"].append(np.asarray(fire[src], dtype=bool))
-        buffer["label__target"].append(np.asarray(target[src], dtype=np.int32))
-        buffer["label__amount"].append(np.asarray(amount[src], dtype=np.int32))
-        buffer["meta__episode_id"].append(np.asarray(int(episode_id), dtype=np.int64))
-        buffer["meta__step"].append(np.asarray(step, dtype=np.int32))
-        buffer["meta__source_slot"].append(np.asarray(src, dtype=np.int32))
-        rows += 1
+    source_row_count = min(int(row_count), int(source_slots.shape[0]))
+    if source_row_count <= 0:
+        return 0
+
+    row_indices = np.arange(source_row_count, dtype=np.int32)
+    row_source_slots = source_slots[:source_row_count]
+    keep = source_mask[:source_row_count] & source_valid[row_source_slots]
+    if float(noop_row_keep_ratio) >= 1.0:
+        noop_keep = np.ones((source_row_count,), dtype=bool)
+    elif float(noop_row_keep_ratio) <= 0.0:
+        noop_keep = np.zeros((source_row_count,), dtype=bool)
+    else:
+        noop_keep = np.asarray(
+            [keep_noop_row(episode_id, step, int(src), noop_row_keep_ratio) for src in row_source_slots],
+            dtype=bool,
+        )
+    keep &= fire[row_source_slots] | noop_keep
+
+    kept_row_indices = row_indices[keep]
+    if limit is not None:
+        kept_row_indices = kept_row_indices[: int(limit)]
+    rows = int(kept_row_indices.shape[0])
+    if rows <= 0:
+        return 0
+
+    kept_sources = row_source_slots[kept_row_indices]
+    kept_source_ships = source_ships[kept_row_indices].astype(np.float32)
+    ships = np.floor(kept_source_ships).astype(np.int32)
+    ratios = np.asarray(SHIP_RATIOS[:bucket_count], dtype=np.float32)
+    ship_buckets = np.clip(np.round(ships[:, None] * ratios[None, :]), 1.0, ships[:, None]).astype(np.float32)
+    ship_buckets = np.where(ships[:, None] > 0, ship_buckets, 0.0).astype(np.float32)
+
+    alive = np.asarray(state.planet_alive, dtype=bool)
+    target_slots = np.arange(max_planets, dtype=np.int32)
+    per_planet_mask = alive[None, :] & (target_slots[None, :] != kept_sources[:, None])
+    candidate_mask = np.concatenate([np.zeros((rows, 1), dtype=bool), per_planet_mask], axis=1)
+    amount_mask = candidate_mask[:, :, None] & (ship_buckets > 0.0)[:, None, :]
+
+    buffer["feature__source_id"].extend(source_ids[kept_row_indices].astype(np.int32))
+    buffer["feature__source_ships"].extend(kept_source_ships.astype(np.float32))
+    buffer["feature__candidate_ids"].extend(candidate_ids[kept_row_indices])
+    buffer["feature__ship_buckets"].extend(ship_buckets)
+    buffer["feature__candidate_mask"].extend(candidate_mask)
+    buffer["feature__amount_mask"].extend(amount_mask)
+    buffer["feature__global"].extend(global_features[kept_row_indices])
+    buffer["feature__map"].extend(encoded_map[kept_row_indices])
+    buffer["feature__fight_planet"].extend(fight_planet[kept_row_indices])
+    buffer["feature__fight_relative"].extend(fight_relative[kept_row_indices])
+    buffer["label__fire"].extend(fire[kept_sources].astype(bool))
+    buffer["label__target"].extend(target[kept_sources].astype(np.int32))
+    buffer["label__amount"].extend(amount[kept_sources].astype(np.int32))
+    buffer["meta__episode_id"].extend(np.full((rows,), int(episode_id), dtype=np.int64))
+    buffer["meta__replay_id"].extend(np.full((rows,), str(replay_id), dtype=f"<U{max(len(str(replay_id)), 1)}"))
+    buffer["meta__step"].extend(np.full((rows,), step, dtype=np.int32))
+    buffer["meta__source_slot"].extend(kept_sources.astype(np.int32))
+    buffer["meta__episode_steps"].extend(np.full((rows,), int(episode_steps), dtype=np.int32))
+    buffer["meta__player0_name"].extend(np.full((rows,), str(player0_name), dtype=f"<U{max(len(str(player0_name)), 1)}"))
+    buffer["meta__player1_name"].extend(np.full((rows,), str(player1_name), dtype=f"<U{max(len(str(player1_name)), 1)}"))
+    buffer["meta__winner_name"].extend(np.full((rows,), str(winner_name), dtype=f"<U{max(len(str(winner_name)), 1)}"))
     return rows
 
 
@@ -400,6 +480,16 @@ def main() -> None:
         )
     )
     fight_all = jax.jit(lambda state: build_fight_feature_extras(state, feature_params))
+    batch_encode_all = jax.jit(
+        jax.vmap(
+            lambda state: encode_light_sources(
+                state,
+                jnp.arange(feature_params.max_planets, dtype=jnp.int32),
+                feature_params,
+            )
+        )
+    )
+    batch_fight_all = jax.jit(jax.vmap(lambda state: build_fight_feature_extras(state, feature_params)))
     encode_sources = jax.jit(lambda state, source_slots: encode_light_sources(state, source_slots, feature_params))
     fight_sources = jax.jit(lambda state, source_slots: build_fight_feature_extras_for_sources(state, source_slots, feature_params))
 
@@ -472,6 +562,7 @@ def main() -> None:
                     append_jsonl(replay_audit, {"event": "replay_error", "time": time.time(), "row": row, "error": str(exc)})
                     continue
 
+                replay_meta = replay_metadata(replay, row)
                 board_rows, stats = process_replay(replay, env_params, args)
                 for key, value in stats.items():
                     if key == "rows":
@@ -486,6 +577,68 @@ def main() -> None:
                         stop = True
                         break
                     chunk = board_rows[batch_start : batch_start + board_batch_size]
+                    if str(args.source_filter_mode) != "early" and board_batch_size > 1:
+                        padded_chunk = pad_chunk(chunk, board_batch_size)
+                        batch_state = stack_state_dicts([state_dict for state_dict, _labels in padded_chunk])
+                        encoded_batch = batch_encode_all(batch_state)
+                        fight_batch = batch_fight_all(batch_state)
+                        encoded_batch, fight_batch = jax.device_get((encoded_batch, fight_batch))
+                        for batch_i, (state_dict, labels) in enumerate(chunk):
+                            if int(args.max_rows) > 0 and total["feature_rows"] >= int(args.max_rows):
+                                stop = True
+                                break
+                            step = int(np.asarray(state_dict["step"]))
+                            limit = None
+                            if int(args.max_rows) > 0:
+                                limit = max(int(args.max_rows) - int(total["feature_rows"]), 0)
+                            if limit == 0:
+                                stop = True
+                                break
+                            env_state = EnvState(**state_dict)
+                            added = append_feature_rows(
+                                buffer,
+                                env_state,
+                                slice_tree(encoded_batch, batch_i),
+                                slice_tree(fight_batch, batch_i),
+                                labels,
+                                str(replay_meta["episode_id"]),
+                                step,
+                                int(args.max_planets),
+                                int(args.map_grid_size),
+                                float(args.max_ships),
+                                int(args.max_planets),
+                                float(args.noop_row_keep_ratio),
+                                replay_id=str(replay_meta["replay_id"]),
+                                episode_steps=int(replay_meta["episode_steps"]),
+                                player0_name=str(replay_meta["player0_name"]),
+                                player1_name=str(replay_meta["player1_name"]),
+                                winner_name=str(replay_meta["winner_name"]),
+                                limit=limit,
+                            )
+                            total["feature_rows"] += added
+                            appended_feature_rows += added
+
+                            while len(buffer["label__fire"]) >= int(args.shard_size):
+                                shard_buffer = {name: values[: int(args.shard_size)] for name, values in buffer.items()}
+                                buffer = {name: values[int(args.shard_size) :] for name, values in buffer.items()}
+                                meta = {"args": jsonable_args(args), "stats": dict(total), "shard_index": shard_index}
+                                path = write_shard(
+                                    shard_buffer,
+                                    args.output_dir,
+                                    shard_index,
+                                    meta,
+                                    str(args.compression),
+                                    str(args.feature_dtype),
+                                )
+                                shards.append({"path": str(path), "rows": int(args.shard_size)})
+                                append_jsonl(audit_log, {"event": "shard_write", "time": time.time(), "path": str(path), "rows": int(args.shard_size), "total": dict(total)})
+                                print(f"[shard] wrote {path} rows={int(args.shard_size)} total_feature_rows={total['feature_rows']}", flush=True)
+                                write_progress(args.output_dir, args, total, shards, started, zip_i, len(by_zip), zip_path)
+                                shard_index += 1
+                        if stop:
+                            break
+                        continue
+
                     for state_dict, labels in chunk:
                         if int(args.max_rows) > 0 and total["feature_rows"] >= int(args.max_rows):
                             stop = True
@@ -502,7 +655,7 @@ def main() -> None:
                             source_slots = selected_source_slots_np(
                                 state_dict,
                                 labels,
-                                str(row["episode_id"]),
+                                str(replay_meta["episode_id"]),
                                 step,
                                 int(args.max_planets),
                                 float(args.noop_row_keep_ratio),
@@ -524,13 +677,18 @@ def main() -> None:
                             encoded,
                             fight_extras,
                             labels,
-                            str(row["episode_id"]),
+                            str(replay_meta["episode_id"]),
                             step,
                             int(args.max_planets),
                             int(args.map_grid_size),
                             float(args.max_ships),
                             int(source_row_count),
                             float(args.noop_row_keep_ratio),
+                            replay_id=str(replay_meta["replay_id"]),
+                            episode_steps=int(replay_meta["episode_steps"]),
+                            player0_name=str(replay_meta["player0_name"]),
+                            player1_name=str(replay_meta["player1_name"]),
+                            winner_name=str(replay_meta["winner_name"]),
                             limit=limit,
                         )
                         total["feature_rows"] += added
@@ -618,6 +776,16 @@ def main() -> None:
             "feature__global": [GLOBAL_DIM],
             "feature__map": [BC_MAP_CHANNELS, int(args.map_grid_size), int(args.map_grid_size)],
             "labels": {"fire": "bool", "target": "0=no-fire placeholder else target_slot+1", "amount": "ship bucket index"},
+            "meta": {
+                "episode_id": "Kaggle episode id; joins back to source manifest zip_path/json_name",
+                "replay_id": "Replay UUID from the raw replay JSON",
+                "step": "Replay step for this feature row",
+                "source_slot": "Canonicalized source planet slot",
+                "episode_steps": "Total number of step records in the raw replay",
+                "player0_name": "Raw replay player 0 team/name",
+                "player1_name": "Raw replay player 1 team/name",
+                "winner_name": "Winner team/name inferred from rewards",
+            },
         },
         "shards": shards,
         "elapsed_sec": time.monotonic() - started,

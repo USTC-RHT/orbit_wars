@@ -41,7 +41,7 @@ eval:
   bank_size: 16
 
 bc:
-  dataset_glob: /mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full/bc_feature_rows_*.npz
+  dataset_glob: /mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full_v2_compressed/bc_feature_rows_*.npz
   epochs: 5
   batch_size: 512
   lr: 3.0e-4

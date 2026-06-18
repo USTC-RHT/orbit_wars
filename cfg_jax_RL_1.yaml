@@ -91,7 +91,14 @@ eval:
   games: 20
   seed: 200000
   player: 1
-  opponents: ["nearest", "sigma", "tamrazov", "pool_ckpt900"]
+  opponents:
+    - "nearest"
+    - "producer"
+    - "tamrazov"
+    - "ckpt_32700"
+    - "ckpt_48900"
+    - "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid"
+    - "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid"
 
 wandb:
   enabled: true

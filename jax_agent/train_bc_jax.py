@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume from a BC checkpoint path.")
     return parser.parse_args()
 
 
@@ -503,13 +504,65 @@ def run_epoch(
     return train_state, rng, {k: v / max(count, 1) for k, v in sums.items()}
 
 
-def save_checkpoint(path: Path, train_state, normalizer: dict[str, np.ndarray], raw_cfg, metrics: dict[str, float]) -> None:
+def load_checkpoint_payload(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    with Path(path).open("rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"BC checkpoint payload must be a dict: {path}")
+    return payload
+
+
+def restore_train_state(train_state, payload: dict[str, Any]):
+    params = payload.get("params")
+    if params is None:
+        raise KeyError("resume checkpoint is missing 'params'")
+    train_state = train_state.replace(params=jax.tree_util.tree_map(jnp.asarray, params))
+    if "opt_state" in payload:
+        train_state = train_state.replace(opt_state=jax.tree_util.tree_map(jnp.asarray, payload["opt_state"]))
+    if "step" in payload:
+        train_state = train_state.replace(step=jnp.asarray(payload["step"]))
+    return train_state
+
+
+def metrics_best_val(metrics_path: Path) -> float:
+    if not metrics_path.exists():
+        return float("inf")
+    best = float("inf")
+    with metrics_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "val_loss" in row:
+                best = min(best, float(row["val_loss"]))
+    return best
+
+
+def save_checkpoint(
+    path: Path,
+    train_state,
+    normalizer: dict[str, np.ndarray],
+    raw_cfg,
+    metrics: dict[str, float],
+    *,
+    epoch: int,
+    rng,
+    best_val: float,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "params": jax.device_get(train_state.params),
+        "opt_state": jax.device_get(train_state.opt_state),
+        "step": int(jax.device_get(train_state.step)),
         "normalizer": normalizer,
         "raw_config": raw_cfg,
         "metrics": metrics,
+        "epoch": int(epoch),
+        "rng": jax.device_get(rng),
+        "best_val": float(best_val),
         "checkpoint_type": "feature_row_bc",
     }
     with path.open("wb") as f:
@@ -527,6 +580,7 @@ def write_metrics(path: Path, epoch: int, metrics: dict[str, float]) -> None:
 def main() -> None:
     args = parse_args()
     raw_cfg = read_raw_config(args.config)
+    resume_payload = load_checkpoint_payload(args.resume)
     dataset_pattern = args.dataset_glob or str(raw_get(raw_cfg, "bc", "dataset_glob", ""))
     paths = shard_paths(dataset_pattern, args.max_shards)
     train_paths, val_paths = split_paths(paths, float(raw_get(raw_cfg, "bc", "val_fraction", 0.1)))
@@ -545,7 +599,11 @@ def main() -> None:
     }
 
     tic = time.time()
-    normalizer_np = identity_normalizer() if args.no_normalize else compute_normalizer(train_paths)
+    if resume_payload is not None and "normalizer" in resume_payload and not args.no_normalize:
+        normalizer_np = resume_payload["normalizer"]
+        print(f"resume: loaded normalizer from {args.resume}", flush=True)
+    else:
+        normalizer_np = identity_normalizer() if args.no_normalize else compute_normalizer(train_paths)
     normalizer = jax_normalizer(normalizer_np)
     print(
         f"BC feature-row start shards={len(paths)} train={len(train_paths)} val={len(val_paths)} "
@@ -562,6 +620,18 @@ def main() -> None:
     rng = jax.random.PRNGKey(int(raw_cfg.get("seed", 42)))
     rng, init_rng = jax.random.split(rng)
     train_state = make_train_state(init_rng, model, sample_batch, lr=lr, weight_decay=weight_decay)
+    start_epoch = 1
+    if resume_payload is not None:
+        train_state = restore_train_state(train_state, resume_payload)
+        resumed_epoch = int(resume_payload.get("epoch", 0) or 0)
+        start_epoch = resumed_epoch + 1
+        if "rng" in resume_payload:
+            rng = jnp.asarray(resume_payload["rng"])
+        print(
+            f"resume: restored {args.resume} epoch={resumed_epoch} "
+            f"step={int(jax.device_get(train_state.step))} next_epoch={start_epoch}",
+            flush=True,
+        )
     train_step = make_train_step(model, weights)
     eval_step = make_eval_step(model, weights)
 
@@ -572,10 +642,20 @@ def main() -> None:
     np.savez(save_dir / "normalizer.npz", **normalizer_np)
     (save_dir / "train_config_snapshot.yaml").write_text(yaml.safe_dump(raw_cfg, sort_keys=False), encoding="utf-8")
 
-    best_val = float("inf")
     checkpoint_every = int(raw_cfg.get("checkpoint_every", 1))
     metrics_path = save_dir / "metrics.jsonl"
-    for epoch in range(1, epochs + 1):
+    best_val = metrics_best_val(metrics_path)
+    if resume_payload is not None:
+        best_val = min(
+            best_val,
+            float(resume_payload.get("best_val", float("inf"))),
+            float(resume_payload.get("metrics", {}).get("val_loss", float("inf"))),
+        )
+    if start_epoch > epochs:
+        print(f"BC resume checkpoint already at epoch {start_epoch - 1}; target epochs={epochs}, nothing to do.", flush=True)
+        return
+
+    for epoch in range(start_epoch, epochs + 1):
         epoch_tic = time.time()
         train_state, rng, train_metrics = run_epoch(
             train_paths,
@@ -614,12 +694,41 @@ def main() -> None:
             f"elapsed={elapsed:.1f}s",
             flush=True,
         )
-        save_checkpoint(save_dir / "ckpt_last.pkl", train_state, normalizer_np, raw_cfg, metrics)
-        if metrics["val_loss"] < best_val:
+        improved = metrics["val_loss"] < best_val
+        if improved:
             best_val = metrics["val_loss"]
-            save_checkpoint(save_dir / "ckpt_best.pkl", train_state, normalizer_np, raw_cfg, metrics)
+        save_checkpoint(
+            save_dir / "ckpt_last.pkl",
+            train_state,
+            normalizer_np,
+            raw_cfg,
+            metrics,
+            epoch=epoch,
+            rng=rng,
+            best_val=best_val,
+        )
+        if improved:
+            save_checkpoint(
+                save_dir / "ckpt_best.pkl",
+                train_state,
+                normalizer_np,
+                raw_cfg,
+                metrics,
+                epoch=epoch,
+                rng=rng,
+                best_val=best_val,
+            )
         if checkpoint_every > 0 and epoch % checkpoint_every == 0:
-            save_checkpoint(save_dir / f"ckpt_epoch_{epoch:04d}.pkl", train_state, normalizer_np, raw_cfg, metrics)
+            save_checkpoint(
+                save_dir / f"ckpt_epoch_{epoch:04d}.pkl",
+                train_state,
+                normalizer_np,
+                raw_cfg,
+                metrics,
+                epoch=epoch,
+                rng=rng,
+                best_val=best_val,
+            )
 
     print(f"BC done, wrote {save_dir / 'ckpt_best.pkl'}", flush=True)
 

@@ -412,6 +412,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
     enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
     agents_root = root / "agents"
     external_root = agents_root / "external"
+    mine_root = agents_root / "mine"
     opponents: list[JaxEvalOpponent] = []
     if "nearest" in enabled:
         opponents.append(NearestJaxEvalOpponent())
@@ -429,7 +430,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=external_root / "slawekbiel-producer",
             seed_offset=15485863,
         ))
-    if "ckpt_48900" in enabled or "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid" in enabled:
+    if "ckpt_48900" in enabled:
         opponents.append(JaxCheckpointEvalOpponent(
             name="ckpt_048900",
             metric_prefix="ckpt_48900",
@@ -437,7 +438,7 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             seed_offset=32452843,
             feature_mode="legacy_target_mask",
         ))
-    if "ckpt_32700" in enabled or "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid" in enabled:
+    if "ckpt_32700" in enabled:
         opponents.append(JaxCheckpointEvalOpponent(
             name="ckpt_032700",
             metric_prefix="ckpt_32700",
@@ -445,6 +446,22 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             seed_offset=49979687,
             feature_mode="legacy_target_mask",
         ))
+    mine_script_opponents = {
+        "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid": ("tgtmask_32700_producer", 521),
+        "fixed-pool-tgtmask-0526-ckpt48800-onnx-tamrazov-hybrid": ("tgtmask_48800_tamrazov", 1543),
+        "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid": ("tgtmask_48900_producer", 3251),
+        "fixed-pool-tgtmask-0526-ckpt48900-onnx-tamrazov-hybrid": ("tgtmask_48900_tamrazov", 7841),
+        "fixed-pool-tgtmask-0526-ckpt49000-onnx-tamrazov-hybrid": ("tgtmask_49000_tamrazov", 12289),
+        "fixed-pool-tgtmask-0526-ckpt49100-onnx-tamrazov-hybrid": ("tgtmask_49100_tamrazov", 24593),
+    }
+    for opponent_name, (metric_prefix, seed_offset) in mine_script_opponents.items():
+        if opponent_name in enabled or metric_prefix in enabled:
+            opponents.append(ExternalScriptJaxEvalOpponent(
+                name=opponent_name,
+                metric_prefix=metric_prefix,
+                agent_dir=mine_root / opponent_name,
+                seed_offset=seed_offset,
+            ))
     if "tamrazov" in enabled or "tamrazov-starwars" in enabled:
         opponents.append(ExternalScriptJaxEvalOpponent(
             name="tamrazov-starwars",

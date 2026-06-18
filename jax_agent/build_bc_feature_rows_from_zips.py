@@ -28,6 +28,8 @@ from .build_bc_shards_from_zips import (
     jsonable_args,
     manifest_rows,
     process_replay,
+    numeric_reward_pair,
+    valid_reward_pair,
     write_input_snapshot,
 )
 from .bc_fight_feature_extras import FIGHT_PLANET_DIM, FIGHT_RELATIVE_DIM, build_fight_feature_extras, build_fight_feature_extras_for_sources
@@ -171,8 +173,8 @@ def replay_metadata(replay: dict[str, Any], manifest_row: dict[str, str]) -> dic
     names = [player_name(0), player_name(1)]
     rewards = replay.get("rewards") if isinstance(replay, dict) else None
     winner_name = "unknown"
-    if isinstance(rewards, list) and rewards:
-        pair_rewards = rewards[:2]
+    pair_rewards = numeric_reward_pair(rewards)
+    if pair_rewards is not None:
         best = max(pair_rewards)
         winners = [idx for idx, reward in enumerate(pair_rewards) if reward == best and reward > 0]
         if len(winners) == 1:
@@ -560,6 +562,18 @@ def main() -> None:
                     replay = json.loads(zf.read(row["json_name"]))
                 except Exception as exc:
                     append_jsonl(replay_audit, {"event": "replay_error", "time": time.time(), "row": row, "error": str(exc)})
+                    continue
+
+                if str(args.learn_players) == "winners" and not valid_reward_pair(replay.get("rewards")):
+                    append_jsonl(
+                        replay_audit,
+                        {
+                            "event": "invalid_rewards_skip",
+                            "time": time.time(),
+                            "row": row,
+                            "rewards": replay.get("rewards"),
+                        },
+                    )
                     continue
 
                 replay_meta = replay_metadata(replay, row)

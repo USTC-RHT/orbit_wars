@@ -510,11 +510,30 @@ def manifest_rows(path: Path, max_replays: int) -> list[dict[str, str]]:
     return rows
 
 
+def valid_reward_pair(rewards: Any) -> bool:
+    if not isinstance(rewards, list) or len(rewards) < 2:
+        return False
+    try:
+        pair = [float(rewards[0]), float(rewards[1])]
+    except (TypeError, ValueError):
+        return False
+    return bool(np.isfinite(pair).all())
+
+
+def numeric_reward_pair(rewards: Any) -> list[float] | None:
+    if not valid_reward_pair(rewards):
+        return None
+    return [float(rewards[0]), float(rewards[1])]
+
+
 def selected_players(rewards: Any, mode: str) -> list[int]:
     if mode == "all" or not isinstance(rewards, list) or not rewards:
         return [0, 1]
-    best = max(rewards)
-    return [idx for idx, reward in enumerate(rewards[:2]) if reward == best and reward > 0]
+    pair = numeric_reward_pair(rewards)
+    if pair is None:
+        return []
+    best = max(pair)
+    return [idx for idx, reward in enumerate(pair) if reward == best and reward > 0]
 
 
 def process_replay(replay: dict[str, Any], params: EnvParams, args: argparse.Namespace) -> tuple[list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]], dict[str, int]]:

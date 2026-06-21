@@ -14,7 +14,9 @@ import argparse
 import glob
 import json
 import pickle
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
@@ -84,9 +86,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="cfg_jax_BC_1.yaml")
     parser.add_argument("--dataset-glob", default=None)
-    parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--log-every-steps", type=int, default=None)
+    parser.add_argument("--eval-every-steps", type=int, default=None)
+    parser.add_argument("--eval-batches", type=int, default=None)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=None)
+    parser.add_argument("--shuffle-buffer-rows", type=int, default=None)
+    parser.add_argument("--prefetch-batches", type=int, default=None)
+    parser.add_argument("--no-shuffle-shards", action="store_true")
     parser.add_argument("--max-shards", type=int, default=None)
     parser.add_argument("--max-rows-per-shard", type=int, default=None)
     parser.add_argument("--run-name", default=None)
@@ -281,10 +290,22 @@ def finalize_normalizer(stats: dict[str, np.ndarray], eps: float = 1e-6) -> dict
     }
 
 
-def compute_normalizer(paths: list[Path]) -> dict[str, np.ndarray]:
+def compute_normalizer(paths: list[Path], *, report_every: int = 100) -> dict[str, np.ndarray]:
     stats = zeros_stats()
-    for path in paths:
+    start = time.time()
+    total = len(paths)
+    print(f"normalizer: start shards={total}", flush=True)
+    for i, path in enumerate(paths, start=1):
         accumulate_stats(stats, load_shard_arrays(path, NORMALIZER_ARRAY_KEYS))
+        if i == 1 or i == total or (int(report_every) > 0 and i % int(report_every) == 0):
+            elapsed = time.time() - start
+            rate = i / max(elapsed, 1e-9)
+            eta = (total - i) / max(rate, 1e-9)
+            print(
+                f"normalizer: shard={i}/{total} file={path.name} "
+                f"rate={rate:.2f} shard/s eta={eta / 60.0:.1f}m",
+                flush=True,
+            )
     return finalize_normalizer(stats)
 
 
@@ -317,16 +338,52 @@ def normalize_batch(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> Fea
 
 def batch_from_arrays(data: Mapping[str, np.ndarray], idx: np.ndarray) -> FeatureRowBatch:
     return FeatureRowBatch(
-        planet=jnp.asarray(data["feature__fight_planet"][idx], dtype=jnp.float32),
-        relative=jnp.asarray(data["feature__fight_relative"][idx], dtype=jnp.float32),
-        global_features=jnp.asarray(data["feature__global"][idx], dtype=jnp.float32),
-        map_features=jnp.asarray(data["feature__map"][idx], dtype=jnp.float32),
-        candidate_mask=jnp.asarray(data["feature__candidate_mask"][idx], dtype=bool),
-        amount_mask=jnp.asarray(data["feature__amount_mask"][idx], dtype=bool),
-        fire=jnp.asarray(data["label__fire"][idx], dtype=bool),
-        target=jnp.asarray(data["label__target"][idx], dtype=jnp.int32),
-        amount=jnp.asarray(data["label__amount"][idx], dtype=jnp.int32),
+        planet=np.asarray(data["feature__fight_planet"][idx], dtype=np.float32),
+        relative=np.asarray(data["feature__fight_relative"][idx], dtype=np.float32),
+        global_features=np.asarray(data["feature__global"][idx], dtype=np.float32),
+        map_features=np.asarray(data["feature__map"][idx], dtype=np.float32),
+        candidate_mask=np.asarray(data["feature__candidate_mask"][idx], dtype=bool),
+        amount_mask=np.asarray(data["feature__amount_mask"][idx], dtype=bool),
+        fire=np.asarray(data["label__fire"][idx], dtype=bool),
+        target=np.asarray(data["label__target"][idx], dtype=np.int32),
+        amount=np.asarray(data["label__amount"][idx], dtype=np.int32),
     )
+
+
+def allocate_shuffle_buffer(sample: Mapping[str, np.ndarray], capacity: int) -> dict[str, np.ndarray]:
+    return {
+        name: np.empty((int(capacity),) + sample[name].shape[1:], dtype=sample[name].dtype)
+        for name in TRAIN_ARRAY_KEYS
+    }
+
+
+def append_to_shuffle_buffer(
+    buffer: dict[str, np.ndarray],
+    count: int,
+    data: Mapping[str, np.ndarray],
+    rows: np.ndarray,
+) -> int:
+    if len(rows) == 0:
+        return int(count)
+    dst = slice(int(count), int(count) + len(rows))
+    for name in TRAIN_ARRAY_KEYS:
+        buffer[name][dst] = data[name][rows]
+    return int(count) + len(rows)
+
+
+def batch_from_shuffle_buffer(buffer: Mapping[str, np.ndarray], idx: np.ndarray) -> FeatureRowBatch:
+    return batch_from_arrays(buffer, idx)
+
+
+def remove_from_shuffle_buffer(buffer: dict[str, np.ndarray], count: int, idx: np.ndarray) -> int:
+    new_count = int(count)
+    for pos in sorted((int(i) for i in idx), reverse=True):
+        last = new_count - 1
+        if pos != last:
+            for name in TRAIN_ARRAY_KEYS:
+                buffer[name][pos] = buffer[name][last]
+        new_count -= 1
+    return new_count
 
 
 def bc_loss_and_metrics(model, params, batch: FeatureRowBatch, weights: dict[str, float]):
@@ -413,9 +470,11 @@ def make_train_state(rng, model, sample_batch: FeatureRowBatch, lr: float, weigh
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
 
-def make_train_step(model, weights):
-    @jax.jit
+def make_train_step(model, weights, normalizer: dict[str, jnp.ndarray]):
+    @jax.jit(donate_argnums=(0,))
     def train_step(train_state, batch: FeatureRowBatch):
+        batch = normalize_batch(batch, normalizer)
+
         def loss_fn(params):
             return bc_loss_and_metrics(model, params, batch, weights)
 
@@ -426,9 +485,10 @@ def make_train_step(model, weights):
     return train_step
 
 
-def make_eval_step(model, weights):
+def make_eval_step(model, weights, normalizer: dict[str, jnp.ndarray]):
     @jax.jit
     def eval_step(train_state, batch: FeatureRowBatch):
+        batch = normalize_batch(batch, normalizer)
         _, metrics = bc_loss_and_metrics(model, train_state.params, batch, weights)
         return metrics
 
@@ -437,71 +497,207 @@ def make_eval_step(model, weights):
 
 def epoch_indices(
     data: Mapping[str, np.ndarray],
-    rng,
+    rng: np.random.Generator,
     train: bool,
     noop_keep_ratio: float,
     max_rows_per_shard: int | None,
-) -> tuple[np.ndarray, Any]:
+    shuffle: bool | None = None,
+) -> np.ndarray:
+    if shuffle is None:
+        shuffle = train
     rows = int(data["label__fire"].shape[0])
     keep = np.ones((rows,), dtype=bool)
     if train and noop_keep_ratio < 1.0:
         fire = data["label__fire"].astype(bool)
-        rng, keep_key = jax.random.split(rng)
-        keep_noop = np.asarray(jax.random.uniform(keep_key, (rows,)) < float(noop_keep_ratio))
+        keep_noop = rng.random(rows) < float(noop_keep_ratio)
         keep = fire | keep_noop
         if not keep.any():
             keep[:] = True
     idx = np.flatnonzero(keep)
+    if shuffle:
+        rng.shuffle(idx)
     if max_rows_per_shard is not None and int(max_rows_per_shard) > 0:
         idx = idx[: int(max_rows_per_shard)]
-    if train:
-        rng, order_key = jax.random.split(rng)
-        idx = np.asarray(jax.random.permutation(order_key, idx))
-    return idx, rng
+    return idx.astype(np.int32, copy=False)
 
 
-def run_epoch(
+def add_metric_sums(sums: dict[str, float], metrics: Mapping[str, Any], weight: int) -> None:
+    for key, value in metrics.items():
+        sums[key] = sums.get(key, 0.0) + float(value) * float(weight)
+
+
+def average_metric_sums(sums: dict[str, float], count: int) -> dict[str, float]:
+    return {key: value / max(int(count), 1) for key, value in sums.items()}
+
+
+def add_metric_sums_device(sums: dict[str, jnp.ndarray], metrics: Mapping[str, Any], weight: int) -> None:
+    weight_arr = jnp.asarray(float(weight), dtype=jnp.float32)
+    for key, value in metrics.items():
+        weighted = jnp.asarray(value) * weight_arr
+        sums[key] = sums.get(key, jnp.asarray(0.0, dtype=weighted.dtype)) + weighted
+
+
+def average_metric_sums_device(sums: dict[str, jnp.ndarray], count: int) -> dict[str, jnp.ndarray]:
+    denom = jnp.maximum(jnp.asarray(float(count), dtype=jnp.float32), 1.0)
+    return {key: value / denom for key, value in sums.items()}
+
+
+def train_batch_stream(
+    paths: list[Path],
+    batch_size: int,
+    rng: np.random.Generator,
+    noop_keep_ratio: float,
+    max_rows_per_shard: int | None,
+    initial_completed_passes: int = 0,
+    shuffle_shards: bool = True,
+    shuffle_buffer_rows: int = 0,
+):
+    completed_passes = int(initial_completed_passes)
+    buffer_capacity = int(shuffle_buffer_rows)
+    if buffer_capacity < int(batch_size):
+        raise ValueError("shuffle_buffer_rows must be >= batch_size")
+    buffer: dict[str, np.ndarray] | None = None
+    buffer_count = 0
+
+    pass_paths: list[Path] = []
+    path_cursor = 0
+    current_data: dict[str, np.ndarray] | None = None
+    current_order = np.zeros((0,), dtype=np.int32)
+    current_cursor = 0
+    current_path = paths[0]
+
+    def reset_pass():
+        nonlocal pass_paths, path_cursor
+        pass_paths = list(paths)
+        if shuffle_shards:
+            shard_order = rng.permutation(len(paths))
+            pass_paths = [paths[int(i)] for i in shard_order]
+        path_cursor = 0
+
+    def load_next_kept_shard():
+        nonlocal completed_passes, path_cursor
+        attempts = 0
+        while attempts < max(len(paths) * 2, 1):
+            if path_cursor >= len(pass_paths):
+                completed_passes += 1
+                reset_pass()
+            path = pass_paths[path_cursor]
+            path_cursor += 1
+            attempts += 1
+            data = load_shard_arrays(path)
+            order = epoch_indices(
+                data,
+                rng,
+                train=True,
+                noop_keep_ratio=noop_keep_ratio,
+                max_rows_per_shard=max_rows_per_shard,
+                shuffle=True,
+            )
+            if len(order) > 0:
+                return path, data, order
+        raise ValueError("no train rows were produced; check BC shard contents and noop_keep_ratio")
+
+    def refill(target_count: int):
+        nonlocal buffer, buffer_count, current_data, current_order, current_cursor, current_path
+        while buffer_count < int(target_count):
+            if current_data is None or current_cursor >= len(current_order):
+                current_path, current_data, current_order = load_next_kept_shard()
+                current_cursor = 0
+                if buffer is None:
+                    buffer = allocate_shuffle_buffer(current_data, buffer_capacity)
+            free = buffer_capacity - buffer_count
+            if free <= 0:
+                break
+            available = len(current_order) - current_cursor
+            take = min(free, available)
+            rows = current_order[current_cursor : current_cursor + take]
+            buffer_count = append_to_shuffle_buffer(buffer, buffer_count, current_data, rows)
+            current_cursor += take
+
+    reset_pass()
+    refill(buffer_capacity)
+    if buffer is None or buffer_count < batch_size:
+        raise ValueError("shuffle buffer could not be initialized with enough train rows")
+
+    while True:
+        batch_idx = rng.choice(buffer_count, size=int(batch_size), replace=False).astype(np.int32)
+        batch = batch_from_shuffle_buffer(buffer, batch_idx)
+        buffer_count = remove_from_shuffle_buffer(buffer, buffer_count, batch_idx)
+        refill(buffer_capacity)
+        yield batch, completed_passes, current_path
+
+
+def prefetch_batch_stream(stream, prefetch_batches: int):
+    depth = int(prefetch_batches)
+    if depth <= 0:
+        yield from stream
+        return
+
+    sentinel = object()
+    q: queue.Queue[Any] = queue.Queue(maxsize=depth)
+
+    def worker() -> None:
+        try:
+            for batch, completed_passes, path in stream:
+                q.put((jax.device_put(batch), completed_passes, path))
+        except BaseException as exc:
+            q.put(exc)
+        finally:
+            q.put(sentinel)
+
+    thread = threading.Thread(target=worker, name="bc-prefetch", daemon=True)
+    thread.start()
+    while True:
+        item = q.get()
+        if item is sentinel:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+def run_eval_batches(
     paths: list[Path],
     train_state,
-    step_fn,
-    normalizer: dict[str, jnp.ndarray],
+    eval_step,
     batch_size: int,
     rng,
-    train: bool,
-    noop_keep_ratio: float,
-    max_rows_per_shard: int | None = None,
+    eval_batches: int,
+    max_rows_per_shard: int | None,
 ):
     sums: dict[str, float] = {}
     count = 0
-    for path in paths:
+    batches = 0
+    path_index = 0
+    empty_cycles = 0
+    while batches < int(eval_batches):
+        path = paths[path_index % len(paths)]
+        path_index += 1
         data = load_shard_arrays(path)
-        order, rng = epoch_indices(
+        order = epoch_indices(
             data,
             rng,
-            train=train,
-            noop_keep_ratio=noop_keep_ratio,
+            train=False,
+            noop_keep_ratio=1.0,
             max_rows_per_shard=max_rows_per_shard,
+            shuffle=True,
         )
-        if len(order) == 0:
-            continue
-        starts = range(0, len(order) - batch_size + 1, batch_size)
         if len(order) < batch_size:
-            starts = range(0, 1)
-        for start in starts:
+            empty_cycles += 1
+            if empty_cycles > len(paths):
+                raise ValueError("no eval batches were produced; check batch_size and BC validation shards")
+            continue
+        empty_cycles = 0
+        for start in range(0, len(order) - batch_size + 1, batch_size):
             idx = order[start : start + batch_size]
-            if len(idx) < batch_size and count > 0:
-                continue
-            batch = normalize_batch(batch_from_arrays(data, idx), normalizer)
-            if train:
-                train_state, metrics = step_fn(train_state, batch)
-            else:
-                metrics = step_fn(train_state, batch)
-            metrics = jax.device_get(metrics)
+            metrics = jax.device_get(eval_step(train_state, batch_from_arrays(data, idx)))
             batch_rows = int(len(idx))
             count += batch_rows
-            for key, value in metrics.items():
-                sums[key] = sums.get(key, 0.0) + float(value) * batch_rows
-    return train_state, rng, {k: v / max(count, 1) for k, v in sums.items()}
+            batches += 1
+            add_metric_sums(sums, metrics, batch_rows)
+            if batches >= int(eval_batches):
+                break
+    return average_metric_sums(sums, count)
 
 
 def load_checkpoint_payload(path: Path | None) -> dict[str, Any] | None:
@@ -548,7 +744,7 @@ def save_checkpoint(
     raw_cfg,
     metrics: dict[str, float],
     *,
-    epoch: int,
+    completed_passes: int,
     rng,
     best_val: float,
 ) -> None:
@@ -560,7 +756,7 @@ def save_checkpoint(
         "normalizer": normalizer,
         "raw_config": raw_cfg,
         "metrics": metrics,
-        "epoch": int(epoch),
+        "completed_passes": int(completed_passes),
         "rng": jax.device_get(rng),
         "best_val": float(best_val),
         "checkpoint_type": "feature_row_bc",
@@ -570,11 +766,140 @@ def save_checkpoint(
     np.savez(path.parent / "normalizer.npz", **normalizer)
 
 
-def write_metrics(path: Path, epoch: int, metrics: dict[str, float]) -> None:
+def write_metrics(path: Path, step: int, metrics: dict[str, float], *, completed_passes: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    row = {"epoch": epoch, "time": time.time(), **metrics}
+    row = {"step": int(step), "completed_passes": int(completed_passes), "time": time.time(), **metrics}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def resolve_online_opponent_dir(root: Path, name: str) -> Path:
+    direct = Path(name)
+    if (direct / "main.py").exists():
+        return direct
+    aliases = {
+        "nearest": "nearest-sniper",
+        "nearest-sniper": "nearest-sniper",
+        "producer": "slawekbiel-producer",
+        "slawekbiel": "slawekbiel-producer",
+    }
+    candidates = [name]
+    alias = aliases.get(str(name))
+    if alias is not None:
+        candidates.append(alias)
+    for candidate_name in candidates:
+        for subdir in ("external", "mine", "baselines"):
+            candidate = root / subdir / candidate_name
+            if (candidate / "main.py").exists():
+                return candidate
+    raise FileNotFoundError(f"could not resolve online eval opponent: {name}")
+
+
+def make_online_eval_agent(model, train_state, normalizer: dict[str, jnp.ndarray], raw_cfg: dict[str, Any], *, max_fleets: int):
+    # Imported lazily to avoid paying Kaggle/runtime setup cost when online eval is disabled.
+    from .bc_policy_runtime import BCPolicyAgent, build_env_params_from_raw, env_config_from_raw
+    from .features_jax import FeatureParams
+
+    env_params = build_env_params_from_raw(raw_cfg, max_fleets=int(max_fleets))
+    env_cfg = env_config_from_raw(raw_cfg)
+    feature_params = FeatureParams.from_train_config(type("Cfg", (), {"env": env_cfg})())
+    ship_bucket_count = int(raw_get(raw_cfg, "env", "ship_bucket_count", 8))
+    return BCPolicyAgent(
+        model=model,
+        params=train_state.params,
+        normalizer=normalizer,
+        env_params=env_params,
+        feature_params=feature_params,
+        ship_bucket_count=ship_bucket_count,
+    )
+
+
+def run_online_eval(
+    *,
+    model,
+    train_state,
+    normalizer: dict[str, jnp.ndarray],
+    raw_cfg: dict[str, Any],
+    opponent_name: str,
+    agents_root: Path,
+    games: int,
+    seed: int,
+    bc_player: int,
+    max_fleets: int,
+) -> dict[str, float]:
+    from .eval_opponents.opponents import ExternalScriptOpponent
+
+    try:
+        from kaggle_environments import make as kaggle_make
+    except ImportError as exc:
+        raise RuntimeError("kaggle_environments is required for online BC eval") from exc
+
+    agent = make_online_eval_agent(model, train_state, normalizer, raw_cfg, max_fleets=int(max_fleets))
+    opponent_dir = resolve_online_opponent_dir(Path(agents_root), str(opponent_name))
+    opponent = ExternalScriptOpponent(opponent_dir)
+    bc_idx = int(bc_player)
+    opp_idx = 1 - bc_idx
+    wins = losses = draws = 0
+    reward_sum = 0.0
+    turns_sum = 0.0
+    start = time.time()
+    print(
+        f"[online-eval] start opponent={opponent_dir} games={int(games)} bc_player={bc_idx} seed={int(seed)}",
+        flush=True,
+    )
+
+    for game_idx in range(int(games)):
+        game_seed = int(seed) + game_idx
+        opponent.reset_env(game_idx, game_seed)
+        env = kaggle_make("orbit_wars", configuration={"seed": game_seed, "randomSeed": game_seed}, debug=False)
+        env.reset(num_agents=2)
+        states = env.step([[], []])
+        while states[0]["status"] == "ACTIVE":
+            bc_action = agent.act(states[bc_idx]["observation"], player=bc_idx)
+            opp_action = opponent.act_for_env(game_idx, states[opp_idx]["observation"])
+            joint = [None, None]
+            joint[bc_idx] = bc_action
+            joint[opp_idx] = opp_action
+            states = env.step(joint)
+
+        reward = float(states[bc_idx].get("reward", 0.0) or 0.0)
+        reward_sum += reward
+        turns = float(len(env.steps) if hasattr(env, "steps") else 0)
+        turns_sum += turns
+        if reward > 0:
+            wins += 1
+            outcome = "win"
+        elif reward < 0:
+            losses += 1
+            outcome = "loss"
+        else:
+            draws += 1
+            outcome = "draw"
+        print(
+            f"[online-eval] game={game_idx + 1}/{int(games)} seed={game_seed} "
+            f"outcome={outcome} reward={reward:.1f} turns={turns:.0f}",
+            flush=True,
+        )
+
+    total = max(int(games), 1)
+    elapsed = time.time() - start
+    metrics = {
+        "online_wins": float(wins),
+        "online_losses": float(losses),
+        "online_draws": float(draws),
+        "online_win_rate": wins / total,
+        "online_loss_rate": losses / total,
+        "online_draw_rate": draws / total,
+        "online_reward_mean": reward_sum / total,
+        "online_turns_mean": turns_sum / total,
+        "online_elapsed_sec": elapsed,
+    }
+    print(
+        f"[online-eval] done wins={wins} losses={losses} draws={draws} "
+        f"win_rate={metrics['online_win_rate']:.3f} elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+    return metrics
 
 
 def main() -> None:
@@ -584,9 +909,29 @@ def main() -> None:
     dataset_pattern = args.dataset_glob or str(raw_get(raw_cfg, "bc", "dataset_glob", ""))
     paths = shard_paths(dataset_pattern, args.max_shards)
     train_paths, val_paths = split_paths(paths, float(raw_get(raw_cfg, "bc", "val_fraction", 0.1)))
-    epochs = int(args.epochs or raw_get(raw_cfg, "bc", "epochs", 1))
     batch_size = int(args.batch_size or raw_get(raw_cfg, "bc", "batch_size", 512))
     lr = float(args.lr or raw_get(raw_cfg, "bc", "lr", 3e-4))
+    max_steps = int(args.max_steps or raw_get(raw_cfg, "bc", "max_steps", 0))
+    if max_steps <= 0:
+        raise ValueError("step-based BC training requires bc.max_steps or --max-steps > 0")
+    log_every_steps = int(args.log_every_steps or raw_get(raw_cfg, "bc", "log_every_steps", 100))
+    eval_every_steps = int(args.eval_every_steps or raw_get(raw_cfg, "bc", "eval_every_steps", 1000))
+    eval_batches = int(args.eval_batches or raw_get(raw_cfg, "bc", "eval_batches", 64))
+    checkpoint_every_steps = int(args.checkpoint_every_steps or raw_get(raw_cfg, "bc", "checkpoint_every_steps", 5000))
+    shuffle_shards = bool(raw_get(raw_cfg, "bc", "shuffle_shards", True)) and not bool(args.no_shuffle_shards)
+    prefetch_batches = int(args.prefetch_batches if args.prefetch_batches is not None else raw_get(raw_cfg, "bc", "prefetch_batches", 0))
+    shuffle_buffer_rows_raw = args.shuffle_buffer_rows
+    if shuffle_buffer_rows_raw is None:
+        shuffle_buffer_rows_raw = raw_get(raw_cfg, "bc", "shuffle_buffer_rows", None)
+    if shuffle_buffer_rows_raw is None:
+        raise ValueError("step-based BC training requires bc.shuffle_buffer_rows or --shuffle-buffer-rows")
+    shuffle_buffer_rows = int(shuffle_buffer_rows_raw)
+    if eval_batches <= 0:
+        raise ValueError("step-based BC training requires bc.eval_batches or --eval-batches > 0")
+    if shuffle_buffer_rows < batch_size:
+        raise ValueError("bc.shuffle_buffer_rows or --shuffle-buffer-rows must be >= batch_size")
+    if prefetch_batches < 0:
+        raise ValueError("bc.prefetch_batches or --prefetch-batches must be >= 0")
     hidden_size = int(raw_get(raw_cfg, "model", "hidden_size", 128))
     use_cnn = bool(raw_get(raw_cfg, "model", "use_cnn", True))
     weight_decay = float(raw_get(raw_cfg, "bc", "weight_decay", 0.0))
@@ -597,6 +942,19 @@ def main() -> None:
         "target_weight": float(raw_get(raw_cfg, "bc", "target_weight", 1.0)),
         "amount_weight": float(raw_get(raw_cfg, "bc", "amount_weight", 0.5)),
     }
+    online_eval_enabled = bool(raw_get(raw_cfg, "eval", "enabled", False))
+    online_eval_every_steps = int(raw_get(raw_cfg, "eval", "every_steps", 0))
+    online_eval_games = int(raw_get(raw_cfg, "eval", "games", 2))
+    online_eval_seed = int(raw_get(raw_cfg, "eval", "seed", 300000))
+    online_eval_opponent = str(raw_get(raw_cfg, "eval", "opponent", "slawekbiel-producer"))
+    online_eval_agents_root = Path(str(raw_get(raw_cfg, "eval", "agents_root", "agents")))
+    online_eval_bc_player = int(raw_get(raw_cfg, "eval", "bc_player", 0))
+    online_eval_max_fleets = int(raw_get(raw_cfg, "eval", "max_fleets", 512))
+    online_eval_fail_on_error = bool(raw_get(raw_cfg, "eval", "fail_on_error", False))
+    if online_eval_enabled and online_eval_every_steps <= 0:
+        raise ValueError("online eval is enabled, so eval.every_steps must be > 0")
+    if online_eval_bc_player not in (0, 1):
+        raise ValueError(f"eval.bc_player must be 0 or 1, got {online_eval_bc_player}")
 
     tic = time.time()
     if resume_payload is not None and "normalizer" in resume_payload and not args.no_normalize:
@@ -604,12 +962,23 @@ def main() -> None:
         print(f"resume: loaded normalizer from {args.resume}", flush=True)
     else:
         normalizer_np = identity_normalizer() if args.no_normalize else compute_normalizer(train_paths)
+        if args.no_normalize:
+            print("normalizer: disabled; using identity normalizer", flush=True)
     normalizer = jax_normalizer(normalizer_np)
     print(
         f"BC feature-row start shards={len(paths)} train={len(train_paths)} val={len(val_paths)} "
-        f"epochs={epochs} batch={batch_size} norm_counts={normalizer_np['counts'].tolist()}",
+        f"max_steps={max_steps} batch={batch_size} eval_batches={eval_batches} "
+        f"shuffle_shards={shuffle_shards} shuffle_buffer_rows={shuffle_buffer_rows} "
+        f"prefetch_batches={prefetch_batches} "
+        f"norm_counts={normalizer_np['counts'].tolist()}",
         flush=True,
     )
+    if online_eval_enabled:
+        print(
+            f"online eval enabled every_steps={online_eval_every_steps} games={online_eval_games} "
+            f"opponent={online_eval_opponent} bc_player={online_eval_bc_player}",
+            flush=True,
+        )
 
     sample_data = load_shard_arrays(train_paths[0])
     sample_idx = np.arange(min(batch_size, int(sample_data["label__fire"].shape[0])))
@@ -620,20 +989,19 @@ def main() -> None:
     rng = jax.random.PRNGKey(int(raw_cfg.get("seed", 42)))
     rng, init_rng = jax.random.split(rng)
     train_state = make_train_state(init_rng, model, sample_batch, lr=lr, weight_decay=weight_decay)
-    start_epoch = 1
+    completed_passes = 0
     if resume_payload is not None:
         train_state = restore_train_state(train_state, resume_payload)
-        resumed_epoch = int(resume_payload.get("epoch", 0) or 0)
-        start_epoch = resumed_epoch + 1
+        completed_passes = int(resume_payload.get("completed_passes", 0) or 0)
         if "rng" in resume_payload:
             rng = jnp.asarray(resume_payload["rng"])
         print(
-            f"resume: restored {args.resume} epoch={resumed_epoch} "
-            f"step={int(jax.device_get(train_state.step))} next_epoch={start_epoch}",
+            f"resume: restored {args.resume} step={int(jax.device_get(train_state.step))} "
+            f"completed_passes={completed_passes}",
             flush=True,
         )
-    train_step = make_train_step(model, weights)
-    eval_step = make_eval_step(model, weights)
+    train_step = make_train_step(model, weights, normalizer)
+    eval_step = make_eval_step(model, weights, normalizer)
 
     save_root = Path(str(args.save_dir or raw_cfg.get("save_dir", "/mnt/f/kaggle-orbit-wars-data/bc_runs")))
     run_name = str(args.run_name or raw_cfg.get("run_name", "bc_feature_rows"))
@@ -642,7 +1010,6 @@ def main() -> None:
     np.savez(save_dir / "normalizer.npz", **normalizer_np)
     (save_dir / "train_config_snapshot.yaml").write_text(yaml.safe_dump(raw_cfg, sort_keys=False), encoding="utf-8")
 
-    checkpoint_every = int(raw_cfg.get("checkpoint_every", 1))
     metrics_path = save_dir / "metrics.jsonl"
     best_val = metrics_best_val(metrics_path)
     if resume_payload is not None:
@@ -651,62 +1018,145 @@ def main() -> None:
             float(resume_payload.get("best_val", float("inf"))),
             float(resume_payload.get("metrics", {}).get("val_loss", float("inf"))),
         )
-    if start_epoch > epochs:
-        print(f"BC resume checkpoint already at epoch {start_epoch - 1}; target epochs={epochs}, nothing to do.", flush=True)
+    start_step = int(jax.device_get(train_state.step))
+    if start_step >= max_steps:
+        print(f"BC resume checkpoint already at step {start_step}; target max_steps={max_steps}, nothing to do.", flush=True)
         return
 
-    for epoch in range(start_epoch, epochs + 1):
-        epoch_tic = time.time()
-        train_state, rng, train_metrics = run_epoch(
-            train_paths,
-            train_state,
-            train_step,
-            normalizer,
-            batch_size,
-            rng,
-            train=True,
-            noop_keep_ratio=noop_keep_ratio,
-            max_rows_per_shard=args.max_rows_per_shard,
-        )
-        train_state, rng, val_metrics = run_epoch(
-            val_paths,
-            train_state,
-            eval_step,
-            normalizer,
-            batch_size,
-            rng,
-            train=False,
-            noop_keep_ratio=1.0,
-            max_rows_per_shard=args.max_rows_per_shard,
-        )
-        metrics = {f"train_{k}": v for k, v in train_metrics.items()}
-        metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
-        elapsed = time.time() - epoch_tic
-        metrics["epoch_elapsed_sec"] = elapsed
+    data_seed = int(raw_cfg.get("seed", 42)) + 1_000_003 * (start_step + 1)
+    data_rng = np.random.default_rng(data_seed)
+    stream = train_batch_stream(
+        train_paths,
+        batch_size,
+        data_rng,
+        noop_keep_ratio,
+        args.max_rows_per_shard,
+        initial_completed_passes=completed_passes,
+        shuffle_shards=shuffle_shards,
+        shuffle_buffer_rows=shuffle_buffer_rows,
+    )
+    stream = prefetch_batch_stream(stream, prefetch_batches)
+    log_sums: dict[str, jnp.ndarray] = {}
+    log_count = 0
+    log_start_step = start_step
+    log_start_time = time.time()
+    last_metrics: dict[str, float] = {}
+    step = start_step
+
+    while step < max_steps:
+        batch, completed_passes, _path = next(stream)
+        train_state, train_metrics_raw = train_step(train_state, batch)
+        step += 1
+        batch_rows = int(batch.fire.shape[0])
+        add_metric_sums_device(log_sums, train_metrics_raw, batch_rows)
+        log_count += batch_rows
+
+        final_step = step >= max_steps
+        log_due = log_every_steps > 0 and (step % log_every_steps == 0 or final_step)
+        eval_due = eval_every_steps > 0 and (step % eval_every_steps == 0 or final_step)
+        online_due = online_eval_enabled and (step % online_eval_every_steps == 0 or final_step)
+        checkpoint_due = checkpoint_every_steps > 0 and (step % checkpoint_every_steps == 0 or final_step)
+        if not (log_due or eval_due or online_due or checkpoint_due):
+            continue
+
+        train_metrics = {
+            key: float(value)
+            for key, value in jax.device_get(average_metric_sums_device(log_sums, log_count)).items()
+        }
+        metrics = {f"train_{key}": value for key, value in train_metrics.items()}
         metrics["total_elapsed_sec"] = time.time() - tic
-        write_metrics(metrics_path, epoch, metrics)
-        print(
-            f"epoch={epoch:04d} loss={metrics['train_loss']:.4f} val={metrics['val_loss']:.4f} "
-            f"fire_acc={metrics['val_fire_acc']:.3f} fire_rec={metrics['val_fire_recall']:.3f} "
-            f"target={metrics['val_target_acc']:.3f}/{metrics['val_target_top3']:.3f} "
-            f"amount={metrics['val_amount_acc']:.3f} mae={metrics['val_amount_mae']:.3f} "
-            f"launch={metrics['val_launch_rate']:.3f}->{metrics['val_pred_launch_rate']:.3f} "
-            f"elapsed={elapsed:.1f}s",
-            flush=True,
-        )
-        improved = metrics["val_loss"] < best_val
-        if improved:
-            best_val = metrics["val_loss"]
-        save_checkpoint(
-            save_dir / "ckpt_last.pkl",
-            train_state,
-            normalizer_np,
-            raw_cfg,
-            metrics,
-            epoch=epoch,
-            rng=rng,
-            best_val=best_val,
-        )
+        metrics["steps_per_sec"] = (step - log_start_step) / max(time.time() - log_start_time, 1e-9)
+        metrics["rows_per_sec"] = metrics["steps_per_sec"] * float(batch_size)
+
+        improved = False
+        if eval_due:
+            val_metrics = run_eval_batches(
+                val_paths,
+                train_state,
+                eval_step,
+                batch_size,
+                np.random.default_rng(int(raw_cfg.get("seed", 42)) + 2_000_003 + step),
+                eval_batches,
+                args.max_rows_per_shard,
+            )
+            metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
+            improved = metrics["val_loss"] < best_val
+            if improved:
+                best_val = metrics["val_loss"]
+
+        if online_due:
+            try:
+                online_metrics = run_online_eval(
+                    model=model,
+                    train_state=train_state,
+                    normalizer=normalizer,
+                    raw_cfg=raw_cfg,
+                    opponent_name=online_eval_opponent,
+                    agents_root=online_eval_agents_root,
+                    games=online_eval_games,
+                    seed=online_eval_seed + step,
+                    bc_player=online_eval_bc_player,
+                    max_fleets=online_eval_max_fleets,
+                )
+                metrics.update(online_metrics)
+            except Exception as exc:
+                if online_eval_fail_on_error:
+                    raise
+                metrics["online_eval_error"] = 1.0
+                print(f"[online-eval] failed at step={step}: {exc!r}", flush=True)
+
+        write_metrics(metrics_path, step, metrics, completed_passes=completed_passes)
+        last_metrics = metrics
+        online_text = ""
+        if "online_win_rate" in metrics:
+            online_text = (
+                f" online_wr={metrics['online_win_rate']:.3f}"
+                f" online={int(metrics['online_wins'])}-{int(metrics['online_losses'])}-{int(metrics['online_draws'])}"
+            )
+        if eval_due:
+            print(
+                f"step={step:08d}/{max_steps} loss={metrics['train_loss']:.4f} val={metrics['val_loss']:.4f} "
+                f"fire_acc={metrics['val_fire_acc']:.3f} fire_rec={metrics['val_fire_recall']:.3f} "
+                f"target={metrics['val_target_acc']:.3f}/{metrics['val_target_top3']:.3f} "
+                f"amount={metrics['val_amount_acc']:.3f} mae={metrics['val_amount_mae']:.3f} "
+                f"launch={metrics['val_launch_rate']:.3f}->{metrics['val_pred_launch_rate']:.3f} "
+                f"steps/s={metrics['steps_per_sec']:.2f} rows/s={metrics['rows_per_sec']:.0f}{online_text}",
+                flush=True,
+            )
+        elif log_due:
+            print(
+                f"step={step:08d}/{max_steps} loss={metrics['train_loss']:.4f} "
+                f"fire_acc={metrics['train_fire_acc']:.3f} fire_rec={metrics['train_fire_recall']:.3f} "
+                f"target={metrics['train_target_acc']:.3f}/{metrics['train_target_top3']:.3f} "
+                f"amount={metrics['train_amount_acc']:.3f} mae={metrics['train_amount_mae']:.3f} "
+                f"launch={metrics['train_launch_rate']:.3f}->{metrics['train_pred_launch_rate']:.3f} "
+                f"steps/s={metrics['steps_per_sec']:.2f} rows/s={metrics['rows_per_sec']:.0f}{online_text}",
+                flush=True,
+            )
+        elif online_due:
+            print(
+                f"step={step:08d}/{max_steps} loss={metrics['train_loss']:.4f} "
+                f"steps/s={metrics['steps_per_sec']:.2f} rows/s={metrics['rows_per_sec']:.0f}{online_text}",
+                flush=True,
+            )
+
+        if log_due or eval_due or online_due:
+            log_sums = {}
+            log_count = 0
+            log_start_step = step
+            log_start_time = time.time()
+
+        if checkpoint_due or improved:
+            save_checkpoint(
+                save_dir / "ckpt_last.pkl",
+                train_state,
+                normalizer_np,
+                raw_cfg,
+                metrics,
+                completed_passes=completed_passes,
+                rng=rng,
+                best_val=best_val,
+            )
         if improved:
             save_checkpoint(
                 save_dir / "ckpt_best.pkl",
@@ -714,23 +1164,24 @@ def main() -> None:
                 normalizer_np,
                 raw_cfg,
                 metrics,
-                epoch=epoch,
+                completed_passes=completed_passes,
                 rng=rng,
                 best_val=best_val,
             )
-        if checkpoint_every > 0 and epoch % checkpoint_every == 0:
+        if checkpoint_due:
             save_checkpoint(
-                save_dir / f"ckpt_epoch_{epoch:04d}.pkl",
+                save_dir / f"ckpt_step_{step:08d}.pkl",
                 train_state,
                 normalizer_np,
                 raw_cfg,
                 metrics,
-                epoch=epoch,
+                completed_passes=completed_passes,
                 rng=rng,
                 best_val=best_val,
             )
 
-    print(f"BC done, wrote {save_dir / 'ckpt_best.pkl'}", flush=True)
+    if last_metrics:
+        print(f"BC done at step={step}; wrote {save_dir / 'ckpt_last.pkl'}", flush=True)
 
 
 if __name__ == "__main__":

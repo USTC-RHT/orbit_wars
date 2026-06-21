@@ -6,8 +6,6 @@
 seed: 42
 run_name: "bc_feature_rows_fight_full"
 save_dir: /mnt/f/kaggle-orbit-wars-data/bc_runs
-log_every: 1
-checkpoint_every: 1
 
 env:
   board_size: 100.0
@@ -22,7 +20,7 @@ env:
 
 model:
   actor_type: per_planet
-  hidden_size: 128
+  hidden_size: 1024
   use_cnn: true
   use_transformer: false
 
@@ -32,18 +30,27 @@ state_norm:
   eps: 1.0e-8
 
 eval:
-  enabled: false
-  every: 1
-  games: 2
+  enabled: true
+  every_steps: 10000
+  games: 20
   seed: 300000
-  opponent: nearest
-  bank: /mnt/f/kaggle-orbit-wars-data/state_banks/rl_agent_bc_eval_bank.npz
-  bank_size: 16
+  opponent: slawekbiel-producer
+  agents_root: agents
+  bc_player: 0
+  max_fleets: 512
+  fail_on_error: false
 
 bc:
   dataset_glob: /mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full_v2_compressed/bc_feature_rows_*.npz
-  epochs: 5
-  batch_size: 512
+  max_steps: 200000
+  batch_size: 2048
+  shuffle_shards: true
+  shuffle_buffer_rows: 65536
+  prefetch_batches: 2
+  log_every_steps: 100
+  eval_every_steps: 5000
+  eval_batches: 64
+  checkpoint_every_steps: 5000
   lr: 3.0e-4
   weight_decay: 0.0
   val_fraction: 0.1

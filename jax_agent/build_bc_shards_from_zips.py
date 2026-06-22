@@ -672,7 +672,8 @@ def main() -> None:
 
     by_zip: dict[str, list[dict[str, str]]] = {}
     for row in rows:
-        by_zip.setdefault(row["zip_path"], []).append(row)
+        zip_path = args.zip_dir / Path(row["zip_path"]).name
+        by_zip.setdefault(str(zip_path), []).append(row)
     if int(args.max_replays_per_zip) > 0:
         by_zip = {path: zip_rows[: int(args.max_replays_per_zip)] for path, zip_rows in by_zip.items()}
     write_input_snapshot(args.output_dir, args, rows, by_zip)

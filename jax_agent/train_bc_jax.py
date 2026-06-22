@@ -158,6 +158,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument("--normalizer-path", type=Path, default=None)
+    parser.add_argument("--normalizer-sample-shards", type=int, default=None)
+    parser.add_argument("--normalizer-sample-seed", type=int, default=None)
     parser.add_argument("--resume", type=Path, default=None, help="Resume from a BC checkpoint path.")
     parser.add_argument("--winner-fire-rate-min", type=float, default=None)
     parser.add_argument("--winner-fire-rate-max", type=float, default=None)
@@ -189,6 +192,14 @@ def split_paths(paths: list[Path], val_fraction: float) -> tuple[list[Path], lis
     train_paths = paths[:-val_count] if val_count else paths
     val_paths = paths[-val_count:] if val_count else paths[-1:]
     return train_paths, val_paths
+
+
+def sample_normalizer_paths(paths: list[Path], sample_shards: int, seed: int) -> list[Path]:
+    if int(sample_shards) <= 0 or int(sample_shards) >= len(paths):
+        return paths
+    rng = np.random.default_rng(int(seed))
+    indices = np.sort(rng.choice(len(paths), size=int(sample_shards), replace=False))
+    return [paths[int(i)] for i in indices]
 
 
 def load_shard_arrays(path: Path, keys: tuple[str, ...] = TRAIN_ARRAY_KEYS) -> dict[str, np.ndarray]:
@@ -615,6 +626,15 @@ def identity_normalizer() -> dict[str, np.ndarray]:
         "map_std": np.ones((6, 1, 1), dtype=np.float32),
         "counts": np.zeros((4,), dtype=np.float64),
     }
+
+
+def load_normalizer_npz(path: Path) -> dict[str, np.ndarray]:
+    required = tuple(identity_normalizer().keys())
+    with np.load(path) as data:
+        missing = [name for name in required if name not in data.files]
+        if missing:
+            raise KeyError(f"normalizer npz missing keys {missing}: {path}")
+        return {name: np.asarray(data[name]) for name in required}
 
 
 def jax_normalizer(normalizer: dict[str, np.ndarray]) -> dict[str, jnp.ndarray]:
@@ -1247,6 +1267,7 @@ def prefix_online_eval_metrics(prefix: str, metrics: dict[str, float]) -> dict[s
 
 def main() -> None:
     args = parse_args()
+    config_path = Path(args.config).expanduser()
     raw_cfg = read_raw_config(args.config)
     bc_cfg = raw_cfg.setdefault("bc", {})
     if isinstance(bc_cfg, dict):
@@ -1354,14 +1375,42 @@ def main() -> None:
         )
         log_wandb(use_wandb, {f"winner_filter/{k}": v for k, v in filter_summary.items()}, step=0)
     normalize_enabled = bool(raw_get(raw_cfg, "state_norm", "enabled", True)) and not args.no_normalize
+    normalizer_sample_shards = args.normalizer_sample_shards
+    if normalizer_sample_shards is None:
+        normalizer_sample_shards = parse_optional_int(raw_get(raw_cfg, "state_norm", "sample_shards", 0))
+    normalizer_sample_seed = args.normalizer_sample_seed
+    if normalizer_sample_seed is None:
+        normalizer_sample_seed = parse_optional_int(raw_get(raw_cfg, "state_norm", "sample_seed", seed))
+    normalizer_path = args.normalizer_path
+    if normalizer_path is None:
+        normalizer_path_raw = raw_get(raw_cfg, "state_norm", "normalizer_path", None)
+        if normalizer_path_raw in (None, ""):
+            normalizer_path_raw = raw_get(raw_cfg, "state_norm", "path", None)
+        if normalizer_path_raw not in (None, ""):
+            normalizer_path = Path(str(normalizer_path_raw)).expanduser()
+    if normalizer_path is not None and not normalizer_path.is_absolute():
+        normalizer_path = (config_path.parent / normalizer_path).resolve()
     if resume_payload is not None and "normalizer" in resume_payload and normalize_enabled:
         normalizer_np = resume_payload["normalizer"]
         print(f"resume: loaded normalizer from {args.resume}", flush=True)
+    elif normalize_enabled and normalizer_path is not None:
+        if not normalizer_path.is_file():
+            raise FileNotFoundError(f"configured normalizer_path does not exist: {normalizer_path}")
+        normalizer_np = load_normalizer_npz(normalizer_path)
+        print(f"normalizer: loaded from {normalizer_path}", flush=True)
+        log_wandb(use_wandb, {"normalizer/loaded_from_path": 1}, step=0)
     else:
+        normalizer_paths = sample_normalizer_paths(train_paths, int(normalizer_sample_shards or 0), int(normalizer_sample_seed or seed))
+        if normalize_enabled and len(normalizer_paths) != len(train_paths):
+            print(
+                f"normalizer: sampled shards={len(normalizer_paths)}/{len(train_paths)} "
+                f"seed={int(normalizer_sample_seed or seed)}",
+                flush=True,
+            )
         normalizer_np = (
             identity_normalizer()
             if not normalize_enabled
-            else compute_normalizer(train_paths, use_wandb=use_wandb, allowed_winners=allowed_winners)
+            else compute_normalizer(normalizer_paths, use_wandb=use_wandb, allowed_winners=allowed_winners)
         )
         if not normalize_enabled:
             print("normalizer: disabled; using identity normalizer", flush=True)

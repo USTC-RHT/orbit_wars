@@ -20,6 +20,10 @@ from .train_bc_jax import FeatureRowBCPolicy, FeatureRowBatch, identity_normaliz
 from .train_jax import aim_with_prediction_jax, fit_action_slots
 
 NEG_INF = -1.0e9
+FIGHT_PLANET_X = 5
+FIGHT_PLANET_Y = 6
+FIGHT_REL_DX = 1
+FIGHT_REL_DY = 2
 
 
 class BCPolicyRows(NamedTuple):
@@ -73,8 +77,9 @@ def build_env_params_from_raw(raw: dict[str, Any], *, max_fleets: int = 512) -> 
 def canonicalize_state_owner_for_player(state: EnvState, player: int) -> EnvState:
     """Put the requested player in owner slot 0 without rotating coordinates.
 
-    BC feature rows were built by owner-canonicalizing the learner side; keeping
-    real coordinates means predicted angles can be emitted directly to Kaggle.
+    BC feature rows are mirrored at the feature-row level by
+    ``bc_rows_to_player0_view``. Keeping the state in real coordinates here
+    lets action aiming emit Kaggle angles directly.
     """
 
     if int(player) == 0:
@@ -87,6 +92,56 @@ def canonicalize_state_owner_for_player(state: EnvState, player: int) -> EnvStat
     initial_planets = state.initial_planets.at[:, 1].set(flip_owner(state.initial_planets[:, 1]))
     fleets = state.fleets.at[:, 1].set(flip_owner(state.fleets[:, 1]))
     return state._replace(planets=planets, initial_planets=initial_planets, fleets=fleets)
+
+
+def mirror_planet_indices(count: int) -> jnp.ndarray:
+    idx = jnp.arange(int(count), dtype=jnp.int32)
+    mirror = (idx // 4) * 4 + (3 - (idx % 4))
+    return jnp.where(mirror < int(count), mirror, idx).astype(jnp.int32)
+
+
+def bc_rows_to_player0_view(rows: BCPolicyRows, player: int | jnp.ndarray) -> BCPolicyRows:
+    """Apply the same player-1 feature-row mirror used by offline conversion.
+
+    The raw state stays in the real map frame for aiming. Only the tensors seen
+    by the BC model are mirrored/permuted to the canonical player-0 view.
+    """
+
+    max_planets = int(rows.relative.shape[1] - 1)
+    planet_perm = mirror_planet_indices(max_planets)
+    candidate_perm = jnp.concatenate([jnp.asarray([0], dtype=jnp.int32), planet_perm + 1])
+
+    planet = rows.planet
+    mirrored_planet = planet.at[:, FIGHT_PLANET_X].set(1.0 - planet[:, FIGHT_PLANET_X])
+    mirrored_planet = mirrored_planet.at[:, FIGHT_PLANET_Y].set(1.0 - planet[:, FIGHT_PLANET_Y])
+
+    relative = rows.relative[:, candidate_perm, :]
+    relative = relative.at[:, :, FIGHT_REL_DX].set(-relative[:, :, FIGHT_REL_DX])
+    relative = relative.at[:, :, FIGHT_REL_DY].set(-relative[:, :, FIGHT_REL_DY])
+
+    mirrored = rows._replace(
+        planet=mirrored_planet,
+        relative=relative,
+        candidate_mask=rows.candidate_mask[:, candidate_perm],
+        amount_mask=rows.amount_mask[:, candidate_perm, :],
+        map_features=rows.map_features[:, :, ::-1, ::-1],
+    )
+    use_mirror = jnp.asarray(player, dtype=jnp.int32) == 1
+    return BCPolicyRows(
+        **{
+            name: jnp.where(use_mirror, getattr(mirrored, name), getattr(rows, name))
+            for name in rows._fields
+        }
+    )
+
+
+def target_from_player0_view(target: jnp.ndarray, player: int | jnp.ndarray, max_planets: int) -> jnp.ndarray:
+    """Map model-view target indices back to real environment candidate slots."""
+
+    planet_perm = mirror_planet_indices(int(max_planets))
+    target_slot = jnp.clip(target - 1, 0, int(max_planets) - 1).astype(jnp.int32)
+    mapped = jnp.where(target > 0, planet_perm[target_slot] + 1, 0).astype(jnp.int32)
+    return jnp.where(jnp.asarray(player, dtype=jnp.int32) == 1, mapped, target).astype(jnp.int32)
 
 
 def obs_to_bc_state(obs: Any, env_params: EnvParams, player: int | None = None) -> EnvState:
@@ -296,12 +351,19 @@ class BCPolicyAgent:
             ship_bucket_count=ship_bucket_count,
         )
 
-    def _act_arrays(self, state: EnvState) -> jnp.ndarray:
+    def _act_arrays(self, state: EnvState, player: jnp.ndarray) -> jnp.ndarray:
         rows = build_bc_policy_rows(state, self.feature_params, self.ship_bucket_count)
-        fire, target, amount = bc_decisions(self.model, self.params, rows, self.normalizer)
-        return bc_actions_from_decisions(state, rows, fire, target, amount, self.env_params)
+        model_rows = bc_rows_to_player0_view(rows, player)
+        fire, target, amount = bc_decisions(self.model, self.params, model_rows, self.normalizer)
+        target_env = target_from_player0_view(target, player, int(self.env_params.max_planets))
+        return bc_actions_from_decisions(state, rows, fire, target_env, amount, self.env_params)
 
     def act(self, observation: Any, *, player: int | None = None) -> list[list[float | int]]:
+        if player is None:
+            if isinstance(observation, dict):
+                player = int(observation.get("player", 0) or 0)
+            else:
+                player = int(getattr(observation, "player", 0) or 0)
         state = obs_to_bc_state(observation, self.env_params, player=player)
-        actions = self._act_jit(state)
+        actions = self._act_jit(state, jnp.asarray(int(player), dtype=jnp.int32))
         return jax_actions_to_kaggle(jax.device_get(actions))

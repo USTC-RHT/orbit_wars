@@ -23,10 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from .bc_policy_runtime import (
+    bc_rows_to_player0_view,
     build_bc_policy_rows,
     build_env_params_from_raw,
     canonicalize_state_owner_for_player,
     env_config_from_raw,
+    target_from_player0_view,
 )
 from .fast_env import state_from_observation
 from .features_jax import FeatureParams
@@ -147,13 +149,20 @@ class BCOnnxPolicyAgent:
         state = state_from_observation(observation, self.env_params)
         state = canonicalize_state_owner_for_player(state, int(player))
         rows = self._build_rows_jit(state)
+        model_rows = bc_rows_to_player0_view(rows, int(player))
         rows_np = {
-            "planet": np.asarray(jax.device_get(rows.planet)),
-            "relative": np.asarray(jax.device_get(rows.relative)),
-            "global_features": np.asarray(jax.device_get(rows.global_features)),
-            "map_features": np.asarray(jax.device_get(rows.map_features)),
+            "planet": np.asarray(jax.device_get(model_rows.planet)),
+            "relative": np.asarray(jax.device_get(model_rows.relative)),
+            "global_features": np.asarray(jax.device_get(model_rows.global_features)),
+            "map_features": np.asarray(jax.device_get(model_rows.map_features)),
+            "candidate_mask": np.asarray(jax.device_get(model_rows.candidate_mask)),
+            "amount_mask": np.asarray(jax.device_get(model_rows.amount_mask)),
+            "source_mask": np.asarray(jax.device_get(model_rows.source_mask)),
+            "source_ids": np.asarray(jax.device_get(model_rows.source_ids)),
+            "ship_buckets": np.asarray(jax.device_get(model_rows.ship_buckets)),
+        }
+        env_rows_np = {
             "candidate_mask": np.asarray(jax.device_get(rows.candidate_mask)),
-            "amount_mask": np.asarray(jax.device_get(rows.amount_mask)),
             "source_mask": np.asarray(jax.device_get(rows.source_mask)),
             "source_ids": np.asarray(jax.device_get(rows.source_ids)),
             "ship_buckets": np.asarray(jax.device_get(rows.ship_buckets)),
@@ -178,16 +187,20 @@ class BCOnnxPolicyAgent:
         amount = np.argmax(_safe_logits_np(amount_logits, selected_amount_mask), axis=-1).astype(np.int32)
         amount = np.where(fire, amount, 0).astype(np.int32)
 
-        target_slot = np.clip(target[None] - 1, 0, self.max_planets - 1).astype(np.int32)
+        target_env = np.asarray(
+            jax.device_get(target_from_player0_view(jnp.asarray(target), int(player), self.max_planets)),
+            dtype=np.int32,
+        )
+        target_slot = np.clip(target_env[None] - 1, 0, self.max_planets - 1).astype(np.int32)
         source_planets = np.asarray(jax.device_get(state.planets))[None]
         target_planets = np.take_along_axis(source_planets, target_slot[..., None], axis=1)
-        ships = np.take_along_axis(rows_np["ship_buckets"][None], amount[None, :, None], axis=2).squeeze(-1)
-        target_valid = np.take_along_axis(rows_np["candidate_mask"][None], target[None, :, None], axis=2).squeeze(-1)
-        valid = fire[None] & rows_np["source_mask"][None] & target_valid & (target[None] > 0) & (ships > 0.0)
+        ships = np.take_along_axis(env_rows_np["ship_buckets"][None], amount[None, :, None], axis=2).squeeze(-1)
+        target_valid = np.take_along_axis(env_rows_np["candidate_mask"][None], target_env[None, :, None], axis=2).squeeze(-1)
+        valid = fire[None] & env_rows_np["source_mask"][None] & target_valid & (target_env[None] > 0) & (ships > 0.0)
         angle, _hit = aim_with_prediction_np(source_planets, target_planets, target_slot, state, ships)
         actions = np.stack(
             [
-                np.where(valid, rows_np["source_ids"][None].astype(np.float32), 0.0),
+                np.where(valid, env_rows_np["source_ids"][None].astype(np.float32), 0.0),
                 np.where(valid, angle, 0.0),
                 np.where(valid, ships, 0.0),
             ],

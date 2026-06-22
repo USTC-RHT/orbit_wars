@@ -26,6 +26,9 @@ model:
 
 state_norm:
   enabled: true
+  normalizer_path: normalizer.npz
+  sample_shards: 512   # 0 = scan all train shards for normalizer stats
+  sample_seed: 42
   clip: 5.0
   eps: 1.0e-8
 

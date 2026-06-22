@@ -7,5 +7,20 @@ outputs/
 .ipynb_checkpoints/
 .vscode/
 .DS_Store
-agents
+
+# Most packaged/external agents are local artifacts. Keep the fixed eval
+# opponents tracked because container runs sync this repo through git.
+agents/*
+!agents/external/
+agents/external/*
+!agents/external/slawekbiel-producer/
+!agents/external/slawekbiel-producer/**
+!agents/mine/
+agents/mine/*
+!agents/mine/fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid/
+!agents/mine/fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid/**
+!agents/mine/fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid/
+!agents/mine/fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid/**
+agents/**/__pycache__/
+agents/**/*.pyc
 checkpoints

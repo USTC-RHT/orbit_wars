@@ -1204,23 +1204,43 @@ def run_online_eval(
 
     total = max(int(games), 1)
     elapsed = time.time() - start
-    metrics = {
-        "online_wins": float(wins),
-        "online_losses": float(losses),
-        "online_draws": float(draws),
-        "online_win_rate": wins / total,
-        "online_loss_rate": losses / total,
-        "online_draw_rate": draws / total,
-        "online_reward_mean": reward_sum / total,
-        "online_turns_mean": turns_sum / total,
-        "online_elapsed_sec": elapsed,
-    }
+    metrics = {"online_win_rate": wins / total}
     print(
         f"[online-eval] done wins={wins} losses={losses} draws={draws} "
         f"win_rate={metrics['online_win_rate']:.3f} elapsed={elapsed:.1f}s",
         flush=True,
     )
     return metrics
+
+
+def online_eval_opponent_names(raw_cfg: dict[str, Any]) -> list[str]:
+    value = raw_get(raw_cfg, "eval", "opponents", None)
+    if value is None:
+        return [str(raw_get(raw_cfg, "eval", "opponent", "slawekbiel-producer"))]
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def online_eval_metric_prefix(name: str) -> str:
+    aliases = {
+        "producer": "producer",
+        "slawekbiel": "producer",
+        "slawekbiel-producer": "producer",
+        "fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid": "ckpt48900",
+        "ckpt_48900": "ckpt48900",
+        "ckpt48900": "ckpt48900",
+    }
+    label = aliases.get(str(name), str(name))
+    out = []
+    for ch in label.lower():
+        out.append(ch if ch.isalnum() else "_")
+    return "_".join("".join(out).strip("_").split("_"))
+
+
+def prefix_online_eval_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    win_rate = metrics.get("online_win_rate")
+    return {} if win_rate is None else {f"online_{prefix}_win_rate": float(win_rate)}
 
 
 def main() -> None:
@@ -1292,7 +1312,7 @@ def main() -> None:
     online_eval_every_steps = int(raw_get(raw_cfg, "eval", "every_steps", 0))
     online_eval_games = int(raw_get(raw_cfg, "eval", "games", 2))
     online_eval_seed = int(raw_get(raw_cfg, "eval", "seed", 300000))
-    online_eval_opponent = str(raw_get(raw_cfg, "eval", "opponent", "slawekbiel-producer"))
+    online_eval_opponents = online_eval_opponent_names(raw_cfg)
     online_eval_agents_root = Path(str(raw_get(raw_cfg, "eval", "agents_root", "agents")))
     online_eval_bc_player = int(raw_get(raw_cfg, "eval", "bc_player", 0))
     online_eval_max_fleets = int(raw_get(raw_cfg, "eval", "max_fleets", 512))
@@ -1356,7 +1376,7 @@ def main() -> None:
     if online_eval_enabled:
         print(
             f"online eval enabled every_steps={online_eval_every_steps} games={online_eval_games} "
-            f"opponent={online_eval_opponent} bc_player={online_eval_bc_player}",
+            f"opponents={online_eval_opponents} bc_player={online_eval_bc_player}",
             flush=True,
         )
 
@@ -1463,35 +1483,41 @@ def main() -> None:
                 best_val = metrics["val_loss"]
 
         if online_due:
-            try:
-                online_metrics = run_online_eval(
-                    model=model,
-                    train_state=train_state,
-                    normalizer=normalizer,
-                    raw_cfg=raw_cfg,
-                    opponent_name=online_eval_opponent,
-                    agents_root=online_eval_agents_root,
-                    games=online_eval_games,
-                    seed=online_eval_seed + step,
-                    bc_player=online_eval_bc_player,
-                    max_fleets=online_eval_max_fleets,
-                )
-                metrics.update(online_metrics)
-            except Exception as exc:
-                if online_eval_fail_on_error:
-                    raise
-                metrics["online_eval_error"] = 1.0
-                print(f"[online-eval] failed at step={step}: {exc!r}", flush=True)
+            for opponent_name in online_eval_opponents:
+                prefix = online_eval_metric_prefix(opponent_name)
+                try:
+                    online_metrics = run_online_eval(
+                        model=model,
+                        train_state=train_state,
+                        normalizer=normalizer,
+                        raw_cfg=raw_cfg,
+                        opponent_name=opponent_name,
+                        agents_root=online_eval_agents_root,
+                        games=online_eval_games,
+                        seed=online_eval_seed + step,
+                        bc_player=online_eval_bc_player,
+                        max_fleets=online_eval_max_fleets,
+                    )
+                    metrics.update(prefix_online_eval_metrics(prefix, online_metrics))
+                except Exception as exc:
+                    if online_eval_fail_on_error:
+                        raise
+                    metrics[f"online_{prefix}_eval_error"] = 1.0
+                    print(f"[online-eval/{prefix}] failed at step={step}: {exc!r}", flush=True)
 
         write_metrics(metrics_path, step, metrics, completed_passes=completed_passes)
         log_wandb(use_wandb, {"completed_passes": completed_passes, **metrics}, step=step)
         last_metrics = metrics
         online_text = ""
-        if "online_win_rate" in metrics:
-            online_text = (
-                f" online_wr={metrics['online_win_rate']:.3f}"
-                f" online={int(metrics['online_wins'])}-{int(metrics['online_losses'])}-{int(metrics['online_draws'])}"
-            )
+        online_parts = []
+        for opponent_name in online_eval_opponents:
+            prefix = online_eval_metric_prefix(opponent_name)
+            wr_key = f"online_{prefix}_win_rate"
+            if wr_key not in metrics:
+                continue
+            online_parts.append(f"{prefix}_wr={metrics[wr_key]:.3f}")
+        if online_parts:
+            online_text = " online " + " ".join(online_parts)
         if eval_due:
             print(
                 f"step={step:08d}/{max_steps} loss={metrics['train_loss']:.4f} val={metrics['val_loss']:.4f} "

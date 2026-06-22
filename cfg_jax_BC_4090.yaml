@@ -30,11 +30,14 @@ state_norm:
   eps: 1.0e-8
 
 eval:
+  # Uses packaged opponents under rl-agent/agents.
   enabled: true
   every_steps: 10000
   games: 20
   seed: 300000
-  opponent: slawekbiel-producer
+  opponents:
+    - producer
+    - fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid
   agents_root: agents
   bc_player: 0
   max_fleets: 512

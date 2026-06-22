@@ -30,7 +30,9 @@ state_norm:
   eps: 1.0e-8
 
 eval:
-  enabled: true
+  # BC online eval currently calls external Kaggle agent scripts.
+  # Keep it disabled when we want training/eval to stay inside rl-agent.
+  enabled: false
   every_steps: 10000
   games: 20
   seed: 300000

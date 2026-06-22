@@ -1,0 +1,31 @@
+{
+  "checkpoints": [
+    {
+      "checkpoint": "ckpt_048900.pkl",
+      "max_planets": 45,
+      "max_fleets": 512,
+      "ship_bucket_count": 8,
+      "max_ships": 500.0,
+      "max_production": 5.0,
+      "episode_steps": 500,
+      "target_filter_enabled": true,
+      "attack_top_k": 10,
+      "defense_top_k": 5,
+      "hidden_size": 128,
+      "use_cnn": true,
+      "max_fleet_tokens": 16,
+      "num_transformer_layers": 2,
+      "num_heads": 4,
+      "max_action_tokens": 12,
+      "end_bias_init": -3.0,
+      "state_norm_enabled": true,
+      "state_norm_clip": 5.0,
+      "state_norm_eps": 1e-08,
+      "normalizer_params": {
+        "enabled": true,
+        "clip": 5.0,
+        "eps": 1e-08
+      }
+    }
+  ]
+}

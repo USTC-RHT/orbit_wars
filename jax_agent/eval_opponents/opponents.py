@@ -409,11 +409,33 @@ class ExternalScriptJaxEvalOpponent:
 def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpponent]:
     """根据配置创建默认评估对手列表。"""
 
-    enabled = set(enabled_names or ["nearest", "sigma", "tamrazov"])
-    agents_root = root / "agents"
+    enabled = set(enabled_names or ["nearest"])
+    repo_root = Path(__file__).resolve().parents[2]
+    agents_root = repo_root / "agents"
     external_root = agents_root / "external"
     mine_root = agents_root / "mine"
     opponents: list[JaxEvalOpponent] = []
+
+    def packaged_onnx_checkpoint(
+        *,
+        metric_prefix: str,
+        agent_dir_name: str,
+        seed_offset: int,
+    ) -> JaxEvalOpponent:
+        agent_dir = (mine_root / agent_dir_name).resolve()
+        try:
+            agent_dir.relative_to(repo_root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"packaged checkpoint opponent must live under rl-agent: {agent_dir}") from exc
+        if not (agent_dir / "main.py").exists():
+            raise FileNotFoundError(f"packaged checkpoint opponent not found: {agent_dir / 'main.py'}")
+        return ExternalScriptJaxEvalOpponent(
+            name=agent_dir_name,
+            metric_prefix=metric_prefix,
+            agent_dir=agent_dir,
+            seed_offset=seed_offset,
+        )
+
     if "nearest" in enabled:
         opponents.append(NearestJaxEvalOpponent())
     if "sigma" in enabled or "sigmaborov-reinforce" in enabled:
@@ -430,21 +452,20 @@ def default_eval_opponents(root: Path, *, enabled_names=None) -> list[JaxEvalOpp
             agent_dir=external_root / "slawekbiel-producer",
             seed_offset=15485863,
         ))
+    # These historical Fight checkpoints use an older feature/model schema.
+    # Evaluate them through packaged ONNX agents kept under rl-agent/agents/mine,
+    # so the checkpoint-time runtime is used without referencing orbit-wars-lab.
     if "ckpt_48900" in enabled:
-        opponents.append(JaxCheckpointEvalOpponent(
-            name="ckpt_048900",
+        opponents.append(packaged_onnx_checkpoint(
             metric_prefix="ckpt_48900",
-            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_048900.pkl",
+            agent_dir_name="fixed-pool-tgtmask-0526-ckpt48900-onnx-producer-hybrid",
             seed_offset=32452843,
-            feature_mode="legacy_target_mask",
         ))
     if "ckpt_32700" in enabled:
-        opponents.append(JaxCheckpointEvalOpponent(
-            name="ckpt_032700",
+        opponents.append(packaged_onnx_checkpoint(
             metric_prefix="ckpt_32700",
-            checkpoint_path=root / "checkpoints" / "fixed_pool_with_tgtmask-0526_jax" / "ckpt_032700.pkl",
+            agent_dir_name="fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid",
             seed_offset=49979687,
-            feature_mode="legacy_target_mask",
         ))
     mine_script_opponents = {
         "fixed-pool-tgtmask-0526-ckpt32700-onnx-producer-hybrid": ("tgtmask_32700_producer", 521),

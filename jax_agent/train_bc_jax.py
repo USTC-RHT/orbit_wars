@@ -1269,6 +1269,7 @@ def main() -> None:
     args = parse_args()
     config_path = Path(args.config).expanduser()
     raw_cfg = read_raw_config(args.config)
+    seed = int(raw_cfg.get("seed", 42))
     bc_cfg = raw_cfg.setdefault("bc", {})
     if isinstance(bc_cfg, dict):
         bc_cfg["dropped_relative_feature_dims"] = list(BUGGY_RELATIVE_FEATURE_DIMS)
@@ -1436,7 +1437,7 @@ def main() -> None:
 
     ship_bucket_count = int(sample_batch.amount_mask.shape[-1])
     model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)
-    rng = jax.random.PRNGKey(int(raw_cfg.get("seed", 42)))
+    rng = jax.random.PRNGKey(seed)
     rng, init_rng = jax.random.split(rng)
     train_state = make_train_state(init_rng, model, sample_batch, lr=lr, weight_decay=weight_decay)
     completed_passes = 0
@@ -1471,7 +1472,7 @@ def main() -> None:
             _wandb.finish()
         return
 
-    data_seed = int(raw_cfg.get("seed", 42)) + 1_000_003 * (start_step + 1)
+    data_seed = seed + 1_000_003 * (start_step + 1)
     data_rng = np.random.default_rng(data_seed)
     stream = train_batch_stream(
         train_paths,
@@ -1524,7 +1525,7 @@ def main() -> None:
                 train_state,
                 eval_step,
                 batch_size,
-                np.random.default_rng(int(raw_cfg.get("seed", 42)) + 2_000_003 + step),
+                np.random.default_rng(seed + 2_000_003 + step),
                 eval_batches,
                 args.max_rows_per_shard,
                 allowed_winners=allowed_winners,

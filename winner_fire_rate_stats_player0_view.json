@@ -1,0 +1,5467 @@
+{
+  "root": "/mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full_v2_player0_view_eta_retained",
+  "shards": 4618,
+  "generated_at": 1782130082.614061,
+  "stats": [
+    {
+      "winner": "Isaiah @ Tufa Labs",
+      "rows": 11001405,
+      "fires": 743660,
+      "fire_rate": 0.06759682058791582,
+      "episodes": 2018
+    },
+    {
+      "winner": "TonyK",
+      "rows": 6832048,
+      "fires": 305729,
+      "fire_rate": 0.0447492464924134,
+      "episodes": 1332
+    },
+    {
+      "winner": "vkhydras",
+      "rows": 6688160,
+      "fires": 875027,
+      "fire_rate": 0.1308322468362001,
+      "episodes": 1402
+    },
+    {
+      "winner": "Controlvector",
+      "rows": 5999739,
+      "fires": 597906,
+      "fire_rate": 0.09965533500707281,
+      "episodes": 1125
+    },
+    {
+      "winner": "Jake Will",
+      "rows": 5178641,
+      "fires": 233093,
+      "fire_rate": 0.04501045737675193,
+      "episodes": 2016
+    },
+    {
+      "winner": "typeIIIfairy",
+      "rows": 4992482,
+      "fires": 657651,
+      "fire_rate": 0.13172826662169237,
+      "episodes": 1803
+    },
+    {
+      "winner": "213tubo",
+      "rows": 4518709,
+      "fires": 1110745,
+      "fire_rate": 0.24581025244157126,
+      "episodes": 1397
+    },
+    {
+      "winner": "Ebi",
+      "rows": 3160476,
+      "fires": 251950,
+      "fire_rate": 0.07971900435250892,
+      "episodes": 895
+    },
+    {
+      "winner": "One Man Wrecking Machine",
+      "rows": 2913348,
+      "fires": 1051819,
+      "fire_rate": 0.3610344524581341,
+      "episodes": 854
+    },
+    {
+      "winner": "Hober Malloc",
+      "rows": 2899651,
+      "fires": 1118010,
+      "fire_rate": 0.3855670906602208,
+      "episodes": 1162
+    },
+    {
+      "winner": "skalermo",
+      "rows": 2735888,
+      "fires": 212092,
+      "fire_rate": 0.07752217927049646,
+      "episodes": 619
+    },
+    {
+      "winner": "ma name",
+      "rows": 2706062,
+      "fires": 269710,
+      "fire_rate": 0.09966881763980279,
+      "episodes": 540
+    },
+    {
+      "winner": "C404",
+      "rows": 2602195,
+      "fires": 343993,
+      "fire_rate": 0.13219339826569493,
+      "episodes": 785
+    },
+    {
+      "winner": "dragon warrior",
+      "rows": 2600804,
+      "fires": 513102,
+      "fire_rate": 0.19728591620129776,
+      "episodes": 1073
+    },
+    {
+      "winner": "Roche Overflow",
+      "rows": 2585710,
+      "fires": 329268,
+      "fire_rate": 0.12734142653275116,
+      "episodes": 648
+    },
+    {
+      "winner": "Vadasz",
+      "rows": 2541226,
+      "fires": 200820,
+      "fire_rate": 0.07902484863605205,
+      "episodes": 1130
+    },
+    {
+      "winner": "flg",
+      "rows": 2507100,
+      "fires": 257041,
+      "fire_rate": 0.1025252283514818,
+      "episodes": 1069
+    },
+    {
+      "winner": "Zachary Ruhe",
+      "rows": 2498097,
+      "fires": 375265,
+      "fire_rate": 0.15022034772869108,
+      "episodes": 1052
+    },
+    {
+      "winner": "yuto083",
+      "rows": 2446934,
+      "fires": 213141,
+      "fire_rate": 0.08710533263259246,
+      "episodes": 583
+    },
+    {
+      "winner": "3Comets",
+      "rows": 2254702,
+      "fires": 357145,
+      "fire_rate": 0.15840009012277453,
+      "episodes": 1160
+    },
+    {
+      "winner": "Mendrika",
+      "rows": 2240344,
+      "fires": 635390,
+      "fire_rate": 0.2836126951932382,
+      "episodes": 651
+    },
+    {
+      "winner": "Harm Buisman",
+      "rows": 2221668,
+      "fires": 278725,
+      "fire_rate": 0.1254575391102541,
+      "episodes": 1001
+    },
+    {
+      "winner": "Boey",
+      "rows": 2091933,
+      "fires": 251150,
+      "fire_rate": 0.12005642628133883,
+      "episodes": 974
+    },
+    {
+      "winner": "sash",
+      "rows": 2059905,
+      "fires": 870395,
+      "fire_rate": 0.4225413307895267,
+      "episodes": 302
+    },
+    {
+      "winner": "Ender",
+      "rows": 2043704,
+      "fires": 76226,
+      "fire_rate": 0.03729796487162525,
+      "episodes": 650
+    },
+    {
+      "winner": "bowwowforeach",
+      "rows": 2010930,
+      "fires": 135866,
+      "fire_rate": 0.06756376402957835,
+      "episodes": 1079
+    },
+    {
+      "winner": "Piotr Gabrys",
+      "rows": 1860336,
+      "fires": 594506,
+      "fire_rate": 0.31956915309922507,
+      "episodes": 841
+    },
+    {
+      "winner": "Xiangyu Liu",
+      "rows": 1764806,
+      "fires": 282593,
+      "fire_rate": 0.16012694879777153,
+      "episodes": 669
+    },
+    {
+      "winner": "Shun_PI",
+      "rows": 1753208,
+      "fires": 206269,
+      "fire_rate": 0.11765232647809044,
+      "episodes": 488
+    },
+    {
+      "winner": "XtraLearning",
+      "rows": 1734651,
+      "fires": 286975,
+      "fire_rate": 0.16543673626568112,
+      "episodes": 486
+    },
+    {
+      "winner": "Gregor Lied",
+      "rows": 1677790,
+      "fires": 189989,
+      "fire_rate": 0.11323765191114502,
+      "episodes": 403
+    },
+    {
+      "winner": "Audun Ljone Henriksen",
+      "rows": 1666197,
+      "fires": 427066,
+      "fire_rate": 0.25631182867332014,
+      "episodes": 826
+    },
+    {
+      "winner": "M & J & M.ver2",
+      "rows": 1526715,
+      "fires": 138351,
+      "fire_rate": 0.09062005678859512,
+      "episodes": 623
+    },
+    {
+      "winner": "draven",
+      "rows": 1399932,
+      "fires": 841545,
+      "fire_rate": 0.6011327693059377,
+      "episodes": 295
+    },
+    {
+      "winner": "SR",
+      "rows": 1318820,
+      "fires": 129343,
+      "fire_rate": 0.09807479413415023,
+      "episodes": 525
+    },
+    {
+      "winner": "Yuki Okumura",
+      "rows": 1229170,
+      "fires": 85331,
+      "fire_rate": 0.06942164224639391,
+      "episodes": 266
+    },
+    {
+      "winner": "Maruichi01",
+      "rows": 1227745,
+      "fires": 448900,
+      "fire_rate": 0.3656296706563659,
+      "episodes": 656
+    },
+    {
+      "winner": "saharan",
+      "rows": 1162428,
+      "fires": 81657,
+      "fire_rate": 0.07024693142284942,
+      "episodes": 522
+    },
+    {
+      "winner": "bengle",
+      "rows": 1140505,
+      "fires": 157604,
+      "fire_rate": 0.13818790798812808,
+      "episodes": 670
+    },
+    {
+      "winner": "Felix M Neumann",
+      "rows": 1101584,
+      "fires": 423361,
+      "fire_rate": 0.3843202152536711,
+      "episodes": 639
+    },
+    {
+      "winner": "Monster",
+      "rows": 1065977,
+      "fires": 238958,
+      "fire_rate": 0.22416806366366254,
+      "episodes": 447
+    },
+    {
+      "winner": "Ascalon",
+      "rows": 1057046,
+      "fires": 79245,
+      "fire_rate": 0.07496835520876102,
+      "episodes": 464
+    },
+    {
+      "winner": "Luca",
+      "rows": 1033992,
+      "fires": 247848,
+      "fire_rate": 0.2397001137339554,
+      "episodes": 357
+    },
+    {
+      "winner": "Artem",
+      "rows": 1015955,
+      "fires": 264436,
+      "fire_rate": 0.2602831818338411,
+      "episodes": 515
+    },
+    {
+      "winner": "DONJYARAHOI",
+      "rows": 960597,
+      "fires": 228063,
+      "fire_rate": 0.23741798069325637,
+      "episodes": 280
+    },
+    {
+      "winner": "Abhyuday",
+      "rows": 951378,
+      "fires": 197690,
+      "fire_rate": 0.20779332715282464,
+      "episodes": 300
+    },
+    {
+      "winner": "Dreame1",
+      "rows": 947121,
+      "fires": 388382,
+      "fire_rate": 0.4100658733150252,
+      "episodes": 338
+    },
+    {
+      "winner": "SiestaGuru",
+      "rows": 944290,
+      "fires": 161764,
+      "fire_rate": 0.17130754323354055,
+      "episodes": 526
+    },
+    {
+      "winner": "Katasonov Eugene",
+      "rows": 841488,
+      "fires": 86397,
+      "fire_rate": 0.1026716958530603,
+      "episodes": 407
+    },
+    {
+      "winner": "CPMP",
+      "rows": 801570,
+      "fires": 175394,
+      "fire_rate": 0.21881307933181132,
+      "episodes": 355
+    },
+    {
+      "winner": "Ezra",
+      "rows": 798570,
+      "fires": 93306,
+      "fire_rate": 0.11684135392013224,
+      "episodes": 433
+    },
+    {
+      "winner": "klog",
+      "rows": 796738,
+      "fires": 145670,
+      "fire_rate": 0.18283300156387672,
+      "episodes": 377
+    },
+    {
+      "winner": "Radek Osmulski",
+      "rows": 794634,
+      "fires": 168633,
+      "fire_rate": 0.21221467996587107,
+      "episodes": 384
+    },
+    {
+      "winner": "Vincent Schuler",
+      "rows": 761075,
+      "fires": 70578,
+      "fire_rate": 0.09273461879578228,
+      "episodes": 436
+    },
+    {
+      "winner": "Vadasz & Ascalon",
+      "rows": 757871,
+      "fires": 59279,
+      "fire_rate": 0.07821779696016869,
+      "episodes": 314
+    },
+    {
+      "winner": "kovi",
+      "rows": 713014,
+      "fires": 80865,
+      "fire_rate": 0.11341292036341502,
+      "episodes": 432
+    },
+    {
+      "winner": "MartinZiserman",
+      "rows": 680147,
+      "fires": 52777,
+      "fire_rate": 0.07759646076509931,
+      "episodes": 122
+    },
+    {
+      "winner": "linrock",
+      "rows": 679705,
+      "fires": 89300,
+      "fire_rate": 0.13138052537497885,
+      "episodes": 358
+    },
+    {
+      "winner": "Tommy Barnes",
+      "rows": 617157,
+      "fires": 318697,
+      "fire_rate": 0.5163953418660082,
+      "episodes": 356
+    },
+    {
+      "winner": "Man Penguin",
+      "rows": 592861,
+      "fires": 24619,
+      "fire_rate": 0.04152575392882986,
+      "episodes": 149
+    },
+    {
+      "winner": "Tufaben",
+      "rows": 546384,
+      "fires": 43498,
+      "fire_rate": 0.07961067674016808,
+      "episodes": 111
+    },
+    {
+      "winner": "Jack",
+      "rows": 537367,
+      "fires": 116600,
+      "fire_rate": 0.21698392346385245,
+      "episodes": 205
+    },
+    {
+      "winner": "준환",
+      "rows": 481813,
+      "fires": 79985,
+      "fire_rate": 0.16600838914682667,
+      "episodes": 238
+    },
+    {
+      "winner": "Kaiser",
+      "rows": 481269,
+      "fires": 79141,
+      "fire_rate": 0.1644423388998668,
+      "episodes": 327
+    },
+    {
+      "winner": "lllleeeo",
+      "rows": 480870,
+      "fires": 22328,
+      "fire_rate": 0.04643250774637636,
+      "episodes": 109
+    },
+    {
+      "winner": "moriiiiiiiiim",
+      "rows": 451137,
+      "fires": 33303,
+      "fire_rate": 0.07382014775999308,
+      "episodes": 179
+    },
+    {
+      "winner": "Nebraskinator",
+      "rows": 423541,
+      "fires": 30740,
+      "fire_rate": 0.07257856972524501,
+      "episodes": 134
+    },
+    {
+      "winner": "LuckyXC",
+      "rows": 413794,
+      "fires": 29388,
+      "fire_rate": 0.07102084612150007,
+      "episodes": 66
+    },
+    {
+      "winner": "Erfan Eshratifar",
+      "rows": 413125,
+      "fires": 115688,
+      "fire_rate": 0.280031467473525,
+      "episodes": 245
+    },
+    {
+      "winner": "ShunkiKyoya",
+      "rows": 409855,
+      "fires": 43808,
+      "fire_rate": 0.10688658183991899,
+      "episodes": 220
+    },
+    {
+      "winner": "aaa",
+      "rows": 392025,
+      "fires": 57127,
+      "fire_rate": 0.14572284930807985,
+      "episodes": 213
+    },
+    {
+      "winner": "Tim Krige",
+      "rows": 371506,
+      "fires": 14103,
+      "fire_rate": 0.037961701829849315,
+      "episodes": 78
+    },
+    {
+      "winner": "koh",
+      "rows": 360915,
+      "fires": 45161,
+      "fire_rate": 0.1251291855423022,
+      "episodes": 244
+    },
+    {
+      "winner": "pantheon of ducks 🦆",
+      "rows": 360775,
+      "fires": 41667,
+      "fire_rate": 0.11549303582565311,
+      "episodes": 170
+    },
+    {
+      "winner": "Claws",
+      "rows": 354934,
+      "fires": 56503,
+      "fire_rate": 0.1591929767224329,
+      "episodes": 137
+    },
+    {
+      "winner": "sary sary",
+      "rows": 347683,
+      "fires": 46580,
+      "fire_rate": 0.13397261298366617,
+      "episodes": 219
+    },
+    {
+      "winner": "nadhir hasan",
+      "rows": 332114,
+      "fires": 86831,
+      "fire_rate": 0.2614493818387662,
+      "episodes": 120
+    },
+    {
+      "winner": "Sheeesh---",
+      "rows": 317912,
+      "fires": 94046,
+      "fire_rate": 0.2958240016105086,
+      "episodes": 212
+    },
+    {
+      "winner": "Blips and Chitz",
+      "rows": 316458,
+      "fires": 34339,
+      "fire_rate": 0.10851045004392368,
+      "episodes": 129
+    },
+    {
+      "winner": "Slawek Biel",
+      "rows": 314430,
+      "fires": 51779,
+      "fire_rate": 0.16467576249085647,
+      "episodes": 140
+    },
+    {
+      "winner": "M & M",
+      "rows": 301003,
+      "fires": 48600,
+      "fire_rate": 0.16146018478221147,
+      "episodes": 148
+    },
+    {
+      "winner": "Illedan",
+      "rows": 296361,
+      "fires": 17496,
+      "fire_rate": 0.0590361079899177,
+      "episodes": 126
+    },
+    {
+      "winner": "istinetz",
+      "rows": 264413,
+      "fires": 24417,
+      "fire_rate": 0.09234417369796492,
+      "episodes": 125
+    },
+    {
+      "winner": "Forrest",
+      "rows": 263894,
+      "fires": 34156,
+      "fire_rate": 0.12943075628850978,
+      "episodes": 144
+    },
+    {
+      "winner": "Jonathan Wang2022",
+      "rows": 261583,
+      "fires": 5763,
+      "fire_rate": 0.02203124820802575,
+      "episodes": 52
+    },
+    {
+      "winner": "Azat Akhtyamov",
+      "rows": 237956,
+      "fires": 27692,
+      "fire_rate": 0.11637445578174116,
+      "episodes": 64
+    },
+    {
+      "winner": "Félix Truong",
+      "rows": 233933,
+      "fires": 54113,
+      "fire_rate": 0.23131836893469498,
+      "episodes": 113
+    },
+    {
+      "winner": "giacomovin",
+      "rows": 231561,
+      "fires": 16590,
+      "fire_rate": 0.07164418878826745,
+      "episodes": 38
+    },
+    {
+      "winner": "Guanshuo Xu",
+      "rows": 221336,
+      "fires": 26231,
+      "fire_rate": 0.11851212635992338,
+      "episodes": 102
+    },
+    {
+      "winner": "Maciej Sypetkowski",
+      "rows": 221137,
+      "fires": 24369,
+      "fire_rate": 0.11019865513233877,
+      "episodes": 42
+    },
+    {
+      "winner": "iwance",
+      "rows": 214773,
+      "fires": 15375,
+      "fire_rate": 0.07158721068290706,
+      "episodes": 77
+    },
+    {
+      "winner": "SVOT",
+      "rows": 209631,
+      "fires": 24888,
+      "fire_rate": 0.11872289880790532,
+      "episodes": 41
+    },
+    {
+      "winner": "dnish",
+      "rows": 209487,
+      "fires": 19227,
+      "fire_rate": 0.09178135158744934,
+      "episodes": 105
+    },
+    {
+      "winner": "Mooegi",
+      "rows": 204233,
+      "fires": 91735,
+      "fire_rate": 0.4491683518334451,
+      "episodes": 103
+    },
+    {
+      "winner": "🛰️ Low-Orbit Losers",
+      "rows": 201533,
+      "fires": 69344,
+      "fire_rate": 0.3440826068187344,
+      "episodes": 111
+    },
+    {
+      "winner": "Komil Parmar",
+      "rows": 193691,
+      "fires": 14361,
+      "fire_rate": 0.07414386832635486,
+      "episodes": 84
+    },
+    {
+      "winner": "luwulaoyabohomosugai",
+      "rows": 191433,
+      "fires": 34892,
+      "fire_rate": 0.1822674251565822,
+      "episodes": 32
+    },
+    {
+      "winner": "Son Pham",
+      "rows": 185323,
+      "fires": 9833,
+      "fire_rate": 0.053058713705260545,
+      "episodes": 112
+    },
+    {
+      "winner": "Gijs Smit",
+      "rows": 184232,
+      "fires": 19656,
+      "fire_rate": 0.10669156281210647,
+      "episodes": 109
+    },
+    {
+      "winner": "Lazy Bandit",
+      "rows": 179630,
+      "fires": 19112,
+      "fire_rate": 0.10639648165673886,
+      "episodes": 97
+    },
+    {
+      "winner": "Matt6283",
+      "rows": 178961,
+      "fires": 19101,
+      "fire_rate": 0.10673275182861071,
+      "episodes": 66
+    },
+    {
+      "winner": "please make way",
+      "rows": 163239,
+      "fires": 31050,
+      "fire_rate": 0.19021189789204784,
+      "episodes": 36
+    },
+    {
+      "winner": "unosss",
+      "rows": 154712,
+      "fires": 21114,
+      "fire_rate": 0.13647293034800145,
+      "episodes": 79
+    },
+    {
+      "winner": "monnu",
+      "rows": 139195,
+      "fires": 12214,
+      "fire_rate": 0.08774740471999713,
+      "episodes": 97
+    },
+    {
+      "winner": "Arthurs Torres24",
+      "rows": 131919,
+      "fires": 15446,
+      "fire_rate": 0.11708700035627924,
+      "episodes": 72
+    },
+    {
+      "winner": "shake salmon",
+      "rows": 129485,
+      "fires": 18220,
+      "fire_rate": 0.14071127929876048,
+      "episodes": 49
+    },
+    {
+      "winner": "Ousagi",
+      "rows": 129279,
+      "fires": 12377,
+      "fire_rate": 0.09573867372117668,
+      "episodes": 60
+    },
+    {
+      "winner": "CPMP Fan",
+      "rows": 112510,
+      "fires": 6491,
+      "fire_rate": 0.05769264954226291,
+      "episodes": 65
+    },
+    {
+      "winner": "моп манки",
+      "rows": 111208,
+      "fires": 4059,
+      "fire_rate": 0.036499172721386954,
+      "episodes": 20
+    },
+    {
+      "winner": "Dapp",
+      "rows": 109444,
+      "fires": 38723,
+      "fire_rate": 0.3538156500127919,
+      "episodes": 238
+    },
+    {
+      "winner": "yossi",
+      "rows": 106161,
+      "fires": 17345,
+      "fire_rate": 0.16338391688096382,
+      "episodes": 34
+    },
+    {
+      "winner": "matsu997",
+      "rows": 103965,
+      "fires": 14110,
+      "fire_rate": 0.13571875150290963,
+      "episodes": 71
+    },
+    {
+      "winner": "Hit Imai",
+      "rows": 102292,
+      "fires": 11979,
+      "fire_rate": 0.11710593203769601,
+      "episodes": 58
+    },
+    {
+      "winner": "CurveCowboy",
+      "rows": 101401,
+      "fires": 18792,
+      "fire_rate": 0.1853236161379079,
+      "episodes": 54
+    },
+    {
+      "winner": "Viltrum Empire",
+      "rows": 98750,
+      "fires": 9688,
+      "fire_rate": 0.09810632911392406,
+      "episodes": 58
+    },
+    {
+      "winner": "Michael Long",
+      "rows": 94020,
+      "fires": 8642,
+      "fire_rate": 0.09191661348649223,
+      "episodes": 55
+    },
+    {
+      "winner": "mmath2",
+      "rows": 89666,
+      "fires": 10582,
+      "fire_rate": 0.11801574732897642,
+      "episodes": 32
+    },
+    {
+      "winner": "ykhnkf",
+      "rows": 83401,
+      "fires": 10476,
+      "fire_rate": 0.12561000467620292,
+      "episodes": 50
+    },
+    {
+      "winner": "Forrest_xlz",
+      "rows": 79764,
+      "fires": 24891,
+      "fire_rate": 0.31205807131036556,
+      "episodes": 14
+    },
+    {
+      "winner": "Scool",
+      "rows": 78221,
+      "fires": 25131,
+      "fire_rate": 0.3212820086677491,
+      "episodes": 29
+    },
+    {
+      "winner": "Mimi",
+      "rows": 78212,
+      "fires": 8567,
+      "fire_rate": 0.10953562113230707,
+      "episodes": 42
+    },
+    {
+      "winner": "datnt114",
+      "rows": 77250,
+      "fires": 7854,
+      "fire_rate": 0.10166990291262136,
+      "episodes": 36
+    },
+    {
+      "winner": "ChrisLeiteScha",
+      "rows": 71836,
+      "fires": 8394,
+      "fire_rate": 0.1168494905061529,
+      "episodes": 41
+    },
+    {
+      "winner": "Cornerian Fleet",
+      "rows": 66827,
+      "fires": 7759,
+      "fire_rate": 0.11610576563365108,
+      "episodes": 45
+    },
+    {
+      "winner": "snehal",
+      "rows": 64651,
+      "fires": 10661,
+      "fire_rate": 0.16490077493000882,
+      "episodes": 44
+    },
+    {
+      "winner": "Cihat Emre Çeliker",
+      "rows": 62495,
+      "fires": 7058,
+      "fire_rate": 0.11293703496279703,
+      "episodes": 32
+    },
+    {
+      "winner": "YEBOI",
+      "rows": 59435,
+      "fires": 7182,
+      "fire_rate": 0.12083789013207706,
+      "episodes": 35
+    },
+    {
+      "winner": "[cmbc] jythow",
+      "rows": 57037,
+      "fires": 6640,
+      "fire_rate": 0.11641566001016884,
+      "episodes": 9
+    },
+    {
+      "winner": "Peng Wang",
+      "rows": 56637,
+      "fires": 6509,
+      "fire_rate": 0.11492487243321503,
+      "episodes": 35
+    },
+    {
+      "winner": "GaoKui",
+      "rows": 55480,
+      "fires": 6459,
+      "fire_rate": 0.11642033165104543,
+      "episodes": 23
+    },
+    {
+      "winner": "qhapaq49",
+      "rows": 55425,
+      "fires": 7546,
+      "fire_rate": 0.13614794767704105,
+      "episodes": 31
+    },
+    {
+      "winner": "T T",
+      "rows": 52555,
+      "fires": 4070,
+      "fire_rate": 0.07744267909808772,
+      "episodes": 35
+    },
+    {
+      "winner": "Sukjae Cho",
+      "rows": 51635,
+      "fires": 5273,
+      "fire_rate": 0.10212065459475163,
+      "episodes": 24
+    },
+    {
+      "winner": "Emre",
+      "rows": 51508,
+      "fires": 7699,
+      "fire_rate": 0.14947192669099946,
+      "episodes": 29
+    },
+    {
+      "winner": "Tim Riggins",
+      "rows": 51435,
+      "fires": 5426,
+      "fire_rate": 0.10549236900942938,
+      "episodes": 30
+    },
+    {
+      "winner": "Sahaj Deep Singh",
+      "rows": 51010,
+      "fires": 5674,
+      "fire_rate": 0.11123309155067634,
+      "episodes": 33
+    },
+    {
+      "winner": "Yam",
+      "rows": 50410,
+      "fires": 6313,
+      "fire_rate": 0.12523308867288235,
+      "episodes": 32
+    },
+    {
+      "winner": "Shubham Phapale",
+      "rows": 48237,
+      "fires": 7421,
+      "fire_rate": 0.15384455915583473,
+      "episodes": 13
+    },
+    {
+      "winner": "lolzPPO",
+      "rows": 47189,
+      "fires": 2703,
+      "fire_rate": 0.0572802983746212,
+      "episodes": 19
+    },
+    {
+      "winner": "surumenDD",
+      "rows": 46945,
+      "fires": 2105,
+      "fire_rate": 0.04483970603898179,
+      "episodes": 8
+    },
+    {
+      "winner": "Junhua Yang",
+      "rows": 46472,
+      "fires": 4980,
+      "fire_rate": 0.10716130142881736,
+      "episodes": 29
+    },
+    {
+      "winner": "Ant",
+      "rows": 46345,
+      "fires": 4486,
+      "fire_rate": 0.09679577084906678,
+      "episodes": 24
+    },
+    {
+      "winner": "Gerar Del Toro",
+      "rows": 45107,
+      "fires": 5675,
+      "fire_rate": 0.12581195823264682,
+      "episodes": 28
+    },
+    {
+      "winner": "skuro0315",
+      "rows": 45073,
+      "fires": 18706,
+      "fire_rate": 0.41501564129301355,
+      "episodes": 27
+    },
+    {
+      "winner": "Blu3s",
+      "rows": 44456,
+      "fires": 5051,
+      "fire_rate": 0.11361795933057404,
+      "episodes": 30
+    },
+    {
+      "winner": "atl132",
+      "rows": 42299,
+      "fires": 5233,
+      "fire_rate": 0.123714508617225,
+      "episodes": 23
+    },
+    {
+      "winner": "Lior Toledano",
+      "rows": 42213,
+      "fires": 5047,
+      "fire_rate": 0.11956032501835927,
+      "episodes": 25
+    },
+    {
+      "winner": "Criquet",
+      "rows": 41878,
+      "fires": 6550,
+      "fire_rate": 0.15640670519126987,
+      "episodes": 23
+    },
+    {
+      "winner": "Yuyajk",
+      "rows": 41384,
+      "fires": 4930,
+      "fire_rate": 0.11912816547457955,
+      "episodes": 29
+    },
+    {
+      "winner": "Gronk",
+      "rows": 38523,
+      "fires": 4676,
+      "fire_rate": 0.1213820315136412,
+      "episodes": 25
+    },
+    {
+      "winner": "Baran Kucuk",
+      "rows": 36941,
+      "fires": 10845,
+      "fire_rate": 0.29357624319861403,
+      "episodes": 23
+    },
+    {
+      "winner": "dndhukn",
+      "rows": 36603,
+      "fires": 3963,
+      "fire_rate": 0.10826981394967626,
+      "episodes": 20
+    },
+    {
+      "winner": "MauryanTitans",
+      "rows": 36226,
+      "fires": 4438,
+      "fire_rate": 0.12250869541213492,
+      "episodes": 22
+    },
+    {
+      "winner": "The P-Value Prophet",
+      "rows": 35799,
+      "fires": 6735,
+      "fire_rate": 0.18813374675270259,
+      "episodes": 7
+    },
+    {
+      "winner": "Duong Nguyen",
+      "rows": 35713,
+      "fires": 4267,
+      "fire_rate": 0.11948030129084647,
+      "episodes": 16
+    },
+    {
+      "winner": "鲁有老爷保号无事个",
+      "rows": 35671,
+      "fires": 7269,
+      "fire_rate": 0.20377898012391019,
+      "episodes": 6
+    },
+    {
+      "winner": "IAI-RL-04",
+      "rows": 34875,
+      "fires": 4643,
+      "fire_rate": 0.1331326164874552,
+      "episodes": 23
+    },
+    {
+      "winner": "Lucas Boesen",
+      "rows": 32591,
+      "fires": 3685,
+      "fire_rate": 0.11306802491485379,
+      "episodes": 15
+    },
+    {
+      "winner": "NMarkS",
+      "rows": 32197,
+      "fires": 7041,
+      "fire_rate": 0.2186849706494394,
+      "episodes": 18
+    },
+    {
+      "winner": "Shubham Jain",
+      "rows": 31885,
+      "fires": 5413,
+      "fire_rate": 0.169766347812451,
+      "episodes": 21
+    },
+    {
+      "winner": "Give up guys",
+      "rows": 31425,
+      "fires": 3980,
+      "fire_rate": 0.12665075576770088,
+      "episodes": 22
+    },
+    {
+      "winner": "lucataco",
+      "rows": 30541,
+      "fires": 4404,
+      "fire_rate": 0.14419960053698308,
+      "episodes": 12
+    },
+    {
+      "winner": "Mehrdad_LU",
+      "rows": 30424,
+      "fires": 5165,
+      "fire_rate": 0.16976728898238233,
+      "episodes": 15
+    },
+    {
+      "winner": "Nishant Raj",
+      "rows": 30267,
+      "fires": 4140,
+      "fire_rate": 0.1367826345524829,
+      "episodes": 14
+    },
+    {
+      "winner": "RiN0804",
+      "rows": 29680,
+      "fires": 3586,
+      "fire_rate": 0.12082210242587602,
+      "episodes": 17
+    },
+    {
+      "winner": "Antonoof",
+      "rows": 29609,
+      "fires": 4138,
+      "fire_rate": 0.1397548042824817,
+      "episodes": 15
+    },
+    {
+      "winner": "Salt708",
+      "rows": 29466,
+      "fires": 3632,
+      "fire_rate": 0.12326070725582026,
+      "episodes": 14
+    },
+    {
+      "winner": "OzanM.",
+      "rows": 29398,
+      "fires": 3247,
+      "fire_rate": 0.110449690455133,
+      "episodes": 13
+    },
+    {
+      "winner": "humble_some1",
+      "rows": 29330,
+      "fires": 2592,
+      "fire_rate": 0.08837367882713945,
+      "episodes": 13
+    },
+    {
+      "winner": "Tomoki Hirose",
+      "rows": 29127,
+      "fires": 2714,
+      "fire_rate": 0.09317815085659353,
+      "episodes": 16
+    },
+    {
+      "winner": "Nadeem",
+      "rows": 28996,
+      "fires": 4242,
+      "fire_rate": 0.14629604083321837,
+      "episodes": 14
+    },
+    {
+      "winner": "Astyrex7",
+      "rows": 28678,
+      "fires": 2332,
+      "fire_rate": 0.08131668875095892,
+      "episodes": 11
+    },
+    {
+      "winner": "Gregory L.",
+      "rows": 28272,
+      "fires": 3569,
+      "fire_rate": 0.126237973967176,
+      "episodes": 10
+    },
+    {
+      "winner": "Kirderf",
+      "rows": 28269,
+      "fires": 3881,
+      "fire_rate": 0.13728819554989566,
+      "episodes": 17
+    },
+    {
+      "winner": "Gekkotron",
+      "rows": 27752,
+      "fires": 3412,
+      "fire_rate": 0.12294609397520899,
+      "episodes": 15
+    },
+    {
+      "winner": "smlcr",
+      "rows": 27276,
+      "fires": 3204,
+      "fire_rate": 0.11746590409150902,
+      "episodes": 14
+    },
+    {
+      "winner": "HIDEYO CHIBA",
+      "rows": 27232,
+      "fires": 4291,
+      "fire_rate": 0.1575719741480611,
+      "episodes": 16
+    },
+    {
+      "winner": "marsianenergy",
+      "rows": 27187,
+      "fires": 5769,
+      "fire_rate": 0.21219700592194798,
+      "episodes": 14
+    },
+    {
+      "winner": "planets conqueror",
+      "rows": 26523,
+      "fires": 3713,
+      "fire_rate": 0.1399917053123704,
+      "episodes": 15
+    },
+    {
+      "winner": "UncleWKTK",
+      "rows": 26493,
+      "fires": 3974,
+      "fire_rate": 0.15000188729098252,
+      "episodes": 17
+    },
+    {
+      "winner": "IAI-RL-Tlm71",
+      "rows": 25815,
+      "fires": 3576,
+      "fire_rate": 0.13852411388727484,
+      "episodes": 15
+    },
+    {
+      "winner": "Moroz Roman",
+      "rows": 25049,
+      "fires": 2928,
+      "fire_rate": 0.1168908938480578,
+      "episodes": 9
+    },
+    {
+      "winner": "Shunsuke Hayashi",
+      "rows": 24867,
+      "fires": 3540,
+      "fire_rate": 0.14235734105440945,
+      "episodes": 11
+    },
+    {
+      "winner": "BIZEN250",
+      "rows": 24739,
+      "fires": 3425,
+      "fire_rate": 0.13844536965924248,
+      "episodes": 11
+    },
+    {
+      "winner": "msd0110",
+      "rows": 24407,
+      "fires": 2982,
+      "fire_rate": 0.12217806367025853,
+      "episodes": 14
+    },
+    {
+      "winner": "l2658183739",
+      "rows": 23751,
+      "fires": 2595,
+      "fire_rate": 0.1092585575344196,
+      "episodes": 9
+    },
+    {
+      "winner": "Nobit",
+      "rows": 23245,
+      "fires": 5986,
+      "fire_rate": 0.25751774575177455,
+      "episodes": 6
+    },
+    {
+      "winner": "Le Viet",
+      "rows": 22765,
+      "fires": 2549,
+      "fire_rate": 0.11197012958488908,
+      "episodes": 9
+    },
+    {
+      "winner": "Tony Li",
+      "rows": 22755,
+      "fires": 2317,
+      "fire_rate": 0.1018237749945067,
+      "episodes": 12
+    },
+    {
+      "winner": "Abdelghani Belgaid",
+      "rows": 22725,
+      "fires": 2782,
+      "fire_rate": 0.12242024202420242,
+      "episodes": 10
+    },
+    {
+      "winner": "Rudra9439",
+      "rows": 22209,
+      "fires": 3045,
+      "fire_rate": 0.1371065784141564,
+      "episodes": 10
+    },
+    {
+      "winner": "test_orbit-wars",
+      "rows": 22039,
+      "fires": 2824,
+      "fire_rate": 0.12813648532147556,
+      "episodes": 11
+    },
+    {
+      "winner": "Mert Bayraktar",
+      "rows": 21712,
+      "fires": 1985,
+      "fire_rate": 0.0914240972733972,
+      "episodes": 13
+    },
+    {
+      "winner": "DaoHe Liu",
+      "rows": 21546,
+      "fires": 3030,
+      "fire_rate": 0.14062935115566694,
+      "episodes": 12
+    },
+    {
+      "winner": "Yichi",
+      "rows": 21438,
+      "fires": 1988,
+      "fire_rate": 0.09273253101968468,
+      "episodes": 9
+    },
+    {
+      "winner": "Kuni05",
+      "rows": 21415,
+      "fires": 2885,
+      "fire_rate": 0.13471865514826056,
+      "episodes": 9
+    },
+    {
+      "winner": "Djenk Ivanov",
+      "rows": 21400,
+      "fires": 2679,
+      "fire_rate": 0.12518691588785047,
+      "episodes": 15
+    },
+    {
+      "winner": "SGzK001",
+      "rows": 21368,
+      "fires": 3069,
+      "fire_rate": 0.14362598277798577,
+      "episodes": 12
+    },
+    {
+      "winner": "Canon",
+      "rows": 21277,
+      "fires": 3029,
+      "fire_rate": 0.14236029515439208,
+      "episodes": 13
+    },
+    {
+      "winner": "Anatoly karpov",
+      "rows": 21223,
+      "fires": 1815,
+      "fire_rate": 0.08552042595297554,
+      "episodes": 8
+    },
+    {
+      "winner": "Ayush Thakur",
+      "rows": 21135,
+      "fires": 10677,
+      "fire_rate": 0.505180979418027,
+      "episodes": 8
+    },
+    {
+      "winner": "Adrián Melic",
+      "rows": 20990,
+      "fires": 3105,
+      "fire_rate": 0.14792758456407815,
+      "episodes": 11
+    },
+    {
+      "winner": "zhenyue",
+      "rows": 20903,
+      "fires": 2197,
+      "fire_rate": 0.10510453045017462,
+      "episodes": 9
+    },
+    {
+      "winner": "perpetual motion machine",
+      "rows": 20884,
+      "fires": 2632,
+      "fire_rate": 0.1260294962650833,
+      "episodes": 15
+    },
+    {
+      "winner": "rofl wars",
+      "rows": 20254,
+      "fires": 2071,
+      "fire_rate": 0.1022514071294559,
+      "episodes": 11
+    },
+    {
+      "winner": "Katsuaki Tanabe",
+      "rows": 19945,
+      "fires": 2567,
+      "fire_rate": 0.12870393582351466,
+      "episodes": 12
+    },
+    {
+      "winner": "PursueML",
+      "rows": 19719,
+      "fires": 2135,
+      "fire_rate": 0.10827121050763223,
+      "episodes": 7
+    },
+    {
+      "winner": "ymg_aq",
+      "rows": 19707,
+      "fires": 1853,
+      "fire_rate": 0.09402750291774496,
+      "episodes": 10
+    },
+    {
+      "winner": "taopy2",
+      "rows": 19691,
+      "fires": 1746,
+      "fire_rate": 0.08866995073891626,
+      "episodes": 9
+    },
+    {
+      "winner": "ImGonnaDie",
+      "rows": 19596,
+      "fires": 2205,
+      "fire_rate": 0.11252296387017759,
+      "episodes": 6
+    },
+    {
+      "winner": "ShumingFang",
+      "rows": 19577,
+      "fires": 2734,
+      "fire_rate": 0.13965367523113859,
+      "episodes": 12
+    },
+    {
+      "winner": "Kurang Tawu",
+      "rows": 19513,
+      "fires": 2113,
+      "fire_rate": 0.10828678317019423,
+      "episodes": 12
+    },
+    {
+      "winner": "automatylicza",
+      "rows": 19358,
+      "fires": 3080,
+      "fire_rate": 0.15910734580018596,
+      "episodes": 10
+    },
+    {
+      "winner": "NeelambujChaturvedi",
+      "rows": 19313,
+      "fires": 2873,
+      "fire_rate": 0.14875990265624192,
+      "episodes": 7
+    },
+    {
+      "winner": "takumina",
+      "rows": 19136,
+      "fires": 3037,
+      "fire_rate": 0.15870610367892976,
+      "episodes": 8
+    },
+    {
+      "winner": "akoynk",
+      "rows": 19108,
+      "fires": 2602,
+      "fire_rate": 0.13617333054218128,
+      "episodes": 12
+    },
+    {
+      "winner": "york li13",
+      "rows": 19099,
+      "fires": 2347,
+      "fire_rate": 0.122886014974606,
+      "episodes": 9
+    },
+    {
+      "winner": "Briant Abad",
+      "rows": 18939,
+      "fires": 1919,
+      "fire_rate": 0.10132530756639738,
+      "episodes": 8
+    },
+    {
+      "winner": "Ayodeji",
+      "rows": 18706,
+      "fires": 1865,
+      "fire_rate": 0.09970063081364268,
+      "episodes": 7
+    },
+    {
+      "winner": "Fruit19",
+      "rows": 18657,
+      "fires": 2654,
+      "fire_rate": 0.14225223776598594,
+      "episodes": 13
+    },
+    {
+      "winner": "Baidalin Adilzhan [dsmlkz]",
+      "rows": 18643,
+      "fires": 2386,
+      "fire_rate": 0.12798369361154321,
+      "episodes": 10
+    },
+    {
+      "winner": "ragnalogic",
+      "rows": 18449,
+      "fires": 2743,
+      "fire_rate": 0.14868014526532602,
+      "episodes": 13
+    },
+    {
+      "winner": "小松崎　大世",
+      "rows": 18374,
+      "fires": 2667,
+      "fire_rate": 0.1451507565037553,
+      "episodes": 11
+    },
+    {
+      "winner": "Yunioshi",
+      "rows": 18275,
+      "fires": 1655,
+      "fire_rate": 0.0905608755129959,
+      "episodes": 7
+    },
+    {
+      "winner": "Jeki Wan Taufik",
+      "rows": 18167,
+      "fires": 2195,
+      "fire_rate": 0.12082347112897011,
+      "episodes": 9
+    },
+    {
+      "winner": "just need a silver medal",
+      "rows": 18058,
+      "fires": 2875,
+      "fire_rate": 0.15920921475246427,
+      "episodes": 14
+    },
+    {
+      "winner": "wkdrbwnd1",
+      "rows": 17907,
+      "fires": 1512,
+      "fire_rate": 0.08443625397889094,
+      "episodes": 6
+    },
+    {
+      "winner": "John Stupid",
+      "rows": 17806,
+      "fires": 2063,
+      "fire_rate": 0.11585982253173088,
+      "episodes": 9
+    },
+    {
+      "winner": "YumeNeko",
+      "rows": 17732,
+      "fires": 4956,
+      "fire_rate": 0.27949469884953754,
+      "episodes": 12
+    },
+    {
+      "winner": "cocoaAI",
+      "rows": 17604,
+      "fires": 1594,
+      "fire_rate": 0.09054760281754147,
+      "episodes": 12
+    },
+    {
+      "winner": "lailixiang",
+      "rows": 17271,
+      "fires": 2000,
+      "fire_rate": 0.11580105378958949,
+      "episodes": 11
+    },
+    {
+      "winner": "Kanak Khemani",
+      "rows": 17229,
+      "fires": 1782,
+      "fire_rate": 0.10343026292878287,
+      "episodes": 10
+    },
+    {
+      "winner": "susutem",
+      "rows": 17077,
+      "fires": 1984,
+      "fire_rate": 0.11617965684839257,
+      "episodes": 12
+    },
+    {
+      "winner": "[ODS] waniz",
+      "rows": 16952,
+      "fires": 2046,
+      "fire_rate": 0.12069372345445965,
+      "episodes": 11
+    },
+    {
+      "winner": "loser try hard",
+      "rows": 16572,
+      "fires": 2452,
+      "fire_rate": 0.147960415158098,
+      "episodes": 10
+    },
+    {
+      "winner": "Mint120",
+      "rows": 16563,
+      "fires": 1790,
+      "fire_rate": 0.10807220914085612,
+      "episodes": 8
+    },
+    {
+      "winner": "uesi",
+      "rows": 16509,
+      "fires": 2244,
+      "fire_rate": 0.1359258586225695,
+      "episodes": 7
+    },
+    {
+      "winner": "Neeraj",
+      "rows": 16354,
+      "fires": 1574,
+      "fire_rate": 0.09624556683380213,
+      "episodes": 7
+    },
+    {
+      "winner": "Araik Tamazian",
+      "rows": 16340,
+      "fires": 1648,
+      "fire_rate": 0.10085679314565484,
+      "episodes": 10
+    },
+    {
+      "winner": "xiao long745",
+      "rows": 16111,
+      "fires": 1869,
+      "fire_rate": 0.11600769660480417,
+      "episodes": 11
+    },
+    {
+      "winner": "Ömer Faruk Yüce",
+      "rows": 15916,
+      "fires": 1637,
+      "fire_rate": 0.10285247549635587,
+      "episodes": 9
+    },
+    {
+      "winner": "Szymon Kłapiński",
+      "rows": 15734,
+      "fires": 2451,
+      "fire_rate": 0.15577729757213676,
+      "episodes": 8
+    },
+    {
+      "winner": "Paul Pawletta",
+      "rows": 15706,
+      "fires": 1872,
+      "fire_rate": 0.11919011842607921,
+      "episodes": 9
+    },
+    {
+      "winner": "Ifeoluwa Adewumi",
+      "rows": 15697,
+      "fires": 2242,
+      "fire_rate": 0.14282984009683378,
+      "episodes": 10
+    },
+    {
+      "winner": "KongKongDe",
+      "rows": 15505,
+      "fires": 2104,
+      "fire_rate": 0.13569816188326347,
+      "episodes": 8
+    },
+    {
+      "winner": "Longkun Shi (Candyman)",
+      "rows": 15377,
+      "fires": 1799,
+      "fire_rate": 0.11699291149118814,
+      "episodes": 8
+    },
+    {
+      "winner": "w d j y 123456",
+      "rows": 15329,
+      "fires": 1781,
+      "fire_rate": 0.11618500880683671,
+      "episodes": 9
+    },
+    {
+      "winner": "Nabid Nur",
+      "rows": 15289,
+      "fires": 1427,
+      "fire_rate": 0.09333507750670417,
+      "episodes": 8
+    },
+    {
+      "winner": "Alvaro",
+      "rows": 15251,
+      "fires": 2392,
+      "fire_rate": 0.15684217428365352,
+      "episodes": 9
+    },
+    {
+      "winner": "Tasniem N. Alyahya",
+      "rows": 15199,
+      "fires": 1866,
+      "fire_rate": 0.12277123494966774,
+      "episodes": 7
+    },
+    {
+      "winner": "shackles6966",
+      "rows": 15184,
+      "fires": 1237,
+      "fire_rate": 0.08146733403582719,
+      "episodes": 5
+    },
+    {
+      "winner": "KoshinM",
+      "rows": 15155,
+      "fires": 2103,
+      "fire_rate": 0.13876608380072583,
+      "episodes": 7
+    },
+    {
+      "winner": "WuJingjing",
+      "rows": 15118,
+      "fires": 2101,
+      "fire_rate": 0.13897340918110862,
+      "episodes": 9
+    },
+    {
+      "winner": "Nat Bel ML Fun",
+      "rows": 15109,
+      "fires": 2122,
+      "fire_rate": 0.14044609173340394,
+      "episodes": 10
+    },
+    {
+      "winner": "RicardoLópez",
+      "rows": 14977,
+      "fires": 1901,
+      "fire_rate": 0.12692795619950592,
+      "episodes": 10
+    },
+    {
+      "winner": "Sean Jones",
+      "rows": 14861,
+      "fires": 1186,
+      "fire_rate": 0.07980620415853576,
+      "episodes": 9
+    },
+    {
+      "winner": "[cmbc] pantheow 🦆 🦆",
+      "rows": 14570,
+      "fires": 925,
+      "fire_rate": 0.0634866163349348,
+      "episodes": 4
+    },
+    {
+      "winner": "shash20124",
+      "rows": 14400,
+      "fires": 2189,
+      "fire_rate": 0.1520138888888889,
+      "episodes": 7
+    },
+    {
+      "winner": "Natalia Jaśkowska",
+      "rows": 14288,
+      "fires": 1640,
+      "fire_rate": 0.11478163493840986,
+      "episodes": 10
+    },
+    {
+      "winner": "PavelLiashkov",
+      "rows": 14283,
+      "fires": 1504,
+      "fire_rate": 0.10530000700133026,
+      "episodes": 7
+    },
+    {
+      "winner": "Alyce Miki",
+      "rows": 14175,
+      "fires": 1897,
+      "fire_rate": 0.13382716049382717,
+      "episodes": 10
+    },
+    {
+      "winner": "mercury12512",
+      "rows": 14130,
+      "fires": 2430,
+      "fire_rate": 0.17197452229299362,
+      "episodes": 7
+    },
+    {
+      "winner": "Octavi Grau",
+      "rows": 14103,
+      "fires": 1263,
+      "fire_rate": 0.08955541374175707,
+      "episodes": 4
+    },
+    {
+      "winner": "Ajay_Rao_43",
+      "rows": 13993,
+      "fires": 1831,
+      "fire_rate": 0.13085113985564212,
+      "episodes": 8
+    },
+    {
+      "winner": "lvisdd",
+      "rows": 13904,
+      "fires": 2042,
+      "fire_rate": 0.14686421173762945,
+      "episodes": 9
+    },
+    {
+      "winner": "Charismatic Pizza Party🍕",
+      "rows": 13873,
+      "fires": 1866,
+      "fire_rate": 0.13450587472068046,
+      "episodes": 10
+    },
+    {
+      "winner": "Hayato Matsuzawa",
+      "rows": 13788,
+      "fires": 1322,
+      "fire_rate": 0.09588047577603713,
+      "episodes": 6
+    },
+    {
+      "winner": "Akira Hirohashi",
+      "rows": 13591,
+      "fires": 2216,
+      "fire_rate": 0.1630490765948054,
+      "episodes": 7
+    },
+    {
+      "winner": "SpeedSci",
+      "rows": 13456,
+      "fires": 1799,
+      "fire_rate": 0.1336950059453032,
+      "episodes": 6
+    },
+    {
+      "winner": "Sam Scott",
+      "rows": 13428,
+      "fires": 2014,
+      "fire_rate": 0.1499851057491808,
+      "episodes": 11
+    },
+    {
+      "winner": "alessio mezzina",
+      "rows": 13353,
+      "fires": 2088,
+      "fire_rate": 0.15636935520107842,
+      "episodes": 3
+    },
+    {
+      "winner": "Omprakash Patra",
+      "rows": 13330,
+      "fires": 1234,
+      "fire_rate": 0.09257314328582146,
+      "episodes": 4
+    },
+    {
+      "winner": "Yusaku Muroya",
+      "rows": 13276,
+      "fires": 1208,
+      "fire_rate": 0.0909912624284423,
+      "episodes": 6
+    },
+    {
+      "winner": "Amon Suzuki",
+      "rows": 13244,
+      "fires": 1935,
+      "fire_rate": 0.1461038961038961,
+      "episodes": 8
+    },
+    {
+      "winner": "itzzomkar",
+      "rows": 13228,
+      "fires": 2037,
+      "fire_rate": 0.15399153311158148,
+      "episodes": 8
+    },
+    {
+      "winner": "Pawan Rama Mali",
+      "rows": 13224,
+      "fires": 1586,
+      "fire_rate": 0.11993345432546884,
+      "episodes": 9
+    },
+    {
+      "winner": "Henry Nieves",
+      "rows": 13109,
+      "fires": 1639,
+      "fire_rate": 0.12502860630101456,
+      "episodes": 6
+    },
+    {
+      "winner": "IAI-RL-IX",
+      "rows": 13040,
+      "fires": 1764,
+      "fire_rate": 0.1352760736196319,
+      "episodes": 7
+    },
+    {
+      "winner": "manaphy24",
+      "rows": 13039,
+      "fires": 1863,
+      "fire_rate": 0.1428790551422655,
+      "episodes": 5
+    },
+    {
+      "winner": "Aadi Joshi",
+      "rows": 13011,
+      "fires": 1672,
+      "fire_rate": 0.1285066482207363,
+      "episodes": 6
+    },
+    {
+      "winner": "Ivan Tretyakov",
+      "rows": 12971,
+      "fires": 1945,
+      "fire_rate": 0.1499498882121656,
+      "episodes": 9
+    },
+    {
+      "winner": "today",
+      "rows": 12901,
+      "fires": 2114,
+      "fire_rate": 0.16386326641345633,
+      "episodes": 6
+    },
+    {
+      "winner": "victorvv",
+      "rows": 12848,
+      "fires": 1917,
+      "fire_rate": 0.14920610211706103,
+      "episodes": 9
+    },
+    {
+      "winner": "Paddington",
+      "rows": 12772,
+      "fires": 1268,
+      "fire_rate": 0.09927967428750391,
+      "episodes": 6
+    },
+    {
+      "winner": "mogura2.0",
+      "rows": 12721,
+      "fires": 1439,
+      "fire_rate": 0.11312003773288264,
+      "episodes": 7
+    },
+    {
+      "winner": "ThEmEpErSoN",
+      "rows": 12627,
+      "fires": 1705,
+      "fire_rate": 0.13502811435812148,
+      "episodes": 6
+    },
+    {
+      "winner": "Data is all you need",
+      "rows": 12559,
+      "fires": 1167,
+      "fire_rate": 0.09292141094036149,
+      "episodes": 6
+    },
+    {
+      "winner": "Hadesgo",
+      "rows": 12529,
+      "fires": 1648,
+      "fire_rate": 0.13153483917311837,
+      "episodes": 7
+    },
+    {
+      "winner": "sadbody123",
+      "rows": 12417,
+      "fires": 1716,
+      "fire_rate": 0.1381976322783281,
+      "episodes": 8
+    },
+    {
+      "winner": "simmons1025",
+      "rows": 12394,
+      "fires": 2097,
+      "fire_rate": 0.16919477166370825,
+      "episodes": 9
+    },
+    {
+      "winner": "Rasmus Foyer",
+      "rows": 12317,
+      "fires": 1499,
+      "fire_rate": 0.12170171307948364,
+      "episodes": 9
+    },
+    {
+      "winner": "keithtyser",
+      "rows": 12280,
+      "fires": 1351,
+      "fire_rate": 0.11001628664495114,
+      "episodes": 7
+    },
+    {
+      "winner": "Ramesh888",
+      "rows": 12185,
+      "fires": 1613,
+      "fire_rate": 0.1323758719737382,
+      "episodes": 7
+    },
+    {
+      "winner": "MR.h",
+      "rows": 12083,
+      "fires": 1536,
+      "fire_rate": 0.12712074815856989,
+      "episodes": 7
+    },
+    {
+      "winner": "Jelma",
+      "rows": 12066,
+      "fires": 1899,
+      "fire_rate": 0.1573843858776728,
+      "episodes": 7
+    },
+    {
+      "winner": "Haru",
+      "rows": 11974,
+      "fires": 1112,
+      "fire_rate": 0.09286788040754969,
+      "episodes": 6
+    },
+    {
+      "winner": "jatan sanghvi",
+      "rows": 11964,
+      "fires": 1408,
+      "fire_rate": 0.11768639251086593,
+      "episodes": 6
+    },
+    {
+      "winner": "Manan Gupta's Fleet",
+      "rows": 11785,
+      "fires": 1046,
+      "fire_rate": 0.08875689435723377,
+      "episodes": 9
+    },
+    {
+      "winner": "Machine is not Learning",
+      "rows": 11742,
+      "fires": 1363,
+      "fire_rate": 0.11607903253278828,
+      "episodes": 8
+    },
+    {
+      "winner": "Raghav_Sharma_17",
+      "rows": 11667,
+      "fires": 1892,
+      "fire_rate": 0.16216679523442187,
+      "episodes": 9
+    },
+    {
+      "winner": "Muhammad Ibrahim Qasmi",
+      "rows": 11661,
+      "fires": 1168,
+      "fire_rate": 0.10016293628333763,
+      "episodes": 4
+    },
+    {
+      "winner": "HongchenDai",
+      "rows": 11582,
+      "fires": 1385,
+      "fire_rate": 0.11958211017095494,
+      "episodes": 5
+    },
+    {
+      "winner": "Time go fishing👎",
+      "rows": 11549,
+      "fires": 1721,
+      "fire_rate": 0.14901723092908478,
+      "episodes": 7
+    },
+    {
+      "winner": "F.A.Nina",
+      "rows": 11539,
+      "fires": 2012,
+      "fire_rate": 0.17436519629083977,
+      "episodes": 6
+    },
+    {
+      "winner": "sam_the_rice_cake",
+      "rows": 11484,
+      "fires": 1411,
+      "fire_rate": 0.12286659700452804,
+      "episodes": 8
+    },
+    {
+      "winner": "GURUSU",
+      "rows": 11439,
+      "fires": 1052,
+      "fire_rate": 0.0919660809511321,
+      "episodes": 4
+    },
+    {
+      "winner": "predlast H of S",
+      "rows": 11347,
+      "fires": 1725,
+      "fire_rate": 0.15202256102934697,
+      "episodes": 7
+    },
+    {
+      "winner": "c0sm1c",
+      "rows": 11310,
+      "fires": 1411,
+      "fire_rate": 0.12475685234305924,
+      "episodes": 6
+    },
+    {
+      "winner": "Kevin Zhou",
+      "rows": 11303,
+      "fires": 852,
+      "fire_rate": 0.07537821817216668,
+      "episodes": 3
+    },
+    {
+      "winner": "Zaakcii Ru",
+      "rows": 11158,
+      "fires": 1642,
+      "fire_rate": 0.1471589890661409,
+      "episodes": 6
+    },
+    {
+      "winner": "Sam",
+      "rows": 11128,
+      "fires": 873,
+      "fire_rate": 0.07845075485262401,
+      "episodes": 4
+    },
+    {
+      "winner": "Filip Strzałka",
+      "rows": 11112,
+      "fires": 1474,
+      "fire_rate": 0.1326493880489561,
+      "episodes": 6
+    },
+    {
+      "winner": "Andrey Khlopotnykh",
+      "rows": 11039,
+      "fires": 1211,
+      "fire_rate": 0.10970196575776792,
+      "episodes": 5
+    },
+    {
+      "winner": "A. R. SEKKAT",
+      "rows": 10935,
+      "fires": 1225,
+      "fire_rate": 0.11202560585276634,
+      "episodes": 6
+    },
+    {
+      "winner": "madmax0404",
+      "rows": 10934,
+      "fires": 1182,
+      "fire_rate": 0.10810316444119261,
+      "episodes": 6
+    },
+    {
+      "winner": "Ryutogrrr",
+      "rows": 10897,
+      "fires": 1516,
+      "fire_rate": 0.13912085895200513,
+      "episodes": 7
+    },
+    {
+      "winner": "Code Flowing on Finger",
+      "rows": 10862,
+      "fires": 294,
+      "fire_rate": 0.02706683851960965,
+      "episodes": 1
+    },
+    {
+      "winner": "ＭＭＭ Abbie",
+      "rows": 10802,
+      "fires": 615,
+      "fire_rate": 0.056933901129420476,
+      "episodes": 3
+    },
+    {
+      "winner": "Viacheslav Popika",
+      "rows": 10746,
+      "fires": 1048,
+      "fire_rate": 0.0975246603387307,
+      "episodes": 6
+    },
+    {
+      "winner": "My_Full_Name3",
+      "rows": 10734,
+      "fires": 1972,
+      "fire_rate": 0.18371529718651017,
+      "episodes": 6
+    },
+    {
+      "winner": "Surya milenial",
+      "rows": 10559,
+      "fires": 1069,
+      "fire_rate": 0.10124064778861634,
+      "episodes": 5
+    },
+    {
+      "winner": "chenyfsusjje",
+      "rows": 10546,
+      "fires": 1514,
+      "fire_rate": 0.14356153992034895,
+      "episodes": 6
+    },
+    {
+      "winner": "Labib Shahriar",
+      "rows": 10502,
+      "fires": 1322,
+      "fire_rate": 0.12588078461245478,
+      "episodes": 5
+    },
+    {
+      "winner": "Jeffri Jeevan",
+      "rows": 10427,
+      "fires": 905,
+      "fire_rate": 0.08679390045075286,
+      "episodes": 3
+    },
+    {
+      "winner": "Kronki",
+      "rows": 10229,
+      "fires": 1408,
+      "fire_rate": 0.13764786391631637,
+      "episodes": 6
+    },
+    {
+      "winner": "zongzishuang",
+      "rows": 10195,
+      "fires": 1419,
+      "fire_rate": 0.13918587542913194,
+      "episodes": 6
+    },
+    {
+      "winner": "ömer kiraz",
+      "rows": 10150,
+      "fires": 1386,
+      "fire_rate": 0.13655172413793104,
+      "episodes": 7
+    },
+    {
+      "winner": "asdf",
+      "rows": 10085,
+      "fires": 989,
+      "fire_rate": 0.09806643529995042,
+      "episodes": 6
+    },
+    {
+      "winner": "Tyooughtul",
+      "rows": 10006,
+      "fires": 1442,
+      "fire_rate": 0.14411353188087148,
+      "episodes": 7
+    },
+    {
+      "winner": "神様",
+      "rows": 9972,
+      "fires": 1220,
+      "fire_rate": 0.12234255916566386,
+      "episodes": 2
+    },
+    {
+      "winner": "islet",
+      "rows": 9935,
+      "fires": 952,
+      "fire_rate": 0.09582284851534978,
+      "episodes": 4
+    },
+    {
+      "winner": "TensorRT",
+      "rows": 9774,
+      "fires": 1530,
+      "fire_rate": 0.15653775322283608,
+      "episodes": 7
+    },
+    {
+      "winner": "Vicens Gaitan",
+      "rows": 9774,
+      "fires": 1608,
+      "fire_rate": 0.16451810926949048,
+      "episodes": 6
+    },
+    {
+      "winner": "spbforce",
+      "rows": 9759,
+      "fires": 1581,
+      "fire_rate": 0.16200430371964342,
+      "episodes": 5
+    },
+    {
+      "winner": "Mantis",
+      "rows": 9688,
+      "fires": 1146,
+      "fire_rate": 0.11829066886870356,
+      "episodes": 7
+    },
+    {
+      "winner": "huangshanle",
+      "rows": 9640,
+      "fires": 1493,
+      "fire_rate": 0.15487551867219918,
+      "episodes": 6
+    },
+    {
+      "winner": "Max Manushin",
+      "rows": 9543,
+      "fires": 1286,
+      "fire_rate": 0.13475846169967515,
+      "episodes": 5
+    },
+    {
+      "winner": "nyanko-sensei",
+      "rows": 9539,
+      "fires": 1345,
+      "fire_rate": 0.14100010483279168,
+      "episodes": 5
+    },
+    {
+      "winner": "XuanxuChem",
+      "rows": 9507,
+      "fires": 837,
+      "fire_rate": 0.08804039129062796,
+      "episodes": 5
+    },
+    {
+      "winner": "Pham Kim Hoan",
+      "rows": 9378,
+      "fires": 1329,
+      "fire_rate": 0.1417146513115803,
+      "episodes": 6
+    },
+    {
+      "winner": "Paritosh Kumar Tripathi",
+      "rows": 9256,
+      "fires": 1255,
+      "fire_rate": 0.1355877268798617,
+      "episodes": 5
+    },
+    {
+      "winner": "Cam-Luan Truong",
+      "rows": 9214,
+      "fires": 1597,
+      "fire_rate": 0.1733232038202735,
+      "episodes": 7
+    },
+    {
+      "winner": "Karan Bhatti",
+      "rows": 9174,
+      "fires": 901,
+      "fire_rate": 0.09821233921953347,
+      "episodes": 5
+    },
+    {
+      "winner": "jiashuo Ma",
+      "rows": 9133,
+      "fires": 1296,
+      "fire_rate": 0.14190298916018831,
+      "episodes": 6
+    },
+    {
+      "winner": "Ming Fong",
+      "rows": 9123,
+      "fires": 993,
+      "fire_rate": 0.10884577441631042,
+      "episodes": 5
+    },
+    {
+      "winner": "kumanomi",
+      "rows": 9120,
+      "fires": 593,
+      "fire_rate": 0.0650219298245614,
+      "episodes": 3
+    },
+    {
+      "winner": "Ricardo.M.Zhang",
+      "rows": 9074,
+      "fires": 620,
+      "fire_rate": 0.06832708838439497,
+      "episodes": 3
+    },
+    {
+      "winner": "me",
+      "rows": 9068,
+      "fires": 653,
+      "fire_rate": 0.07201146890163211,
+      "episodes": 3
+    },
+    {
+      "winner": "Umair Zia",
+      "rows": 9017,
+      "fires": 1300,
+      "fire_rate": 0.14417211933015414,
+      "episodes": 6
+    },
+    {
+      "winner": "croissant",
+      "rows": 8985,
+      "fires": 941,
+      "fire_rate": 0.10473010573177519,
+      "episodes": 8
+    },
+    {
+      "winner": "Blacklions.",
+      "rows": 8951,
+      "fires": 1087,
+      "fire_rate": 0.12143894536923248,
+      "episodes": 6
+    },
+    {
+      "winner": "panda__MB__maximus",
+      "rows": 8925,
+      "fires": 1489,
+      "fire_rate": 0.16683473389355744,
+      "episodes": 4
+    },
+    {
+      "winner": "Carson Builds",
+      "rows": 8901,
+      "fires": 1311,
+      "fire_rate": 0.14728682170542637,
+      "episodes": 5
+    },
+    {
+      "winner": "Le Trong Hieu",
+      "rows": 8813,
+      "fires": 1045,
+      "fire_rate": 0.11857483263360943,
+      "episodes": 3
+    },
+    {
+      "winner": "Long Hu",
+      "rows": 8780,
+      "fires": 1563,
+      "fire_rate": 0.17801822323462416,
+      "episodes": 5
+    },
+    {
+      "winner": "theredbluepill",
+      "rows": 8758,
+      "fires": 983,
+      "fire_rate": 0.11224023749714547,
+      "episodes": 4
+    },
+    {
+      "winner": "Rafiozoo",
+      "rows": 8747,
+      "fires": 1156,
+      "fire_rate": 0.13215959757631188,
+      "episodes": 4
+    },
+    {
+      "winner": "Xander",
+      "rows": 8663,
+      "fires": 1039,
+      "fire_rate": 0.11993535726653584,
+      "episodes": 5
+    },
+    {
+      "winner": "Penguin",
+      "rows": 8652,
+      "fires": 1369,
+      "fire_rate": 0.1582293111419325,
+      "episodes": 5
+    },
+    {
+      "winner": "Mikhail Bovt",
+      "rows": 8634,
+      "fires": 1221,
+      "fire_rate": 0.1414176511466296,
+      "episodes": 4
+    },
+    {
+      "winner": "Veniamin Nelin",
+      "rows": 8556,
+      "fires": 614,
+      "fire_rate": 0.07176250584385227,
+      "episodes": 4
+    },
+    {
+      "winner": "Galatea of the Spheres",
+      "rows": 8514,
+      "fires": 806,
+      "fire_rate": 0.09466760629551327,
+      "episodes": 4
+    },
+    {
+      "winner": "Shiru2",
+      "rows": 8441,
+      "fires": 980,
+      "fire_rate": 0.11609998815306244,
+      "episodes": 6
+    },
+    {
+      "winner": "Marwan Ashref",
+      "rows": 8430,
+      "fires": 1212,
+      "fire_rate": 0.14377224199288255,
+      "episodes": 6
+    },
+    {
+      "winner": "M & L",
+      "rows": 8423,
+      "fires": 1082,
+      "fire_rate": 0.12845779413510625,
+      "episodes": 5
+    },
+    {
+      "winner": "SkyL",
+      "rows": 8423,
+      "fires": 722,
+      "fire_rate": 0.08571767778701175,
+      "episodes": 4
+    },
+    {
+      "winner": "AndiArvy",
+      "rows": 8416,
+      "fires": 1050,
+      "fire_rate": 0.12476235741444867,
+      "episodes": 5
+    },
+    {
+      "winner": "Hanif Noer Rofiq",
+      "rows": 8219,
+      "fires": 865,
+      "fire_rate": 0.10524394695218396,
+      "episodes": 5
+    },
+    {
+      "winner": "yukinoka",
+      "rows": 8217,
+      "fires": 1127,
+      "fire_rate": 0.137154679323354,
+      "episodes": 6
+    },
+    {
+      "winner": "Владислав Карташов",
+      "rows": 8070,
+      "fires": 1311,
+      "fire_rate": 0.162453531598513,
+      "episodes": 4
+    },
+    {
+      "winner": "Gendaijin",
+      "rows": 8031,
+      "fires": 821,
+      "fire_rate": 0.10222886315527331,
+      "episodes": 4
+    },
+    {
+      "winner": "akmr",
+      "rows": 8030,
+      "fires": 762,
+      "fire_rate": 0.09489414694894147,
+      "episodes": 5
+    },
+    {
+      "winner": "luckyappley",
+      "rows": 8010,
+      "fires": 995,
+      "fire_rate": 0.12421972534332085,
+      "episodes": 4
+    },
+    {
+      "winner": "Pratham Parekh",
+      "rows": 7996,
+      "fires": 1064,
+      "fire_rate": 0.1330665332666333,
+      "episodes": 5
+    },
+    {
+      "winner": "Mathemortician",
+      "rows": 7988,
+      "fires": 1203,
+      "fire_rate": 0.15060090135202805,
+      "episodes": 5
+    },
+    {
+      "winner": "THUNDER THUNDER",
+      "rows": 7982,
+      "fires": 1029,
+      "fire_rate": 0.12891505888248558,
+      "episodes": 4
+    },
+    {
+      "winner": "Lucien de Rubempre",
+      "rows": 7959,
+      "fires": 812,
+      "fire_rate": 0.10202286719437115,
+      "episodes": 5
+    },
+    {
+      "winner": "Ray",
+      "rows": 7953,
+      "fires": 1191,
+      "fire_rate": 0.14975480950584685,
+      "episodes": 6
+    },
+    {
+      "winner": "alanchoo",
+      "rows": 7945,
+      "fires": 609,
+      "fire_rate": 0.07665198237885462,
+      "episodes": 4
+    },
+    {
+      "winner": "Albert Wang",
+      "rows": 7848,
+      "fires": 428,
+      "fire_rate": 0.0545361875637105,
+      "episodes": 1
+    },
+    {
+      "winner": "KTakashina",
+      "rows": 7797,
+      "fires": 727,
+      "fire_rate": 0.09324099012440683,
+      "episodes": 4
+    },
+    {
+      "winner": "masha lisafss",
+      "rows": 7685,
+      "fires": 1194,
+      "fire_rate": 0.1553675992192583,
+      "episodes": 4
+    },
+    {
+      "winner": "kruschdev",
+      "rows": 7601,
+      "fires": 905,
+      "fire_rate": 0.11906328114721747,
+      "episodes": 5
+    },
+    {
+      "winner": "Lidor Foguel",
+      "rows": 7572,
+      "fires": 911,
+      "fire_rate": 0.12031167459059694,
+      "episodes": 6
+    },
+    {
+      "winner": "webcainiao",
+      "rows": 7569,
+      "fires": 764,
+      "fire_rate": 0.10093803672876206,
+      "episodes": 5
+    },
+    {
+      "winner": "Julien Genzling",
+      "rows": 7530,
+      "fires": 519,
+      "fire_rate": 0.06892430278884462,
+      "episodes": 2
+    },
+    {
+      "winner": "lyhlyh",
+      "rows": 7519,
+      "fires": 1022,
+      "fire_rate": 0.13592233009708737,
+      "episodes": 5
+    },
+    {
+      "winner": "Oshbocker",
+      "rows": 7491,
+      "fires": 971,
+      "fire_rate": 0.12962221332265386,
+      "episodes": 4
+    },
+    {
+      "winner": "betterme",
+      "rows": 7470,
+      "fires": 1207,
+      "fire_rate": 0.16157965194109772,
+      "episodes": 4
+    },
+    {
+      "winner": "fle3n",
+      "rows": 7425,
+      "fires": 1248,
+      "fire_rate": 0.16808080808080808,
+      "episodes": 6
+    },
+    {
+      "winner": "x5or6",
+      "rows": 7406,
+      "fires": 1125,
+      "fire_rate": 0.1519038617337294,
+      "episodes": 5
+    },
+    {
+      "winner": "Orbit Ruler",
+      "rows": 7389,
+      "fires": 1093,
+      "fire_rate": 0.1479225876302612,
+      "episodes": 6
+    },
+    {
+      "winner": "sidong king",
+      "rows": 7372,
+      "fires": 1256,
+      "fire_rate": 0.17037438958220294,
+      "episodes": 2
+    },
+    {
+      "winner": "Trapeznikov_Mihail",
+      "rows": 7357,
+      "fires": 436,
+      "fire_rate": 0.0592632866657605,
+      "episodes": 1
+    },
+    {
+      "winner": "Can",
+      "rows": 7345,
+      "fires": 952,
+      "fire_rate": 0.12961198093941456,
+      "episodes": 4
+    },
+    {
+      "winner": "Abdullah Kazimov",
+      "rows": 7342,
+      "fires": 948,
+      "fire_rate": 0.1291201307545628,
+      "episodes": 5
+    },
+    {
+      "winner": "C R Suthikshn Kumar",
+      "rows": 7326,
+      "fires": 1041,
+      "fire_rate": 0.1420966420966421,
+      "episodes": 6
+    },
+    {
+      "winner": "Jingjiang Fu",
+      "rows": 7207,
+      "fires": 906,
+      "fire_rate": 0.1257111141945331,
+      "episodes": 4
+    },
+    {
+      "winner": "Yusuraume",
+      "rows": 7201,
+      "fires": 721,
+      "fire_rate": 0.10012498264129982,
+      "episodes": 4
+    },
+    {
+      "winner": "Saksham Sirohi",
+      "rows": 7118,
+      "fires": 863,
+      "fire_rate": 0.12124192188817083,
+      "episodes": 5
+    },
+    {
+      "winner": "SeaEag1e",
+      "rows": 7114,
+      "fires": 1054,
+      "fire_rate": 0.14815856058476243,
+      "episodes": 4
+    },
+    {
+      "winner": "BhargavaAbhi",
+      "rows": 7111,
+      "fires": 902,
+      "fire_rate": 0.12684573196456195,
+      "episodes": 2
+    },
+    {
+      "winner": "Nhat Minh",
+      "rows": 7092,
+      "fires": 527,
+      "fire_rate": 0.07430908065425831,
+      "episodes": 1
+    },
+    {
+      "winner": "agent by agents",
+      "rows": 7036,
+      "fires": 849,
+      "fire_rate": 0.12066515065378056,
+      "episodes": 4
+    },
+    {
+      "winner": "Malespero",
+      "rows": 6927,
+      "fires": 884,
+      "fire_rate": 0.12761657283095135,
+      "episodes": 3
+    },
+    {
+      "winner": "Rajan Nagarajan",
+      "rows": 6919,
+      "fires": 843,
+      "fire_rate": 0.12183841595606301,
+      "episodes": 4
+    },
+    {
+      "winner": "2Yoimiya",
+      "rows": 6882,
+      "fires": 884,
+      "fire_rate": 0.12845103167683813,
+      "episodes": 4
+    },
+    {
+      "winner": "ChrisLeiteScha|khj1222",
+      "rows": 6865,
+      "fires": 1746,
+      "fire_rate": 0.2543335761107065,
+      "episodes": 1
+    },
+    {
+      "winner": "mitubant",
+      "rows": 6823,
+      "fires": 698,
+      "fire_rate": 0.10230104059797743,
+      "episodes": 2
+    },
+    {
+      "winner": "v1codexc3",
+      "rows": 6796,
+      "fires": 426,
+      "fire_rate": 0.06268393172454385,
+      "episodes": 2
+    },
+    {
+      "winner": "SQLRockstar",
+      "rows": 6788,
+      "fires": 241,
+      "fire_rate": 0.03550383028874484,
+      "episodes": 1
+    },
+    {
+      "winner": "SKYisSKYisSKY",
+      "rows": 6737,
+      "fires": 694,
+      "fire_rate": 0.10301321062787591,
+      "episodes": 3
+    },
+    {
+      "winner": "²²n",
+      "rows": 6727,
+      "fires": 883,
+      "fire_rate": 0.13126207819235916,
+      "episodes": 3
+    },
+    {
+      "winner": "ナハト・ ファウスト",
+      "rows": 6726,
+      "fires": 616,
+      "fire_rate": 0.09158489443948856,
+      "episodes": 4
+    },
+    {
+      "winner": "Andrey Atanov",
+      "rows": 6720,
+      "fires": 1319,
+      "fire_rate": 0.1962797619047619,
+      "episodes": 3
+    },
+    {
+      "winner": "Jeki Wan Taufik|[ODS] waniz",
+      "rows": 6678,
+      "fires": 916,
+      "fire_rate": 0.13716681641209943,
+      "episodes": 1
+    },
+    {
+      "winner": "cometcatcher",
+      "rows": 6637,
+      "fires": 1040,
+      "fire_rate": 0.1566973029983426,
+      "episodes": 3
+    },
+    {
+      "winner": "less subs|Raghav_Sharma_17",
+      "rows": 6636,
+      "fires": 1775,
+      "fire_rate": 0.26748040988547317,
+      "episodes": 1
+    },
+    {
+      "winner": "xiao long745|test_orbit-wars",
+      "rows": 6620,
+      "fires": 1236,
+      "fire_rate": 0.18670694864048337,
+      "episodes": 1
+    },
+    {
+      "winner": "Tomas Diaz|smlcr",
+      "rows": 6584,
+      "fires": 919,
+      "fire_rate": 0.13958080194410694,
+      "episodes": 1
+    },
+    {
+      "winner": "ykhnkf|GURUSU",
+      "rows": 6582,
+      "fires": 722,
+      "fire_rate": 0.10969310240048617,
+      "episodes": 1
+    },
+    {
+      "winner": "Georgy Mamarin",
+      "rows": 6555,
+      "fires": 760,
+      "fire_rate": 0.11594202898550725,
+      "episodes": 3
+    },
+    {
+      "winner": "Time go fishing👎|Jeki Wan Taufik",
+      "rows": 6550,
+      "fires": 616,
+      "fire_rate": 0.09404580152671756,
+      "episodes": 1
+    },
+    {
+      "winner": "IAI-RL-Tlm71|Fruit19",
+      "rows": 6532,
+      "fires": 984,
+      "fire_rate": 0.15064298836497245,
+      "episodes": 1
+    },
+    {
+      "winner": "kokinnwakashuu|AkiraIshikawa",
+      "rows": 6408,
+      "fires": 708,
+      "fire_rate": 0.1104868913857678,
+      "episodes": 1
+    },
+    {
+      "winner": "sue124",
+      "rows": 6309,
+      "fires": 832,
+      "fire_rate": 0.13187509906482803,
+      "episodes": 4
+    },
+    {
+      "winner": "Roland Luethy",
+      "rows": 6298,
+      "fires": 1013,
+      "fire_rate": 0.1608447126071769,
+      "episodes": 5
+    },
+    {
+      "winner": "Raki",
+      "rows": 6235,
+      "fires": 2043,
+      "fire_rate": 0.3276663993584603,
+      "episodes": 3
+    },
+    {
+      "winner": "OwnnCarr",
+      "rows": 6218,
+      "fires": 630,
+      "fire_rate": 0.1013187520102927,
+      "episodes": 3
+    },
+    {
+      "winner": "AM",
+      "rows": 6214,
+      "fires": 912,
+      "fire_rate": 0.1467653685226907,
+      "episodes": 4
+    },
+    {
+      "winner": "Mathurin Ache",
+      "rows": 6118,
+      "fires": 644,
+      "fire_rate": 0.10526315789473684,
+      "episodes": 4
+    },
+    {
+      "winner": "llllllc666",
+      "rows": 6115,
+      "fires": 1303,
+      "fire_rate": 0.21308258381030254,
+      "episodes": 3
+    },
+    {
+      "winner": "我chovy",
+      "rows": 6114,
+      "fires": 1734,
+      "fire_rate": 0.28361138370951916,
+      "episodes": 1
+    },
+    {
+      "winner": "nikoro256",
+      "rows": 6099,
+      "fires": 895,
+      "fire_rate": 0.14674536809313002,
+      "episodes": 4
+    },
+    {
+      "winner": "Akshat Rai",
+      "rows": 6088,
+      "fires": 546,
+      "fire_rate": 0.08968462549277267,
+      "episodes": 3
+    },
+    {
+      "winner": "Timmy Juicehouse",
+      "rows": 6086,
+      "fires": 656,
+      "fire_rate": 0.10778836674334538,
+      "episodes": 3
+    },
+    {
+      "winner": "Randomists",
+      "rows": 6072,
+      "fires": 885,
+      "fire_rate": 0.14575098814229248,
+      "episodes": 4
+    },
+    {
+      "winner": "Meenal Sinha",
+      "rows": 6013,
+      "fires": 404,
+      "fire_rate": 0.06718775985365043,
+      "episodes": 3
+    },
+    {
+      "winner": "SK Arin",
+      "rows": 5962,
+      "fires": 689,
+      "fire_rate": 0.11556524656155652,
+      "episodes": 2
+    },
+    {
+      "winner": "mywind",
+      "rows": 5885,
+      "fires": 1001,
+      "fire_rate": 0.17009345794392525,
+      "episodes": 4
+    },
+    {
+      "winner": "Peter Nelson Subrata",
+      "rows": 5873,
+      "fires": 903,
+      "fire_rate": 0.1537544696066746,
+      "episodes": 4
+    },
+    {
+      "winner": "Kinshuk Aggarwal",
+      "rows": 5856,
+      "fires": 811,
+      "fire_rate": 0.13849043715846995,
+      "episodes": 4
+    },
+    {
+      "winner": "Mathemortician|xiao long745",
+      "rows": 5794,
+      "fires": 690,
+      "fire_rate": 0.11908871246116673,
+      "episodes": 1
+    },
+    {
+      "winner": "yaphanqiii",
+      "rows": 5791,
+      "fires": 648,
+      "fire_rate": 0.11189777240545674,
+      "episodes": 2
+    },
+    {
+      "winner": "エンジョイ勢募集",
+      "rows": 5781,
+      "fires": 744,
+      "fire_rate": 0.12869745718733783,
+      "episodes": 3
+    },
+    {
+      "winner": "Fruit19|Long Hu",
+      "rows": 5780,
+      "fires": 1460,
+      "fire_rate": 0.25259515570934254,
+      "episodes": 1
+    },
+    {
+      "winner": "akoynk|CurveCowboy",
+      "rows": 5776,
+      "fires": 1774,
+      "fire_rate": 0.30713296398891965,
+      "episodes": 1
+    },
+    {
+      "winner": "fgwiebfaoish",
+      "rows": 5773,
+      "fires": 941,
+      "fire_rate": 0.16300017322016283,
+      "episodes": 4
+    },
+    {
+      "winner": "Ajay_Rao_43|akoynk",
+      "rows": 5750,
+      "fires": 1632,
+      "fire_rate": 0.28382608695652173,
+      "episodes": 1
+    },
+    {
+      "winner": "Adrián Melic|SGzK001",
+      "rows": 5714,
+      "fires": 1900,
+      "fire_rate": 0.33251662583129155,
+      "episodes": 1
+    },
+    {
+      "winner": "Anil Ozturk|Xander",
+      "rows": 5708,
+      "fires": 748,
+      "fire_rate": 0.13104414856341975,
+      "episodes": 1
+    },
+    {
+      "winner": "Charismatic Pizza Party🍕|Gregory L.",
+      "rows": 5686,
+      "fires": 1168,
+      "fire_rate": 0.20541681322546607,
+      "episodes": 1
+    },
+    {
+      "winner": "IAI-RL-Checkm8|victorvv",
+      "rows": 5686,
+      "fires": 856,
+      "fire_rate": 0.15054519873373198,
+      "episodes": 1
+    },
+    {
+      "winner": "fgwiebfaoish|Djenk Ivanov",
+      "rows": 5686,
+      "fires": 1124,
+      "fire_rate": 0.1976785086176574,
+      "episodes": 1
+    },
+    {
+      "winner": "OzanM.|Shiv Satyam",
+      "rows": 5684,
+      "fires": 1210,
+      "fire_rate": 0.21287825475017594,
+      "episodes": 1
+    },
+    {
+      "winner": "Cam-Luan Truong|Samsay24",
+      "rows": 5680,
+      "fires": 2638,
+      "fire_rate": 0.46443661971830985,
+      "episodes": 1
+    },
+    {
+      "winner": "CQ🚪U",
+      "rows": 5677,
+      "fires": 991,
+      "fire_rate": 0.17456403029769244,
+      "episodes": 3
+    },
+    {
+      "winner": "Andrej Orsula",
+      "rows": 5673,
+      "fires": 822,
+      "fire_rate": 0.14489687995769435,
+      "episodes": 3
+    },
+    {
+      "winner": "ljx59141421",
+      "rows": 5665,
+      "fires": 221,
+      "fire_rate": 0.039011473962930275,
+      "episodes": 2
+    },
+    {
+      "winner": "tc-al",
+      "rows": 5645,
+      "fires": 804,
+      "fire_rate": 0.14242692648361382,
+      "episodes": 3
+    },
+    {
+      "winner": "Orbit Ruler|Shunsuke Hayashi",
+      "rows": 5574,
+      "fires": 554,
+      "fire_rate": 0.09939002511661285,
+      "episodes": 1
+    },
+    {
+      "winner": "Nishant Raj|Oshbocker",
+      "rows": 5564,
+      "fires": 816,
+      "fire_rate": 0.1466570812365205,
+      "episodes": 1
+    },
+    {
+      "winner": "ksew364",
+      "rows": 5559,
+      "fires": 1052,
+      "fire_rate": 0.18924266954488217,
+      "episodes": 3
+    },
+    {
+      "winner": "Jack Cerion|Tony Li",
+      "rows": 5530,
+      "fires": 580,
+      "fire_rate": 0.10488245931283906,
+      "episodes": 1
+    },
+    {
+      "winner": "Anil Ozturk",
+      "rows": 5475,
+      "fires": 496,
+      "fire_rate": 0.09059360730593607,
+      "episodes": 3
+    },
+    {
+      "winner": "Abdullah Hasan",
+      "rows": 5471,
+      "fires": 705,
+      "fire_rate": 0.12886126850667154,
+      "episodes": 3
+    },
+    {
+      "winner": "DJKGHW",
+      "rows": 5460,
+      "fires": 683,
+      "fire_rate": 0.1250915750915751,
+      "episodes": 3
+    },
+    {
+      "winner": "AnthonyTherrien",
+      "rows": 5418,
+      "fires": 446,
+      "fire_rate": 0.08231819859726837,
+      "episodes": 3
+    },
+    {
+      "winner": "ADARSH REDDY B",
+      "rows": 5385,
+      "fires": 406,
+      "fire_rate": 0.07539461467038068,
+      "episodes": 1
+    },
+    {
+      "winner": "ACoder",
+      "rows": 5365,
+      "fires": 270,
+      "fire_rate": 0.05032618825722274,
+      "episodes": 4
+    },
+    {
+      "winner": "Brothers of Creations",
+      "rows": 5362,
+      "fires": 296,
+      "fire_rate": 0.05520328235732935,
+      "episodes": 2
+    },
+    {
+      "winner": "Rajan Nagarajan|perpetual motion machine",
+      "rows": 5340,
+      "fires": 712,
+      "fire_rate": 0.13333333333333333,
+      "episodes": 1
+    },
+    {
+      "winner": "clora",
+      "rows": 5305,
+      "fires": 769,
+      "fire_rate": 0.14495758718190385,
+      "episodes": 3
+    },
+    {
+      "winner": "AkiraIshikawa",
+      "rows": 5299,
+      "fires": 355,
+      "fire_rate": 0.06699377240988866,
+      "episodes": 3
+    },
+    {
+      "winner": "kei-sho",
+      "rows": 5298,
+      "fires": 349,
+      "fire_rate": 0.0658739146847867,
+      "episodes": 1
+    },
+    {
+      "winner": "nonchalanttt",
+      "rows": 5275,
+      "fires": 678,
+      "fire_rate": 0.1285308056872038,
+      "episodes": 3
+    },
+    {
+      "winner": "Shiv Satyam",
+      "rows": 5262,
+      "fires": 434,
+      "fire_rate": 0.08247814519194223,
+      "episodes": 2
+    },
+    {
+      "winner": "late night snack",
+      "rows": 5233,
+      "fires": 546,
+      "fire_rate": 0.10433785591438945,
+      "episodes": 4
+    },
+    {
+      "winner": "Chris Deotte",
+      "rows": 5143,
+      "fires": 688,
+      "fire_rate": 0.13377406183161578,
+      "episodes": 4
+    },
+    {
+      "winner": "krist pun",
+      "rows": 5138,
+      "fires": 371,
+      "fire_rate": 0.07220708446866485,
+      "episodes": 3
+    },
+    {
+      "winner": "doge",
+      "rows": 5132,
+      "fires": 484,
+      "fire_rate": 0.09431021044427124,
+      "episodes": 4
+    },
+    {
+      "winner": "warbit ores",
+      "rows": 5116,
+      "fires": 346,
+      "fire_rate": 0.0676309616888194,
+      "episodes": 3
+    },
+    {
+      "winner": "IAI-RL-Tlm71|akoynk",
+      "rows": 5000,
+      "fires": 794,
+      "fire_rate": 0.1588,
+      "episodes": 1
+    },
+    {
+      "winner": "lingyu07",
+      "rows": 4921,
+      "fires": 824,
+      "fire_rate": 0.16744564112985166,
+      "episodes": 3
+    },
+    {
+      "winner": "Priestess 🏆",
+      "rows": 4875,
+      "fires": 608,
+      "fire_rate": 0.12471794871794872,
+      "episodes": 3
+    },
+    {
+      "winner": "Lance Wu",
+      "rows": 4840,
+      "fires": 724,
+      "fire_rate": 0.14958677685950414,
+      "episodes": 2
+    },
+    {
+      "winner": "Jonathan Roy",
+      "rows": 4823,
+      "fires": 560,
+      "fire_rate": 0.11611030478955008,
+      "episodes": 2
+    },
+    {
+      "winner": "nickyl",
+      "rows": 4819,
+      "fires": 647,
+      "fire_rate": 0.13426021996264786,
+      "episodes": 3
+    },
+    {
+      "winner": "Ajay_Rao_43|ShumingFang",
+      "rows": 4812,
+      "fires": 452,
+      "fire_rate": 0.09393183707398171,
+      "episodes": 1
+    },
+    {
+      "winner": "zhuo wamg",
+      "rows": 4803,
+      "fires": 624,
+      "fire_rate": 0.12991880074953155,
+      "episodes": 3
+    },
+    {
+      "winner": "Duong Nguyen|Fruit19",
+      "rows": 4796,
+      "fires": 378,
+      "fire_rate": 0.07881567973311093,
+      "episodes": 1
+    },
+    {
+      "winner": "Mykola Nelin",
+      "rows": 4775,
+      "fires": 700,
+      "fire_rate": 0.14659685863874344,
+      "episodes": 4
+    },
+    {
+      "winner": "SGzK001|Birtley Doru (DB)",
+      "rows": 4766,
+      "fires": 610,
+      "fire_rate": 0.12798992866135123,
+      "episodes": 1
+    },
+    {
+      "winner": "huangshanle|Ivan Tretyakov",
+      "rows": 4748,
+      "fires": 346,
+      "fire_rate": 0.07287278854254423,
+      "episodes": 1
+    },
+    {
+      "winner": "Neeraj|zhenyue",
+      "rows": 4744,
+      "fires": 822,
+      "fire_rate": 0.17327150084317033,
+      "episodes": 1
+    },
+    {
+      "winner": "YEBOI|Henry Nieves",
+      "rows": 4690,
+      "fires": 316,
+      "fire_rate": 0.0673773987206823,
+      "episodes": 1
+    },
+    {
+      "winner": "Piotr Gabryś",
+      "rows": 4687,
+      "fires": 709,
+      "fire_rate": 0.15126946874333264,
+      "episodes": 2
+    },
+    {
+      "winner": "藤田　佑",
+      "rows": 4650,
+      "fires": 798,
+      "fire_rate": 0.17161290322580644,
+      "episodes": 3
+    },
+    {
+      "winner": "blurrylogic",
+      "rows": 4621,
+      "fires": 368,
+      "fire_rate": 0.07963644232850033,
+      "episodes": 2
+    },
+    {
+      "winner": "Tagir Analyzes",
+      "rows": 4612,
+      "fires": 384,
+      "fire_rate": 0.08326105810928014,
+      "episodes": 2
+    },
+    {
+      "winner": "Yash Marathe",
+      "rows": 4600,
+      "fires": 202,
+      "fire_rate": 0.04391304347826087,
+      "episodes": 1
+    },
+    {
+      "winner": "AI-Cat",
+      "rows": 4552,
+      "fires": 739,
+      "fire_rate": 0.1623462214411248,
+      "episodes": 3
+    },
+    {
+      "winner": "больше чем rl",
+      "rows": 4548,
+      "fires": 677,
+      "fire_rate": 0.14885664028144238,
+      "episodes": 3
+    },
+    {
+      "winner": "IAI-RL-codex",
+      "rows": 4530,
+      "fires": 507,
+      "fire_rate": 0.1119205298013245,
+      "episodes": 3
+    },
+    {
+      "winner": "NewTechMitch",
+      "rows": 4524,
+      "fires": 231,
+      "fire_rate": 0.05106100795755968,
+      "episodes": 2
+    },
+    {
+      "winner": "RITTWIK BHOWMICK",
+      "rows": 4501,
+      "fires": 599,
+      "fire_rate": 0.1330815374361253,
+      "episodes": 3
+    },
+    {
+      "winner": "Himeno",
+      "rows": 4498,
+      "fires": 403,
+      "fire_rate": 0.08959537572254335,
+      "episodes": 3
+    },
+    {
+      "winner": "BlastingAway",
+      "rows": 4433,
+      "fires": 405,
+      "fire_rate": 0.09136025265057524,
+      "episodes": 2
+    },
+    {
+      "winner": "Artem1410",
+      "rows": 4430,
+      "fires": 555,
+      "fire_rate": 0.1252821670428894,
+      "episodes": 3
+    },
+    {
+      "winner": "onick_man",
+      "rows": 4426,
+      "fires": 597,
+      "fire_rate": 0.1348847718029824,
+      "episodes": 1
+    },
+    {
+      "winner": "Fault",
+      "rows": 4384,
+      "fires": 582,
+      "fire_rate": 0.13275547445255476,
+      "episodes": 3
+    },
+    {
+      "winner": "Pham Kim Hoan|Antonoof",
+      "rows": 4376,
+      "fires": 434,
+      "fire_rate": 0.09917733089579525,
+      "episodes": 1
+    },
+    {
+      "winner": "forever young",
+      "rows": 4368,
+      "fires": 580,
+      "fire_rate": 0.13278388278388278,
+      "episodes": 3
+    },
+    {
+      "winner": "kglctf",
+      "rows": 4360,
+      "fires": 441,
+      "fire_rate": 0.10114678899082569,
+      "episodes": 2
+    },
+    {
+      "winner": "Dhruv Bansal",
+      "rows": 4353,
+      "fires": 523,
+      "fire_rate": 0.12014702504020217,
+      "episodes": 3
+    },
+    {
+      "winner": "=",
+      "rows": 4339,
+      "fires": 619,
+      "fire_rate": 0.14265959898594147,
+      "episodes": 3
+    },
+    {
+      "winner": "SUMIN KANG",
+      "rows": 4316,
+      "fires": 129,
+      "fire_rate": 0.0298887859128823,
+      "episodes": 1
+    },
+    {
+      "winner": "Ttkuma",
+      "rows": 4299,
+      "fires": 689,
+      "fire_rate": 0.16026983019306815,
+      "episodes": 3
+    },
+    {
+      "winner": "Maksym Bilychenko",
+      "rows": 4246,
+      "fires": 478,
+      "fire_rate": 0.1125765426283561,
+      "episodes": 3
+    },
+    {
+      "winner": "Venkat reddy Enaganti",
+      "rows": 4222,
+      "fires": 550,
+      "fire_rate": 0.13027001421127427,
+      "episodes": 2
+    },
+    {
+      "winner": "GreedShen",
+      "rows": 4219,
+      "fires": 485,
+      "fire_rate": 0.11495615074662242,
+      "episodes": 2
+    },
+    {
+      "winner": "kawhi0.0",
+      "rows": 4214,
+      "fires": 480,
+      "fire_rate": 0.11390602752728998,
+      "episodes": 3
+    },
+    {
+      "winner": "yuken",
+      "rows": 4156,
+      "fires": 481,
+      "fire_rate": 0.11573628488931666,
+      "episodes": 3
+    },
+    {
+      "winner": "Karthik",
+      "rows": 4149,
+      "fires": 464,
+      "fire_rate": 0.11183417691009882,
+      "episodes": 3
+    },
+    {
+      "winner": "Birtley Doru (DB)",
+      "rows": 4088,
+      "fires": 550,
+      "fire_rate": 0.13454011741682975,
+      "episodes": 3
+    },
+    {
+      "winner": "sasaki",
+      "rows": 4025,
+      "fires": 411,
+      "fire_rate": 0.10211180124223602,
+      "episodes": 3
+    },
+    {
+      "winner": "Robert Cheah",
+      "rows": 4009,
+      "fires": 243,
+      "fire_rate": 0.06061361935644799,
+      "episodes": 1
+    },
+    {
+      "winner": "FlowDiff",
+      "rows": 3936,
+      "fires": 656,
+      "fire_rate": 0.16666666666666666,
+      "episodes": 3
+    },
+    {
+      "winner": "takaito",
+      "rows": 3936,
+      "fires": 455,
+      "fire_rate": 0.11559959349593496,
+      "episodes": 3
+    },
+    {
+      "winner": "Reinhard",
+      "rows": 3908,
+      "fires": 560,
+      "fire_rate": 0.14329580348004095,
+      "episodes": 2
+    },
+    {
+      "winner": "haonan zhengh",
+      "rows": 3889,
+      "fires": 281,
+      "fire_rate": 0.07225507842633068,
+      "episodes": 1
+    },
+    {
+      "winner": "Birtley Doru (DB)|F.A.Nina",
+      "rows": 3888,
+      "fires": 1520,
+      "fire_rate": 0.39094650205761317,
+      "episodes": 1
+    },
+    {
+      "winner": "Iceberg",
+      "rows": 3884,
+      "fires": 477,
+      "fire_rate": 0.12281153450051494,
+      "episodes": 3
+    },
+    {
+      "winner": "Jyo@5200",
+      "rows": 3860,
+      "fires": 278,
+      "fire_rate": 0.07202072538860103,
+      "episodes": 2
+    },
+    {
+      "winner": "Le Trong Hieu|xiao long745",
+      "rows": 3842,
+      "fires": 200,
+      "fire_rate": 0.052056220718375845,
+      "episodes": 1
+    },
+    {
+      "winner": "pd",
+      "rows": 3829,
+      "fires": 567,
+      "fire_rate": 0.1480804387568556,
+      "episodes": 3
+    },
+    {
+      "winner": "Patrick Chan|less subs",
+      "rows": 3820,
+      "fires": 334,
+      "fire_rate": 0.08743455497382199,
+      "episodes": 1
+    },
+    {
+      "winner": "CuteClaw",
+      "rows": 3811,
+      "fires": 466,
+      "fire_rate": 0.1222776174232485,
+      "episodes": 3
+    },
+    {
+      "winner": "Tomoki Hirose|IAI-RL-Tlm71",
+      "rows": 3802,
+      "fires": 426,
+      "fire_rate": 0.11204629142556549,
+      "episodes": 1
+    },
+    {
+      "winner": "Jiahui Qu|Randomists",
+      "rows": 3798,
+      "fires": 180,
+      "fire_rate": 0.04739336492890995,
+      "episodes": 1
+    },
+    {
+      "winner": "Justin He",
+      "rows": 3778,
+      "fires": 497,
+      "fire_rate": 0.13155108523028058,
+      "episodes": 1
+    },
+    {
+      "winner": "JM",
+      "rows": 3772,
+      "fires": 656,
+      "fire_rate": 0.17391304347826086,
+      "episodes": 3
+    },
+    {
+      "winner": "yunus_bayram_kagle",
+      "rows": 3772,
+      "fires": 168,
+      "fire_rate": 0.044538706256627786,
+      "episodes": 2
+    },
+    {
+      "winner": "tomoki225255",
+      "rows": 3732,
+      "fires": 264,
+      "fire_rate": 0.0707395498392283,
+      "episodes": 2
+    },
+    {
+      "winner": "Knight of Favonius",
+      "rows": 3708,
+      "fires": 641,
+      "fire_rate": 0.17286947141316072,
+      "episodes": 2
+    },
+    {
+      "winner": "Nadeem|MR.h",
+      "rows": 3708,
+      "fires": 1732,
+      "fire_rate": 0.4670981661272923,
+      "episodes": 1
+    },
+    {
+      "winner": "W & K",
+      "rows": 3685,
+      "fires": 571,
+      "fire_rate": 0.15495251017639078,
+      "episodes": 3
+    },
+    {
+      "winner": "AM|chiikawa&hachiware",
+      "rows": 3676,
+      "fires": 422,
+      "fire_rate": 0.1147986942328618,
+      "episodes": 1
+    },
+    {
+      "winner": "Giba",
+      "rows": 3669,
+      "fires": 512,
+      "fire_rate": 0.13954756064322704,
+      "episodes": 1
+    },
+    {
+      "winner": "Surabhi veda",
+      "rows": 3663,
+      "fires": 426,
+      "fire_rate": 0.1162981162981163,
+      "episodes": 2
+    },
+    {
+      "winner": "AyFukushima",
+      "rows": 3576,
+      "fires": 501,
+      "fire_rate": 0.1401006711409396,
+      "episodes": 2
+    },
+    {
+      "winner": "LIH.YUN",
+      "rows": 3553,
+      "fires": 537,
+      "fire_rate": 0.1511398817900366,
+      "episodes": 2
+    },
+    {
+      "winner": "Miz",
+      "rows": 3541,
+      "fires": 366,
+      "fire_rate": 0.10336063258966394,
+      "episodes": 3
+    },
+    {
+      "winner": "HY2017",
+      "rows": 3529,
+      "fires": 467,
+      "fire_rate": 0.1323321054122981,
+      "episodes": 2
+    },
+    {
+      "winner": "WBF_USA_NYC",
+      "rows": 3528,
+      "fires": 864,
+      "fire_rate": 0.24489795918367346,
+      "episodes": 4
+    },
+    {
+      "winner": "⸻AgentZZ ⸻",
+      "rows": 3490,
+      "fires": 364,
+      "fire_rate": 0.10429799426934097,
+      "episodes": 2
+    },
+    {
+      "winner": "Shangshang Zhang",
+      "rows": 3468,
+      "fires": 348,
+      "fire_rate": 0.10034602076124567,
+      "episodes": 3
+    },
+    {
+      "winner": "naveen11@12",
+      "rows": 3453,
+      "fires": 462,
+      "fire_rate": 0.13379669852302345,
+      "episodes": 3
+    },
+    {
+      "winner": "Kin",
+      "rows": 3451,
+      "fires": 661,
+      "fire_rate": 0.19153868443929295,
+      "episodes": 1
+    },
+    {
+      "winner": "@🤞@",
+      "rows": 3443,
+      "fires": 758,
+      "fire_rate": 0.22015683996514668,
+      "episodes": 1
+    },
+    {
+      "winner": "Kushal Khemani",
+      "rows": 3420,
+      "fires": 538,
+      "fire_rate": 0.15730994152046784,
+      "episodes": 3
+    },
+    {
+      "winner": "Cyrus",
+      "rows": 3417,
+      "fires": 407,
+      "fire_rate": 0.11911033069944396,
+      "episodes": 2
+    },
+    {
+      "winner": "LiXingtao",
+      "rows": 3411,
+      "fires": 569,
+      "fire_rate": 0.16681325124596894,
+      "episodes": 1
+    },
+    {
+      "winner": "YM",
+      "rows": 3392,
+      "fires": 307,
+      "fire_rate": 0.09050707547169812,
+      "episodes": 1
+    },
+    {
+      "winner": "James Christian",
+      "rows": 3388,
+      "fires": 512,
+      "fire_rate": 0.1511216056670602,
+      "episodes": 2
+    },
+    {
+      "winner": "Qing Yang",
+      "rows": 3387,
+      "fires": 426,
+      "fire_rate": 0.12577502214348982,
+      "episodes": 2
+    },
+    {
+      "winner": "InformaBook2",
+      "rows": 3385,
+      "fires": 494,
+      "fire_rate": 0.14593796159527325,
+      "episodes": 2
+    },
+    {
+      "winner": "Alberto Mocchi",
+      "rows": 3344,
+      "fires": 502,
+      "fire_rate": 0.15011961722488038,
+      "episodes": 2
+    },
+    {
+      "winner": "Will",
+      "rows": 3337,
+      "fires": 572,
+      "fire_rate": 0.17141144740785136,
+      "episodes": 2
+    },
+    {
+      "winner": "Gain John",
+      "rows": 3295,
+      "fires": 320,
+      "fire_rate": 0.09711684370257967,
+      "episodes": 3
+    },
+    {
+      "winner": "Eda",
+      "rows": 3285,
+      "fires": 375,
+      "fire_rate": 0.1141552511415525,
+      "episodes": 1
+    },
+    {
+      "winner": "Eduardo",
+      "rows": 3256,
+      "fires": 337,
+      "fire_rate": 0.1035012285012285,
+      "episodes": 1
+    },
+    {
+      "winner": "Jai Kamal",
+      "rows": 3248,
+      "fires": 513,
+      "fire_rate": 0.1579433497536946,
+      "episodes": 1
+    },
+    {
+      "winner": "IAI-RL-06",
+      "rows": 3243,
+      "fires": 332,
+      "fire_rate": 0.10237434474252236,
+      "episodes": 2
+    },
+    {
+      "winner": "Kunal Aarse",
+      "rows": 3201,
+      "fires": 478,
+      "fire_rate": 0.1493283348953452,
+      "episodes": 1
+    },
+    {
+      "winner": "JaimeF",
+      "rows": 3191,
+      "fires": 249,
+      "fire_rate": 0.07803196490128486,
+      "episodes": 1
+    },
+    {
+      "winner": "shyjin",
+      "rows": 3165,
+      "fires": 349,
+      "fire_rate": 0.11026856240126383,
+      "episodes": 2
+    },
+    {
+      "winner": "Re Son",
+      "rows": 3163,
+      "fires": 538,
+      "fire_rate": 0.17009168510907366,
+      "episodes": 2
+    },
+    {
+      "winner": "Bogdan Kovenko",
+      "rows": 3144,
+      "fires": 522,
+      "fire_rate": 0.16603053435114504,
+      "episodes": 2
+    },
+    {
+      "winner": "Jiri Prudky",
+      "rows": 3111,
+      "fires": 563,
+      "fire_rate": 0.18097074895531984,
+      "episodes": 2
+    },
+    {
+      "winner": "atom",
+      "rows": 3007,
+      "fires": 235,
+      "fire_rate": 0.07815098104423013,
+      "episodes": 2
+    },
+    {
+      "winner": "Aadi Gupta",
+      "rows": 2982,
+      "fires": 374,
+      "fire_rate": 0.12541918175720992,
+      "episodes": 2
+    },
+    {
+      "winner": "Pushu?",
+      "rows": 2980,
+      "fires": 583,
+      "fire_rate": 0.19563758389261746,
+      "episodes": 2
+    },
+    {
+      "winner": "Pavlo Ivanin",
+      "rows": 2971,
+      "fires": 407,
+      "fire_rate": 0.13699091215079098,
+      "episodes": 2
+    },
+    {
+      "winner": "souldrive",
+      "rows": 2968,
+      "fires": 480,
+      "fire_rate": 0.16172506738544473,
+      "episodes": 2
+    },
+    {
+      "winner": "Simon Rüba",
+      "rows": 2954,
+      "fires": 113,
+      "fire_rate": 0.03825321597833446,
+      "episodes": 1
+    },
+    {
+      "winner": "Igor V",
+      "rows": 2953,
+      "fires": 93,
+      "fire_rate": 0.03149339654588554,
+      "episodes": 1
+    },
+    {
+      "winner": "bengle|Jelma",
+      "rows": 2936,
+      "fires": 395,
+      "fire_rate": 0.13453678474114442,
+      "episodes": 1
+    },
+    {
+      "winner": "lllleeeo|Slawek Biel",
+      "rows": 2930,
+      "fires": 6,
+      "fire_rate": 0.0020477815699658703,
+      "episodes": 1
+    },
+    {
+      "winner": "Oshbocker|chenyfsusjje",
+      "rows": 2924,
+      "fires": 146,
+      "fire_rate": 0.04993160054719562,
+      "episodes": 1
+    },
+    {
+      "winner": "Restu Anggoro Kasih",
+      "rows": 2889,
+      "fires": 444,
+      "fire_rate": 0.1536863966770509,
+      "episodes": 1
+    },
+    {
+      "winner": "werwer",
+      "rows": 2862,
+      "fires": 320,
+      "fire_rate": 0.11180992313067785,
+      "episodes": 2
+    },
+    {
+      "winner": "DMR-250248",
+      "rows": 2844,
+      "fires": 387,
+      "fire_rate": 0.1360759493670886,
+      "episodes": 2
+    },
+    {
+      "winner": "Patrick Chan",
+      "rows": 2821,
+      "fires": 362,
+      "fire_rate": 0.1283232896136122,
+      "episodes": 2
+    },
+    {
+      "winner": "betterme|perpetual motion machine",
+      "rows": 2820,
+      "fires": 172,
+      "fire_rate": 0.06099290780141844,
+      "episodes": 1
+    },
+    {
+      "winner": "jcg web",
+      "rows": 2776,
+      "fires": 232,
+      "fire_rate": 0.08357348703170028,
+      "episodes": 2
+    },
+    {
+      "winner": "MMMMok",
+      "rows": 2767,
+      "fires": 314,
+      "fire_rate": 0.11348030357788218,
+      "episodes": 2
+    },
+    {
+      "winner": "SHENGHUI SONG",
+      "rows": 2767,
+      "fires": 496,
+      "fire_rate": 0.1792555113841706,
+      "episodes": 2
+    },
+    {
+      "winner": "@dity!G@=r",
+      "rows": 2765,
+      "fires": 477,
+      "fire_rate": 0.1725135623869801,
+      "episodes": 2
+    },
+    {
+      "winner": "Daniel Bekker",
+      "rows": 2764,
+      "fires": 233,
+      "fire_rate": 0.08429811866859624,
+      "episodes": 1
+    },
+    {
+      "winner": "KickStart57",
+      "rows": 2761,
+      "fires": 244,
+      "fire_rate": 0.08837377761680551,
+      "episodes": 1
+    },
+    {
+      "winner": "Hm... Upgrades!",
+      "rows": 2738,
+      "fires": 318,
+      "fire_rate": 0.11614317019722425,
+      "episodes": 2
+    },
+    {
+      "winner": "musculer",
+      "rows": 2710,
+      "fires": 447,
+      "fire_rate": 0.16494464944649445,
+      "episodes": 1
+    },
+    {
+      "winner": "Oleksandr Kovalchuk",
+      "rows": 2683,
+      "fires": 227,
+      "fire_rate": 0.08460678345136041,
+      "episodes": 1
+    },
+    {
+      "winner": "yellowleaf",
+      "rows": 2664,
+      "fires": 440,
+      "fire_rate": 0.16516516516516516,
+      "episodes": 1
+    },
+    {
+      "winner": "Orion",
+      "rows": 2659,
+      "fires": 399,
+      "fire_rate": 0.15005641218503196,
+      "episodes": 2
+    },
+    {
+      "winner": "Dhruv",
+      "rows": 2599,
+      "fires": 460,
+      "fire_rate": 0.17699115044247787,
+      "episodes": 2
+    },
+    {
+      "winner": "XuguuZzz",
+      "rows": 2598,
+      "fires": 308,
+      "fire_rate": 0.11855273287143957,
+      "episodes": 1
+    },
+    {
+      "winner": "rikuter67",
+      "rows": 2596,
+      "fires": 299,
+      "fire_rate": 0.11517719568567027,
+      "episodes": 1
+    },
+    {
+      "winner": "Srishti Gauraha",
+      "rows": 2576,
+      "fires": 203,
+      "fire_rate": 0.07880434782608696,
+      "episodes": 2
+    },
+    {
+      "winner": "yiyu0716",
+      "rows": 2574,
+      "fires": 252,
+      "fire_rate": 0.0979020979020979,
+      "episodes": 1
+    },
+    {
+      "winner": "Herohito",
+      "rows": 2572,
+      "fires": 443,
+      "fire_rate": 0.17223950233281493,
+      "episodes": 1
+    },
+    {
+      "winner": "Klgv Klgv",
+      "rows": 2557,
+      "fires": 321,
+      "fire_rate": 0.1255377395385217,
+      "episodes": 1
+    },
+    {
+      "winner": "afsaffs",
+      "rows": 2546,
+      "fires": 315,
+      "fire_rate": 0.1237234878240377,
+      "episodes": 1
+    },
+    {
+      "winner": "Thành Toàn Vương",
+      "rows": 2539,
+      "fires": 188,
+      "fire_rate": 0.07404489956675857,
+      "episodes": 2
+    },
+    {
+      "winner": "yukichi0403",
+      "rows": 2527,
+      "fires": 1226,
+      "fire_rate": 0.4851602690937871,
+      "episodes": 1
+    },
+    {
+      "winner": "sottnik",
+      "rows": 2525,
+      "fires": 285,
+      "fire_rate": 0.11287128712871287,
+      "episodes": 2
+    },
+    {
+      "winner": "yw8837",
+      "rows": 2476,
+      "fires": 298,
+      "fire_rate": 0.12035541195476575,
+      "episodes": 1
+    },
+    {
+      "winner": "Jack Cerion",
+      "rows": 2470,
+      "fires": 385,
+      "fire_rate": 0.15587044534412955,
+      "episodes": 3
+    },
+    {
+      "winner": "я на петроградке",
+      "rows": 2410,
+      "fires": 109,
+      "fire_rate": 0.045228215767634854,
+      "episodes": 1
+    },
+    {
+      "winner": "Karl",
+      "rows": 2399,
+      "fires": 230,
+      "fire_rate": 0.09587328053355565,
+      "episodes": 1
+    },
+    {
+      "winner": "Jiahui Qu",
+      "rows": 2381,
+      "fires": 338,
+      "fire_rate": 0.14195716085678287,
+      "episodes": 1
+    },
+    {
+      "winner": "wala",
+      "rows": 2373,
+      "fires": 221,
+      "fire_rate": 0.09313105773282765,
+      "episodes": 1
+    },
+    {
+      "winner": "HongXin Su",
+      "rows": 2365,
+      "fires": 309,
+      "fire_rate": 0.1306553911205074,
+      "episodes": 1
+    },
+    {
+      "winner": "AidenSong123",
+      "rows": 2357,
+      "fires": 303,
+      "fire_rate": 0.1285532456512516,
+      "episodes": 2
+    },
+    {
+      "winner": "Kiki",
+      "rows": 2351,
+      "fires": 286,
+      "fire_rate": 0.12165036154827732,
+      "episodes": 2
+    },
+    {
+      "winner": "Tzuchuan Yang",
+      "rows": 2345,
+      "fires": 244,
+      "fire_rate": 0.10405117270788912,
+      "episodes": 2
+    },
+    {
+      "winner": "RestlessEagle",
+      "rows": 2334,
+      "fires": 331,
+      "fire_rate": 0.14181662382176521,
+      "episodes": 2
+    },
+    {
+      "winner": "Adnan Zaman",
+      "rows": 2331,
+      "fires": 195,
+      "fire_rate": 0.08365508365508366,
+      "episodes": 1
+    },
+    {
+      "winner": "TK256",
+      "rows": 2304,
+      "fires": 239,
+      "fire_rate": 0.1037326388888889,
+      "episodes": 2
+    },
+    {
+      "winner": "Priestess",
+      "rows": 2300,
+      "fires": 227,
+      "fire_rate": 0.09869565217391305,
+      "episodes": 2
+    },
+    {
+      "winner": "Kevin E R MILLE",
+      "rows": 2281,
+      "fires": 398,
+      "fire_rate": 0.17448487505480054,
+      "episodes": 1
+    },
+    {
+      "winner": "Mahmoud Elshahed",
+      "rows": 2268,
+      "fires": 297,
+      "fire_rate": 0.13095238095238096,
+      "episodes": 1
+    },
+    {
+      "winner": "Mayur D",
+      "rows": 2261,
+      "fires": 327,
+      "fire_rate": 0.14462627156125607,
+      "episodes": 2
+    },
+    {
+      "winner": "XiaokangWang",
+      "rows": 2255,
+      "fires": 454,
+      "fire_rate": 0.20133037694013303,
+      "episodes": 2
+    },
+    {
+      "winner": "CleAAAAAAAA",
+      "rows": 2241,
+      "fires": 138,
+      "fire_rate": 0.06157965194109773,
+      "episodes": 2
+    },
+    {
+      "winner": "kokinnwakashuu",
+      "rows": 2239,
+      "fires": 322,
+      "fire_rate": 0.14381420276909335,
+      "episodes": 2
+    },
+    {
+      "winner": "Shoroogh Ahmadi",
+      "rows": 2218,
+      "fires": 226,
+      "fire_rate": 0.1018935978358882,
+      "episodes": 1
+    },
+    {
+      "winner": "TY0912",
+      "rows": 2215,
+      "fires": 321,
+      "fire_rate": 0.14492099322799096,
+      "episodes": 2
+    },
+    {
+      "winner": "胡老大",
+      "rows": 2190,
+      "fires": 408,
+      "fire_rate": 0.1863013698630137,
+      "episodes": 1
+    },
+    {
+      "winner": "Foxlape",
+      "rows": 2180,
+      "fires": 97,
+      "fire_rate": 0.0444954128440367,
+      "episodes": 1
+    },
+    {
+      "winner": "李BCDEFGA",
+      "rows": 2126,
+      "fires": 313,
+      "fire_rate": 0.14722483537158984,
+      "episodes": 1
+    },
+    {
+      "winner": "Alan C52",
+      "rows": 2110,
+      "fires": 368,
+      "fire_rate": 0.17440758293838862,
+      "episodes": 1
+    },
+    {
+      "winner": "Wilson",
+      "rows": 2066,
+      "fires": 174,
+      "fire_rate": 0.08422071636011616,
+      "episodes": 1
+    },
+    {
+      "winner": "Kato Jiro",
+      "rows": 2037,
+      "fires": 187,
+      "fire_rate": 0.09180166912125676,
+      "episodes": 1
+    },
+    {
+      "winner": "Alexander Gremyakov",
+      "rows": 2034,
+      "fires": 295,
+      "fire_rate": 0.14503441494591937,
+      "episodes": 1
+    },
+    {
+      "winner": "Sangram Patil",
+      "rows": 2030,
+      "fires": 199,
+      "fire_rate": 0.0980295566502463,
+      "episodes": 1
+    },
+    {
+      "winner": "cununn",
+      "rows": 2026,
+      "fires": 290,
+      "fire_rate": 0.14313919052319843,
+      "episodes": 2
+    },
+    {
+      "winner": "Manav Trivedi",
+      "rows": 1995,
+      "fires": 263,
+      "fire_rate": 0.1318295739348371,
+      "episodes": 2
+    },
+    {
+      "winner": "zhenyue|Le Trong Hieu",
+      "rows": 1986,
+      "fires": 154,
+      "fire_rate": 0.07754279959718026,
+      "episodes": 1
+    },
+    {
+      "winner": "Boredom",
+      "rows": 1972,
+      "fires": 241,
+      "fire_rate": 0.12221095334685599,
+      "episodes": 1
+    },
+    {
+      "winner": "Prashant Kikani",
+      "rows": 1972,
+      "fires": 241,
+      "fire_rate": 0.12221095334685599,
+      "episodes": 1
+    },
+    {
+      "winner": "Dmitry Volovikov",
+      "rows": 1970,
+      "fires": 405,
+      "fire_rate": 0.20558375634517767,
+      "episodes": 1
+    },
+    {
+      "winner": "Nadeem|Gorilla Wakayama",
+      "rows": 1968,
+      "fires": 128,
+      "fire_rate": 0.06504065040650407,
+      "episodes": 1
+    },
+    {
+      "winner": "Pilkwang Kim",
+      "rows": 1952,
+      "fires": 185,
+      "fire_rate": 0.09477459016393443,
+      "episodes": 1
+    },
+    {
+      "winner": "David Goldrajch",
+      "rows": 1944,
+      "fires": 240,
+      "fire_rate": 0.12345679012345678,
+      "episodes": 2
+    },
+    {
+      "winner": "Cho Royou",
+      "rows": 1940,
+      "fires": 234,
+      "fire_rate": 0.12061855670103093,
+      "episodes": 1
+    },
+    {
+      "winner": "Howlite",
+      "rows": 1921,
+      "fires": 386,
+      "fire_rate": 0.20093701197293076,
+      "episodes": 1
+    },
+    {
+      "winner": "Chenaters",
+      "rows": 1909,
+      "fires": 283,
+      "fire_rate": 0.14824515453116816,
+      "episodes": 1
+    },
+    {
+      "winner": "rezielux",
+      "rows": 1865,
+      "fires": 290,
+      "fire_rate": 0.1554959785522788,
+      "episodes": 1
+    },
+    {
+      "winner": "Praxel",
+      "rows": 1857,
+      "fires": 173,
+      "fire_rate": 0.09316101238556812,
+      "episodes": 2
+    },
+    {
+      "winner": "JezzLynn",
+      "rows": 1822,
+      "fires": 196,
+      "fire_rate": 0.10757409440175632,
+      "episodes": 1
+    },
+    {
+      "winner": "Sebastian Mateus",
+      "rows": 1813,
+      "fires": 316,
+      "fire_rate": 0.17429674572531714,
+      "episodes": 1
+    },
+    {
+      "winner": "wsdsby",
+      "rows": 1810,
+      "fires": 349,
+      "fire_rate": 0.19281767955801105,
+      "episodes": 1
+    },
+    {
+      "winner": "oh,no",
+      "rows": 1809,
+      "fires": 252,
+      "fire_rate": 0.13930348258706468,
+      "episodes": 1
+    },
+    {
+      "winner": "Stands for one and only",
+      "rows": 1790,
+      "fires": 178,
+      "fire_rate": 0.09944134078212291,
+      "episodes": 1
+    },
+    {
+      "winner": "runaway.",
+      "rows": 1784,
+      "fires": 273,
+      "fire_rate": 0.1530269058295964,
+      "episodes": 1
+    },
+    {
+      "winner": "Solo",
+      "rows": 1779,
+      "fires": 178,
+      "fire_rate": 0.10005621135469364,
+      "episodes": 1
+    },
+    {
+      "winner": "jorge fabian avila",
+      "rows": 1766,
+      "fires": 277,
+      "fire_rate": 0.15685164212910532,
+      "episodes": 1
+    },
+    {
+      "winner": "Mikael Kerimov",
+      "rows": 1751,
+      "fires": 17,
+      "fire_rate": 0.009708737864077669,
+      "episodes": 1
+    },
+    {
+      "winner": "colt",
+      "rows": 1728,
+      "fires": 245,
+      "fire_rate": 0.1417824074074074,
+      "episodes": 1
+    },
+    {
+      "winner": "Jean-Louis Roy",
+      "rows": 1726,
+      "fires": 110,
+      "fire_rate": 0.06373117033603708,
+      "episodes": 1
+    },
+    {
+      "winner": "ra5anchor",
+      "rows": 1724,
+      "fires": 206,
+      "fire_rate": 0.11948955916473318,
+      "episodes": 2
+    },
+    {
+      "winner": "Deepak Chaudhari",
+      "rows": 1721,
+      "fires": 277,
+      "fire_rate": 0.1609529343404997,
+      "episodes": 1
+    },
+    {
+      "winner": "HanaMoodYusi.",
+      "rows": 1702,
+      "fires": 362,
+      "fire_rate": 0.21269095182138661,
+      "episodes": 1
+    },
+    {
+      "winner": "Emre Cirak",
+      "rows": 1695,
+      "fires": 299,
+      "fire_rate": 0.17640117994100296,
+      "episodes": 1
+    },
+    {
+      "winner": "Serendipity",
+      "rows": 1689,
+      "fires": 243,
+      "fire_rate": 0.1438721136767318,
+      "episodes": 1
+    },
+    {
+      "winner": "weihao huang2004",
+      "rows": 1689,
+      "fires": 272,
+      "fire_rate": 0.16104203670811132,
+      "episodes": 1
+    },
+    {
+      "winner": "SadWat",
+      "rows": 1671,
+      "fires": 212,
+      "fire_rate": 0.12687013764213045,
+      "episodes": 1
+    },
+    {
+      "winner": "JR",
+      "rows": 1657,
+      "fires": 182,
+      "fire_rate": 0.10983705491852747,
+      "episodes": 1
+    },
+    {
+      "winner": "SpaTaro",
+      "rows": 1652,
+      "fires": 227,
+      "fire_rate": 0.137409200968523,
+      "episodes": 1
+    },
+    {
+      "winner": "Samsay24",
+      "rows": 1643,
+      "fires": 145,
+      "fire_rate": 0.08825319537431528,
+      "episodes": 1
+    },
+    {
+      "winner": "Musab Ahmed",
+      "rows": 1637,
+      "fires": 186,
+      "fire_rate": 0.11362248014660965,
+      "episodes": 1
+    },
+    {
+      "winner": "Masashi Nishimoto",
+      "rows": 1630,
+      "fires": 477,
+      "fire_rate": 0.2926380368098159,
+      "episodes": 1
+    },
+    {
+      "winner": "Gorilla Wakayama",
+      "rows": 1628,
+      "fires": 250,
+      "fire_rate": 0.15356265356265356,
+      "episodes": 1
+    },
+    {
+      "winner": "KongKongDe|Aadi Joshi",
+      "rows": 1628,
+      "fires": 22,
+      "fire_rate": 0.013513513513513514,
+      "episodes": 1
+    },
+    {
+      "winner": "Nav N",
+      "rows": 1625,
+      "fires": 250,
+      "fire_rate": 0.15384615384615385,
+      "episodes": 1
+    },
+    {
+      "winner": "Clawdy Huang (Andy's AI)",
+      "rows": 1599,
+      "fires": 138,
+      "fire_rate": 0.08630393996247655,
+      "episodes": 1
+    },
+    {
+      "winner": "Sab",
+      "rows": 1596,
+      "fires": 242,
+      "fire_rate": 0.15162907268170425,
+      "episodes": 1
+    },
+    {
+      "winner": "Dmitry Kozlov",
+      "rows": 1593,
+      "fires": 127,
+      "fire_rate": 0.07972379158819837,
+      "episodes": 1
+    },
+    {
+      "winner": "Hu Xingyu",
+      "rows": 1584,
+      "fires": 230,
+      "fire_rate": 0.1452020202020202,
+      "episodes": 1
+    },
+    {
+      "winner": "Conquer",
+      "rows": 1583,
+      "fires": 182,
+      "fire_rate": 0.114971572962729,
+      "episodes": 1
+    },
+    {
+      "winner": "Mandel",
+      "rows": 1583,
+      "fires": 210,
+      "fire_rate": 0.1326595072646873,
+      "episodes": 1
+    },
+    {
+      "winner": "KUNIHIRO TABATA",
+      "rows": 1580,
+      "fires": 102,
+      "fire_rate": 0.06455696202531645,
+      "episodes": 1
+    },
+    {
+      "winner": "TABOUT MHAMED",
+      "rows": 1580,
+      "fires": 281,
+      "fire_rate": 0.1778481012658228,
+      "episodes": 1
+    },
+    {
+      "winner": "Funbarimasu",
+      "rows": 1576,
+      "fires": 200,
+      "fire_rate": 0.12690355329949238,
+      "episodes": 1
+    },
+    {
+      "winner": "Xiangjiang Zhou",
+      "rows": 1574,
+      "fires": 219,
+      "fire_rate": 0.13913595933926304,
+      "episodes": 1
+    },
+    {
+      "winner": "Kenleung Leung",
+      "rows": 1554,
+      "fires": 168,
+      "fire_rate": 0.10810810810810811,
+      "episodes": 1
+    },
+    {
+      "winner": "[RU] Nikita Kuznetsov",
+      "rows": 1551,
+      "fires": 121,
+      "fire_rate": 0.07801418439716312,
+      "episodes": 1
+    },
+    {
+      "winner": "MarkDjadchenko",
+      "rows": 1546,
+      "fires": 96,
+      "fire_rate": 0.062095730918499355,
+      "episodes": 1
+    },
+    {
+      "winner": "Carbon",
+      "rows": 1516,
+      "fires": 249,
+      "fire_rate": 0.16424802110817943,
+      "episodes": 1
+    },
+    {
+      "winner": "Hossein",
+      "rows": 1507,
+      "fires": 134,
+      "fire_rate": 0.08891838088918382,
+      "episodes": 1
+    },
+    {
+      "winner": "enddl22",
+      "rows": 1501,
+      "fires": 212,
+      "fire_rate": 0.14123917388407728,
+      "episodes": 1
+    },
+    {
+      "winner": "Roy Lo TW",
+      "rows": 1463,
+      "fires": 213,
+      "fire_rate": 0.14559125085440874,
+      "episodes": 1
+    },
+    {
+      "winner": "tensor choko",
+      "rows": 1457,
+      "fires": 120,
+      "fire_rate": 0.08236101578586136,
+      "episodes": 1
+    },
+    {
+      "winner": "NEXUS 🔥",
+      "rows": 1456,
+      "fires": 120,
+      "fire_rate": 0.08241758241758242,
+      "episodes": 1
+    },
+    {
+      "winner": "YG JH",
+      "rows": 1448,
+      "fires": 301,
+      "fire_rate": 0.2078729281767956,
+      "episodes": 1
+    },
+    {
+      "winner": "Konstantin Zorin",
+      "rows": 1426,
+      "fires": 141,
+      "fire_rate": 0.09887798036465638,
+      "episodes": 1
+    },
+    {
+      "winner": "huhu hoho",
+      "rows": 1425,
+      "fires": 34,
+      "fire_rate": 0.023859649122807018,
+      "episodes": 1
+    },
+    {
+      "winner": "norchadwick",
+      "rows": 1419,
+      "fires": 198,
+      "fire_rate": 0.13953488372093023,
+      "episodes": 1
+    },
+    {
+      "winner": "ttmn",
+      "rows": 1410,
+      "fires": 46,
+      "fire_rate": 0.032624113475177303,
+      "episodes": 1
+    },
+    {
+      "winner": "tezuka takuya",
+      "rows": 1391,
+      "fires": 152,
+      "fire_rate": 0.10927390366642703,
+      "episodes": 1
+    },
+    {
+      "winner": "junseok lee",
+      "rows": 1383,
+      "fires": 136,
+      "fire_rate": 0.09833694866232827,
+      "episodes": 1
+    },
+    {
+      "winner": "izzie1i000",
+      "rows": 1382,
+      "fires": 107,
+      "fire_rate": 0.07742402315484805,
+      "episodes": 1
+    },
+    {
+      "winner": "Itong",
+      "rows": 1368,
+      "fires": 211,
+      "fire_rate": 0.15423976608187134,
+      "episodes": 1
+    },
+    {
+      "winner": "wking edewd",
+      "rows": 1368,
+      "fires": 151,
+      "fire_rate": 0.11038011695906433,
+      "episodes": 1
+    },
+    {
+      "winner": "Greg DeVos",
+      "rows": 1365,
+      "fires": 44,
+      "fire_rate": 0.03223443223443224,
+      "episodes": 1
+    },
+    {
+      "winner": "嵇禄lugent",
+      "rows": 1364,
+      "fires": 206,
+      "fire_rate": 0.15102639296187684,
+      "episodes": 1
+    },
+    {
+      "winner": "Sliver Legion",
+      "rows": 1363,
+      "fires": 699,
+      "fire_rate": 0.5128393250183418,
+      "episodes": 1
+    },
+    {
+      "winner": "Pengchao Zheng",
+      "rows": 1362,
+      "fires": 129,
+      "fire_rate": 0.0947136563876652,
+      "episodes": 1
+    },
+    {
+      "winner": "kwon yong deuk",
+      "rows": 1359,
+      "fires": 209,
+      "fire_rate": 0.15378955114054452,
+      "episodes": 1
+    },
+    {
+      "winner": "Paul Kamau",
+      "rows": 1343,
+      "fires": 180,
+      "fire_rate": 0.1340282948622487,
+      "episodes": 1
+    },
+    {
+      "winner": "Schroll🇧🇷",
+      "rows": 1316,
+      "fires": 190,
+      "fire_rate": 0.14437689969604864,
+      "episodes": 1
+    },
+    {
+      "winner": "Shri Sneha",
+      "rows": 1309,
+      "fires": 181,
+      "fire_rate": 0.1382734912146677,
+      "episodes": 1
+    },
+    {
+      "winner": "COSMIC",
+      "rows": 1304,
+      "fires": 112,
+      "fire_rate": 0.08588957055214724,
+      "episodes": 1
+    },
+    {
+      "winner": "BeeMax",
+      "rows": 1297,
+      "fires": 93,
+      "fire_rate": 0.07170393215111796,
+      "episodes": 1
+    },
+    {
+      "winner": "I just want to do something",
+      "rows": 1294,
+      "fires": 209,
+      "fire_rate": 0.1615146831530139,
+      "episodes": 1
+    },
+    {
+      "winner": "planetWARS",
+      "rows": 1290,
+      "fires": 167,
+      "fire_rate": 0.12945736434108526,
+      "episodes": 1
+    },
+    {
+      "winner": "yash bhaskar",
+      "rows": 1281,
+      "fires": 191,
+      "fire_rate": 0.14910226385636222,
+      "episodes": 2
+    },
+    {
+      "winner": "Haruto Kuroda",
+      "rows": 1264,
+      "fires": 151,
+      "fire_rate": 0.1194620253164557,
+      "episodes": 1
+    },
+    {
+      "winner": "Anthony Wynne",
+      "rows": 1262,
+      "fires": 83,
+      "fire_rate": 0.06576862123613313,
+      "episodes": 1
+    },
+    {
+      "winner": "IAI-RL-Checkm8",
+      "rows": 1254,
+      "fires": 77,
+      "fire_rate": 0.06140350877192982,
+      "episodes": 1
+    },
+    {
+      "winner": "miya",
+      "rows": 1242,
+      "fires": 135,
+      "fire_rate": 0.10869565217391304,
+      "episodes": 1
+    },
+    {
+      "winner": "Evan",
+      "rows": 1236,
+      "fires": 142,
+      "fire_rate": 0.11488673139158576,
+      "episodes": 1
+    },
+    {
+      "winner": "IAI-RL-17",
+      "rows": 1219,
+      "fires": 200,
+      "fire_rate": 0.16406890894175555,
+      "episodes": 1
+    },
+    {
+      "winner": "weichy7",
+      "rows": 1207,
+      "fires": 121,
+      "fire_rate": 0.10024855012427507,
+      "episodes": 1
+    },
+    {
+      "winner": "StupidXie",
+      "rows": 1206,
+      "fires": 75,
+      "fire_rate": 0.06218905472636816,
+      "episodes": 1
+    },
+    {
+      "winner": "Arpit1Bansal",
+      "rows": 1196,
+      "fires": 137,
+      "fire_rate": 0.11454849498327759,
+      "episodes": 1
+    },
+    {
+      "winner": "stochar",
+      "rows": 1194,
+      "fires": 173,
+      "fire_rate": 0.14489112227805695,
+      "episodes": 1
+    },
+    {
+      "winner": "Håkon Kjelseth",
+      "rows": 1181,
+      "fires": 142,
+      "fire_rate": 0.12023708721422523,
+      "episodes": 1
+    },
+    {
+      "winner": "kk.sky.9k",
+      "rows": 1172,
+      "fires": 107,
+      "fire_rate": 0.09129692832764505,
+      "episodes": 1
+    },
+    {
+      "winner": "harryhehaoyu",
+      "rows": 1169,
+      "fires": 119,
+      "fire_rate": 0.10179640718562874,
+      "episodes": 1
+    },
+    {
+      "winner": "huyang111",
+      "rows": 1163,
+      "fires": 50,
+      "fire_rate": 0.04299226139294927,
+      "episodes": 1
+    },
+    {
+      "winner": "Flamadesombra",
+      "rows": 1160,
+      "fires": 43,
+      "fire_rate": 0.03706896551724138,
+      "episodes": 1
+    },
+    {
+      "winner": "LP",
+      "rows": 1160,
+      "fires": 144,
+      "fire_rate": 0.12413793103448276,
+      "episodes": 1
+    },
+    {
+      "winner": "Chengzhengxu Li",
+      "rows": 1151,
+      "fires": 82,
+      "fire_rate": 0.07124239791485665,
+      "episodes": 1
+    },
+    {
+      "winner": "Koki _1231",
+      "rows": 1130,
+      "fires": 161,
+      "fire_rate": 0.1424778761061947,
+      "episodes": 1
+    },
+    {
+      "winner": "Rorical",
+      "rows": 1128,
+      "fires": 164,
+      "fire_rate": 0.1453900709219858,
+      "episodes": 1
+    },
+    {
+      "winner": "WizClan",
+      "rows": 1125,
+      "fires": 109,
+      "fire_rate": 0.09688888888888889,
+      "episodes": 1
+    },
+    {
+      "winner": "xuefengteacherimissyou",
+      "rows": 1112,
+      "fires": 184,
+      "fire_rate": 0.16546762589928057,
+      "episodes": 1
+    },
+    {
+      "winner": "Kaggle Agent",
+      "rows": 1110,
+      "fires": 158,
+      "fire_rate": 0.14234234234234233,
+      "episodes": 1
+    },
+    {
+      "winner": "Zhang Haonan",
+      "rows": 1104,
+      "fires": 195,
+      "fire_rate": 0.1766304347826087,
+      "episodes": 1
+    },
+    {
+      "winner": "taiyang chen | codex",
+      "rows": 1093,
+      "fires": 124,
+      "fire_rate": 0.11344922232387923,
+      "episodes": 1
+    },
+    {
+      "winner": "metrovoc",
+      "rows": 1083,
+      "fires": 128,
+      "fire_rate": 0.11819021237303785,
+      "episodes": 1
+    },
+    {
+      "winner": "Prince Raiyani",
+      "rows": 1075,
+      "fires": 185,
+      "fire_rate": 0.17209302325581396,
+      "episodes": 1
+    },
+    {
+      "winner": "Yusa Aihara",
+      "rows": 1049,
+      "fires": 173,
+      "fire_rate": 0.16491897044804577,
+      "episodes": 1
+    },
+    {
+      "winner": "Divyanshu Hero",
+      "rows": 1041,
+      "fires": 281,
+      "fire_rate": 0.26993275696445723,
+      "episodes": 1
+    },
+    {
+      "winner": "Eme",
+      "rows": 1036,
+      "fires": 97,
+      "fire_rate": 0.09362934362934362,
+      "episodes": 1
+    },
+    {
+      "winner": "菲比啾比",
+      "rows": 1005,
+      "fires": 126,
+      "fire_rate": 0.1253731343283582,
+      "episodes": 1
+    },
+    {
+      "winner": "Hober Malloc|IAI-RL-codex",
+      "rows": 998,
+      "fires": 0,
+      "fire_rate": 0.0,
+      "episodes": 1
+    },
+    {
+      "winner": "RITTWIK BHOWMICK|Gijs Smit",
+      "rows": 998,
+      "fires": 0,
+      "fire_rate": 0.0,
+      "episodes": 1
+    },
+    {
+      "winner": "keithtyser|IAI-RL-Tlm71",
+      "rows": 998,
+      "fires": 0,
+      "fire_rate": 0.0,
+      "episodes": 1
+    },
+    {
+      "winner": "yuuuki1111",
+      "rows": 998,
+      "fires": 205,
+      "fire_rate": 0.20541082164328658,
+      "episodes": 1
+    },
+    {
+      "winner": "耶✌",
+      "rows": 964,
+      "fires": 197,
+      "fire_rate": 0.20435684647302904,
+      "episodes": 1
+    },
+    {
+      "winner": "Marcus Vinicius",
+      "rows": 859,
+      "fires": 118,
+      "fire_rate": 0.13736903376018628,
+      "episodes": 1
+    },
+    {
+      "winner": "Nabeel123@",
+      "rows": 840,
+      "fires": 76,
+      "fire_rate": 0.09047619047619047,
+      "episodes": 1
+    },
+    {
+      "winner": "tzian j",
+      "rows": 818,
+      "fires": 118,
+      "fire_rate": 0.14425427872860636,
+      "episodes": 1
+    },
+    {
+      "winner": "Zachary Maronek",
+      "rows": 804,
+      "fires": 110,
+      "fire_rate": 0.13681592039800994,
+      "episodes": 1
+    },
+    {
+      "winner": "Sirui Zeng",
+      "rows": 785,
+      "fires": 92,
+      "fire_rate": 0.11719745222929936,
+      "episodes": 1
+    },
+    {
+      "winner": "[Nam Ne DANO] Roman Tamrazov",
+      "rows": 779,
+      "fires": 166,
+      "fire_rate": 0.21309370988446727,
+      "episodes": 1
+    },
+    {
+      "winner": "永楽sec",
+      "rows": 765,
+      "fires": 101,
+      "fire_rate": 0.13202614379084968,
+      "episodes": 1
+    },
+    {
+      "winner": "Dmitry Belan",
+      "rows": 745,
+      "fires": 97,
+      "fire_rate": 0.13020134228187918,
+      "episodes": 1
+    },
+    {
+      "winner": "lengli",
+      "rows": 682,
+      "fires": 92,
+      "fire_rate": 0.1348973607038123,
+      "episodes": 1
+    },
+    {
+      "winner": "Kuhnkuhn",
+      "rows": 680,
+      "fires": 48,
+      "fire_rate": 0.07058823529411765,
+      "episodes": 1
+    },
+    {
+      "winner": "Magmucot",
+      "rows": 605,
+      "fires": 51,
+      "fire_rate": 0.08429752066115702,
+      "episodes": 1
+    },
+    {
+      "winner": "子非秋月",
+      "rows": 528,
+      "fires": 30,
+      "fire_rate": 0.056818181818181816,
+      "episodes": 1
+    },
+    {
+      "winner": "Marek Nurzynski",
+      "rows": 506,
+      "fires": 33,
+      "fire_rate": 0.06521739130434782,
+      "episodes": 1
+    },
+    {
+      "winner": "allen wang",
+      "rows": 428,
+      "fires": 60,
+      "fire_rate": 0.14018691588785046,
+      "episodes": 1
+    },
+    {
+      "winner": "chipssy",
+      "rows": 406,
+      "fires": 30,
+      "fire_rate": 0.07389162561576355,
+      "episodes": 1
+    },
+    {
+      "winner": "Bo Peng",
+      "rows": 208,
+      "fires": 9,
+      "fire_rate": 0.04326923076923077,
+      "episodes": 1
+    }
+  ]
+}

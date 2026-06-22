@@ -1,0 +1,80 @@
+# Per-planet behavioral cloning config.
+#
+# Launch:
+#   python -m jax_agent.train_bc_jax --config cfg_jax_BC_1.yaml
+
+seed: 42
+run_name: "bc_feature_rows_fight_full"
+save_dir: /mnt/f/kaggle-orbit-wars-data/bc_runs
+
+env:
+  board_size: 100.0
+  episode_steps: 500
+  ship_bucket_count: 8
+  max_planets: 45
+  max_ships: 500.0
+  max_production: 5.0
+  target_filter_enabled: false
+  attack_top_k: 10
+  defense_top_k: 5
+
+model:
+  actor_type: per_planet
+  hidden_size: 1024
+  use_cnn: true
+  use_transformer: false
+
+state_norm:
+  enabled: true
+  clip: 5.0
+  eps: 1.0e-8
+
+eval:
+  enabled: true
+  every_steps: 10000
+  games: 20
+  seed: 300000
+  opponent: slawekbiel-producer
+  agents_root: agents
+  bc_player: 0
+  max_fleets: 512
+  fail_on_error: false
+
+bc:
+  # /mnt/kaggle/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained/bc_feature_rows_*.npz
+  dataset_glob: /mnt/kaggle/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained/bc_feature_rows_*.npz
+  max_steps: 200000
+  batch_size: 4096
+  shuffle_shards: true
+  shuffle_buffer_rows: 65536
+  prefetch_batches: 2
+  log_every_steps: 100
+  eval_every_steps: 5000
+  eval_batches: 64
+  checkpoint_every_steps: 5000
+  lr: 3.0e-4
+  weight_decay: 0.0
+  val_fraction: 0.1
+  noop_keep_ratio: 0.25
+  noop_weight: 1.0
+  fire_weight: 1.0
+  target_weight: 1.0
+  amount_weight: 0.5
+  winner_fire_rate_filter:
+    enabled: true
+    min_rate: 0.0
+    max_rate: 0.25
+    min_rows: 100000
+    min_episodes: 50
+    include_unqualified: false
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"
+  group: "feature-row-bc-4090"
+  tags:
+    - bc
+    - feature-row
+    - hidden-1024
+    - batch-4096

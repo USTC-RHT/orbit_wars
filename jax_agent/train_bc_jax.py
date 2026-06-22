@@ -373,7 +373,8 @@ def build_allowed_winners(
 
 def row_filter_mask(data: Mapping[str, np.ndarray], allowed_winners: frozenset[str] | None) -> np.ndarray:
     if allowed_winners is None:
-        rows = int(data["label__fire"].shape[0])
+        first = next(iter(data.values()))
+        rows = int(first.shape[0])
         return np.ones((rows,), dtype=bool)
     if "meta__winner_name" not in data:
         raise KeyError("winner fire-rate filtering requires meta__winner_name in BC shards")

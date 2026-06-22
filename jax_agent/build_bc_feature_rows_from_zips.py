@@ -98,6 +98,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-filter-mode", choices=["late", "early"], default="late")
     parser.add_argument("--max-action-tokens", type=int, default=16)
     parser.add_argument("--learn-players", choices=["winners", "all"], default="winners")
+    parser.add_argument("--learn-player-names", nargs="*", default=None)
+    parser.add_argument("--learn-player-names-file", type=Path, default=None)
     parser.add_argument("--horizon", type=int, default=60)
     parser.add_argument("--trajectory-cache", action="store_true")
     parser.add_argument("--max-planets", type=int, default=45)
@@ -154,6 +156,8 @@ def new_buffer() -> dict[str, list[np.ndarray]]:
         "meta__player0_name": [],
         "meta__player1_name": [],
         "meta__winner_name": [],
+        "meta__learn_player": [],
+        "meta__learn_player_name": [],
     }
 
 
@@ -323,6 +327,8 @@ def append_feature_rows(
     player0_name: str = "",
     player1_name: str = "",
     winner_name: str = "",
+    learn_player: int = -1,
+    learn_player_name: str = "",
     limit: int | None = None,
 ) -> int:
     fire, target, amount = per_planet_labels_np(labels, max_planets)
@@ -398,6 +404,10 @@ def append_feature_rows(
     buffer["meta__player0_name"].extend(np.full((rows,), str(player0_name), dtype=f"<U{max(len(str(player0_name)), 1)}"))
     buffer["meta__player1_name"].extend(np.full((rows,), str(player1_name), dtype=f"<U{max(len(str(player1_name)), 1)}"))
     buffer["meta__winner_name"].extend(np.full((rows,), str(winner_name), dtype=f"<U{max(len(str(winner_name)), 1)}"))
+    buffer["meta__learn_player"].extend(np.full((rows,), int(learn_player), dtype=np.int32))
+    buffer["meta__learn_player_name"].extend(
+        np.full((rows,), str(learn_player_name), dtype=f"<U{max(len(str(learn_player_name)), 1)}")
+    )
     return rows
 
 
@@ -641,6 +651,8 @@ def main() -> None:
                                 player0_name=str(replay_meta["player0_name"]),
                                 player1_name=str(replay_meta["player1_name"]),
                                 winner_name=str(replay_meta["winner_name"]),
+                                learn_player=int(np.asarray(labels.get("meta__learn_player", -1))),
+                                learn_player_name=str(np.asarray(labels.get("meta__learn_player_name", "")).item()),
                                 limit=limit,
                             )
                             total["feature_rows"] += added
@@ -717,6 +729,8 @@ def main() -> None:
                             player0_name=str(replay_meta["player0_name"]),
                             player1_name=str(replay_meta["player1_name"]),
                             winner_name=str(replay_meta["winner_name"]),
+                            learn_player=int(np.asarray(labels.get("meta__learn_player", -1))),
+                            learn_player_name=str(np.asarray(labels.get("meta__learn_player_name", "")).item()),
                             limit=limit,
                         )
                         total["feature_rows"] += added

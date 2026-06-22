@@ -81,6 +81,7 @@ class BCOnnxPolicyAgent:
     feature_params: FeatureParams
     ship_bucket_count: int
     max_planets: int
+    dropped_relative_feature_dims: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         self._build_rows_jit = jax.jit(
@@ -116,6 +117,7 @@ class BCOnnxPolicyAgent:
             feature_params=feature_params,
             ship_bucket_count=int(meta.get("ship_bucket_count", 8)),
             max_planets=int(meta.get("max_planets", env_params.max_planets)),
+            dropped_relative_feature_dims=tuple(int(x) for x in (meta.get("dropped_relative_feature_dims") or ())),
         )
 
     def _run_policy(
@@ -123,11 +125,14 @@ class BCOnnxPolicyAgent:
         rows_np: dict[str, np.ndarray],
         selected_targets: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        relative = rows_np["relative"].astype(np.float32, copy=bool(self.dropped_relative_feature_dims))
+        if self.dropped_relative_feature_dims:
+            relative[..., list(self.dropped_relative_feature_dims)] = 0.0
         fire_logits, target_logits, amount_logits = self.session.run(
             None,
             {
                 "planet": rows_np["planet"].astype(np.float32, copy=False),
-                "relative": rows_np["relative"].astype(np.float32, copy=False),
+                "relative": relative,
                 "global_features": rows_np["global_features"].astype(np.float32, copy=False),
                 "candidate_mask": rows_np["candidate_mask"].astype(np.bool_, copy=False),
                 "map_features": rows_np["map_features"].astype(np.float32, copy=False),

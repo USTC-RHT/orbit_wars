@@ -437,6 +437,8 @@ class FeatureRowBCPolicy(nn.Module):
     ship_bucket_count: int
     hidden_size: int = 128
     use_cnn: bool = True
+    target_head: str = "dot"
+    target_num_heads: int = 8
 
     @nn.compact
     def __call__(
@@ -469,13 +471,37 @@ class FeatureRowBCPolicy(nn.Module):
 
         context_h = jnp.concatenate(context_parts, axis=-1)
 
-        q = nn.Dense(self.hidden_size)(context_h)
-        q = nn.relu(q)
-        q = nn.Dense(self.hidden_size)(q)
-        q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
-        keys = nn.Dense(self.hidden_size)(relative_h)
-        keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
-        target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
+        target_head = str(self.target_head or "dot").lower().replace("-", "_")
+        if target_head in {"cross_attention", "attention", "mh_attention", "multihead_attention"}:
+            heads = max(int(self.target_num_heads), 1)
+            head_dim = max((int(self.hidden_size) + heads - 1) // heads, 1)
+            attn_size = heads * head_dim
+            q = nn.relu(nn.Dense(self.hidden_size, name="target_query_mlp_0")(context_h))
+            q = nn.Dense(attn_size, name="target_query")(q).reshape((context_h.shape[0], heads, head_dim))
+            k = nn.Dense(attn_size, name="target_key")(relative_h).reshape((relative_h.shape[0], relative_h.shape[1], heads, head_dim))
+            v = nn.Dense(attn_size, name="target_value")(relative_h).reshape((relative_h.shape[0], relative_h.shape[1], heads, head_dim))
+            attn_logits = jnp.einsum("bhd,bchd->bhc", q, k) / jnp.sqrt(float(head_dim))
+            masked_attn_logits = jnp.where(candidate_mask[:, None, :], attn_logits, NEG_INF)
+            attn_weights = jax.nn.softmax(masked_attn_logits, axis=-1)
+            attended = jnp.einsum("bhc,bchd->bhd", attn_weights, v).reshape((context_h.shape[0], attn_size))
+            attended = nn.relu(nn.Dense(self.hidden_size, name="target_attended_proj")(attended))
+            head_logits = jnp.swapaxes(masked_attn_logits, 1, 2)
+            head_mix = nn.Dense(1, use_bias=False, name="target_head_mix")(head_logits).squeeze(-1)
+            pair_context = nn.relu(nn.Dense(self.hidden_size, name="target_pair_context")(jnp.concatenate([context_h, attended], axis=-1)))
+            pair_context = jnp.broadcast_to(pair_context[:, None, :], relative_h.shape)
+            pair = jnp.concatenate([relative_h, pair_context, relative_h * pair_context], axis=-1)
+            pair_logits = nn.Dense(1, name="target_pair_score")(
+                nn.relu(nn.Dense(self.hidden_size, name="target_pair_mlp")(pair))
+            ).squeeze(-1)
+            target_logits = head_mix + pair_logits
+        else:
+            q = nn.Dense(self.hidden_size)(context_h)
+            q = nn.relu(q)
+            q = nn.Dense(self.hidden_size)(q)
+            q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
+            keys = nn.Dense(self.hidden_size)(relative_h)
+            keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
+            target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
         target_logits = jnp.where(candidate_mask, target_logits, NEG_INF)
 
         fire_h = nn.relu(nn.Dense(self.hidden_size)(context_h))
@@ -1338,6 +1364,8 @@ def main() -> None:
         raise ValueError("bc.prefetch_batches or --prefetch-batches must be >= 0")
     hidden_size = int(raw_get(raw_cfg, "model", "hidden_size", 128))
     use_cnn = bool(raw_get(raw_cfg, "model", "use_cnn", True))
+    target_head = str(raw_get(raw_cfg, "model", "target_head", "dot"))
+    target_num_heads = int(raw_get(raw_cfg, "model", "target_num_heads", 8))
     weight_decay = float(raw_get(raw_cfg, "bc", "weight_decay", 0.0))
     noop_keep_ratio = float(raw_get(raw_cfg, "bc", "noop_keep_ratio", 0.25))
     weights = {
@@ -1450,7 +1478,13 @@ def main() -> None:
     sample_batch = sample_batch_for_init(train_paths, normalizer, batch_size, allowed_winners)
 
     ship_bucket_count = int(sample_batch.amount_mask.shape[-1])
-    model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)
+    model = FeatureRowBCPolicy(
+        ship_bucket_count=ship_bucket_count,
+        hidden_size=hidden_size,
+        use_cnn=use_cnn,
+        target_head=target_head,
+        target_num_heads=target_num_heads,
+    )
     rng = jax.random.PRNGKey(seed)
     rng, init_rng = jax.random.split(rng)
     train_state = make_train_state(init_rng, model, sample_batch, lr=lr, weight_decay=weight_decay)

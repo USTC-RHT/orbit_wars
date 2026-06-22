@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noop-stride", type=int, default=0, help="Only used when --noop-mode=stride.")
     parser.add_argument("--max-action-tokens", type=int, default=16)
     parser.add_argument("--learn-players", choices=["winners", "all"], default="winners")
+    parser.add_argument("--learn-player-names", nargs="*", default=None)
+    parser.add_argument("--learn-player-names-file", type=Path, default=None)
     parser.add_argument("--horizon", type=int, default=60)
     parser.add_argument("--trajectory-cache", action="store_true")
     parser.add_argument("--max-planets", type=int, default=45)
@@ -536,6 +538,33 @@ def selected_players(rewards: Any, mode: str) -> list[int]:
     return [idx for idx, reward in enumerate(pair) if reward == best and reward > 0]
 
 
+def replay_player_names(replay: dict[str, Any]) -> list[str]:
+    info = replay.get("info") if isinstance(replay, dict) else {}
+    info = info if isinstance(info, dict) else {}
+    team_names = info.get("TeamNames") if isinstance(info.get("TeamNames"), list) else []
+    agents = info.get("Agents") if isinstance(info.get("Agents"), list) else []
+
+    def player_name(index: int) -> str:
+        if index < len(team_names) and team_names[index]:
+            return str(team_names[index])
+        if index < len(agents) and isinstance(agents[index], dict) and agents[index].get("Name"):
+            return str(agents[index]["Name"])
+        return f"player_{index}"
+
+    return [player_name(0), player_name(1)]
+
+
+def learn_player_name_filter(args: argparse.Namespace) -> set[str] | None:
+    names: list[str] = []
+    if getattr(args, "learn_player_names", None):
+        names.extend(str(name) for name in args.learn_player_names)
+    names_file = getattr(args, "learn_player_names_file", None)
+    if names_file:
+        with Path(names_file).open(encoding="utf-8") as f:
+            names.extend(line.strip() for line in f if line.strip() and not line.lstrip().startswith("#"))
+    return set(names) if names else None
+
+
 def process_replay(replay: dict[str, Any], params: EnvParams, args: argparse.Namespace) -> tuple[list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]], dict[str, int]]:
     steps = replay.get("steps") or []
     if not steps or len(steps[0]) != 2:
@@ -552,7 +581,11 @@ def process_replay(replay: dict[str, Any], params: EnvParams, args: argparse.Nam
             "comet_hit_actions": 0,
             "bad_amount_actions": 0,
         }
+    names = replay_player_names(replay)
     players = selected_players(replay.get("rewards"), args.learn_players)
+    allowed_names = learn_player_name_filter(args)
+    if allowed_names is not None:
+        players = [player for player in players if player < len(names) and names[player] in allowed_names]
     rows = []
     stats = {
         "replays": 1,
@@ -585,6 +618,8 @@ def process_replay(replay: dict[str, Any], params: EnvParams, args: argparse.Nam
                 int(args.horizon),
                 use_trajectory_cache=bool(getattr(args, "trajectory_cache", False)),
             )
+            labels["meta__learn_player"] = np.asarray(player, dtype=np.int32)
+            labels["meta__learn_player_name"] = np.asarray(names[player] if player < len(names) else f"player_{player}")
             for key in (
                 "raw_actions",
                 "kept_actions",

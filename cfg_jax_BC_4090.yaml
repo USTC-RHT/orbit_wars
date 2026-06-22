@@ -23,6 +23,8 @@ model:
   hidden_size: 1024
   use_cnn: true
   use_transformer: false
+  target_head: cross_attention
+  target_num_heads: 8
 
 state_norm:
   enabled: true

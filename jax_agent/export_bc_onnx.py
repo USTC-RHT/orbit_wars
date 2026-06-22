@@ -27,11 +27,11 @@ import numpy as np
 import onnx
 
 from .train_bc_jax import (
+    BUGGY_RELATIVE_FEATURE_DIMS,
     FeatureRowBCPolicy,
     FeatureRowBatch,
     identity_normalizer,
     jax_normalizer,
-    normalize_batch,
 )
 
 
@@ -53,6 +53,21 @@ def _raw_get(raw: dict[str, Any], section: str, key: str, default: Any) -> Any:
 
 def _shape_dtype(shape: tuple[int, ...], dtype) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(shape, dtype)
+
+
+def normalize_batch_for_onnx(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> FeatureRowBatch:
+    """Normalize rows without indexed updates that are fragile in jax2onnx.
+
+    Disabled relative feature dims are zeroed in the Python ONNX runtime before
+    the tensors are fed to the graph.
+    """
+
+    planet = (batch.planet - norm["planet_mean"]) / jnp.maximum(norm["planet_std"], 1e-6)
+    relative = (batch.relative - norm["relative_mean"]) / jnp.maximum(norm["relative_std"], 1e-6)
+    relative = jnp.where(batch.candidate_mask[..., None], relative, 0.0)
+    global_features = (batch.global_features - norm["global_mean"]) / jnp.maximum(norm["global_std"], 1e-6)
+    map_features = (batch.map_features - norm["map_mean"]) / jnp.maximum(norm["map_std"], 1e-6)
+    return batch._replace(planet=planet, relative=relative, global_features=global_features, map_features=map_features)
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,11 +113,15 @@ def export_checkpoint(
     ship_bucket_count = int(_raw_get(raw, "env", "ship_bucket_count", 8))
     hidden_size = int(_raw_get(raw, "model", "hidden_size", 128))
     use_cnn = bool(_raw_get(raw, "model", "use_cnn", True))
+    target_head = str(_raw_get(raw, "model", "target_head", "dot"))
+    target_num_heads = int(_raw_get(raw, "model", "target_num_heads", 8))
 
     model = FeatureRowBCPolicy(
         ship_bucket_count=ship_bucket_count,
         hidden_size=hidden_size,
         use_cnn=use_cnn,
+        target_head=target_head,
+        target_num_heads=target_num_heads,
     )
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
     normalizer = jax_normalizer(payload.get("normalizer") or identity_normalizer())
@@ -133,7 +152,7 @@ def export_checkpoint(
             target=dummy_i32,
             amount=dummy_i32,
         )
-        batch = normalize_batch(batch, normalizer)
+        batch = normalize_batch_for_onnx(batch, normalizer)
         out = model.apply(
             {"params": params},
             batch.planet,
@@ -193,11 +212,14 @@ def export_checkpoint(
         "ship_bucket_count": ship_bucket_count,
         "hidden_size": hidden_size,
         "use_cnn": use_cnn,
+        "target_head": target_head,
+        "target_num_heads": target_num_heads,
         "planet_dim": int(planet_dim),
         "relative_dim": int(relative_dim),
         "global_dim": int(global_dim),
         "map_channels": int(map_channels),
         "map_grid_size": int(map_grid_size),
+        "dropped_relative_feature_dims": list(BUGGY_RELATIVE_FEATURE_DIMS),
         "raw_config": raw,
         "metrics": payload.get("metrics") or {},
     }

@@ -309,7 +309,15 @@ class BCPolicyAgent:
         ship_bucket_count = int(_raw_get(raw, "env", "ship_bucket_count", 8))
         hidden_size = int(_raw_get(raw, "model", "hidden_size", 128))
         use_cnn = bool(_raw_get(raw, "model", "use_cnn", True))
-        model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)
+        target_head = str(_raw_get(raw, "model", "target_head", "dot"))
+        target_num_heads = int(_raw_get(raw, "model", "target_num_heads", 8))
+        model = FeatureRowBCPolicy(
+            ship_bucket_count=ship_bucket_count,
+            hidden_size=hidden_size,
+            use_cnn=use_cnn,
+            target_head=target_head,
+            target_num_heads=target_num_heads,
+        )
         normalizer = payload.get("normalizer") or identity_normalizer()
         return cls(
             model=model,
@@ -329,7 +337,15 @@ class BCPolicyAgent:
         ship_bucket_count = int(_raw_get(raw, "env", "ship_bucket_count", 8))
         hidden_size = int(_raw_get(raw, "model", "hidden_size", 128))
         use_cnn = bool(_raw_get(raw, "model", "use_cnn", True))
-        model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)
+        target_head = str(_raw_get(raw, "model", "target_head", "dot"))
+        target_num_heads = int(_raw_get(raw, "model", "target_num_heads", 8))
+        model = FeatureRowBCPolicy(
+            ship_bucket_count=ship_bucket_count,
+            hidden_size=hidden_size,
+            use_cnn=use_cnn,
+            target_head=target_head,
+            target_num_heads=target_num_heads,
+        )
         state0 = state_from_observation({"planets": [], "fleets": [], "step": 0}, env_params)
         rows = build_bc_policy_rows(state0, feature_params, ship_bucket_count)
         batch = normalize_rows(rows, jax_normalizer(identity_normalizer()))

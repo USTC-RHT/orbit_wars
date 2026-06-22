@@ -3,7 +3,7 @@
 The source shards were already owner-canonicalized during replay preprocessing:
 for a learned player-1 row, owner 1 was relabeled to owner 0, but coordinates
 were left in the real map frame. This converter applies the Fight-branch 2p
-view transform to those player-1 winner rows:
+view transform to those player-1-view rows:
 
     x/y rotate 180 degrees around board center
     planet candidate slots mirror within each 4-slot symmetry group
@@ -73,11 +73,13 @@ def inverse_permutation(perm: np.ndarray) -> np.ndarray:
     return inv
 
 
-def player1_winner_mask(arrays: dict[str, np.ndarray]) -> np.ndarray:
+def player1_view_mask(arrays: dict[str, np.ndarray]) -> np.ndarray:
+    if "meta__learn_player" in arrays:
+        return arrays["meta__learn_player"].astype(np.int32) == 1
     required = ("meta__winner_name", "meta__player1_name")
     missing = [name for name in required if name not in arrays]
     if missing:
-        raise KeyError(f"missing metadata required to identify player-1 rows: {missing}")
+        raise KeyError(f"missing metadata required to identify player-1-view rows: {missing}")
     return arrays["meta__winner_name"].astype(str) == arrays["meta__player1_name"].astype(str)
 
 
@@ -88,7 +90,7 @@ def transform_player1_rows(arrays: dict[str, np.ndarray]) -> dict[str, int]:
     inv_planet_perm = inverse_permutation(planet_perm)
     candidate_perm = np.concatenate([np.asarray([0], dtype=np.int32), planet_perm + 1])
 
-    p1_rows = player1_winner_mask(arrays)
+    p1_rows = player1_view_mask(arrays)
     p1_count = int(p1_rows.sum())
     total_rows = int(p1_rows.shape[0])
     if p1_count <= 0:
@@ -180,7 +182,7 @@ def main() -> None:
         "limit_shards": int(args.limit_shards),
         "shard_count": len(input_paths),
         "transform": {
-            "player1_row_mask": "meta__winner_name == meta__player1_name",
+            "player1_row_mask": "meta__learn_player == 1 when present; otherwise meta__winner_name == meta__player1_name",
             "geometry": "180-degree rotation to player-0 view",
             "planet_slot_permutation": "Fight branch mirror: (idx // 4) * 4 + (3 - idx % 4)",
             "owner_swap": "not applied here; input rows were already owner-canonicalized",
@@ -218,7 +220,7 @@ def main() -> None:
                     "player1_rows": stats["player1_rows"],
                     "target_remapped": stats["target_remapped"],
                     "buggy_eta_norm": "retained in output; train_bc_jax drops relative dim 7",
-                    "transform": "owner-canonicalized player-1 rows rotated/permuted to player-0 geometry",
+                    "transform": "owner-canonicalized player-1-view rows rotated/permuted to player-0 geometry",
                 },
                 sort_keys=True,
             )

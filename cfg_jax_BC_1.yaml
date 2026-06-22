@@ -41,6 +41,7 @@ eval:
   fail_on_error: false
 
 bc:
+  # /mnt/kaggle/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained/bc_feature_rows_*.npz
   dataset_glob: /mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_full_v2_compressed/bc_feature_rows_*.npz
   max_steps: 200000
   batch_size: 2048
@@ -59,3 +60,21 @@ bc:
   fire_weight: 1.0
   target_weight: 1.0
   amount_weight: 0.5
+  winner_fire_rate_filter:
+    enabled: true
+    min_rate: 0.0
+    max_rate: 0.25
+    min_rows: 100000
+    min_episodes: 50
+    include_unqualified: false
+
+wandb:
+  enabled: true
+  project: "orbit-wars-rl"
+  mode: "online"
+  group: "feature-row-bc-3070ti"
+  tags:
+    - bc
+    - feature-row
+    - hidden-1024
+    - batch-2048

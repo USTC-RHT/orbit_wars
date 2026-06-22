@@ -33,6 +33,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+try:
+    import wandb as _wandb
+
+    _WANDB_AVAILABLE = True
+    _WANDB_IMPORT_ERROR = None
+except ImportError as exc:
+    _WANDB_AVAILABLE = False
+    _WANDB_IMPORT_ERROR = exc
+
 
 NEG_INF = -1.0e9
 TRAIN_ARRAY_KEYS = (
@@ -46,6 +55,10 @@ TRAIN_ARRAY_KEYS = (
     "label__target",
     "label__amount",
 )
+FILTER_META_KEYS = (
+    "meta__winner_name",
+    "meta__episode_id",
+)
 NORMALIZER_ARRAY_KEYS = (
     "feature__fight_planet",
     "feature__fight_relative",
@@ -53,6 +66,7 @@ NORMALIZER_ARRAY_KEYS = (
     "feature__map",
     "feature__candidate_mask",
 )
+BUGGY_RELATIVE_FEATURE_DIMS = (7,)  # Old active-comet ETA feature; drop from BC inputs.
 
 
 class FeatureRowBatch(NamedTuple):
@@ -82,6 +96,49 @@ def raw_get(raw: dict[str, Any], section: str, key: str, default: Any) -> Any:
     return default if value is None else value
 
 
+def setup_wandb(raw_cfg: dict[str, Any], *, run_name: str, save_dir: Path) -> bool:
+    wandb_cfg = raw_cfg.get("wandb", {}) if isinstance(raw_cfg.get("wandb", {}), dict) else {}
+    enabled = bool(wandb_cfg.get("enabled", False))
+    mode = str(wandb_cfg.get("mode", "online"))
+    if not enabled or mode == "disabled":
+        return False
+    if not _WANDB_AVAILABLE:
+        print(f"wandb: unavailable; continuing without W&B: {_WANDB_IMPORT_ERROR!r}", flush=True)
+        return False
+
+    tags = wandb_cfg.get("tags", [])
+    if isinstance(tags, str):
+        tags = [tags]
+    save_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run = _wandb.init(
+            project=str(wandb_cfg.get("project", "orbit-wars-bc")),
+            entity=wandb_cfg.get("entity", None) or None,
+            name=str(wandb_cfg.get("name", run_name) or run_name),
+            config=raw_cfg,
+            mode=mode,
+            group=wandb_cfg.get("group", None) or None,
+            tags=list(tags),
+            dir=str(save_dir),
+        )
+        print(f"wandb: enabled project={wandb_cfg.get('project', 'orbit-wars-bc')} mode={mode}", flush=True)
+        if getattr(run, "url", None):
+            print(f"wandb: run_url={run.url}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"wandb: init failed; continuing without W&B: {exc!r}", flush=True)
+        return False
+
+
+def log_wandb(use_wandb: bool, metrics: Mapping[str, Any], *, step: int | None = None) -> None:
+    if not use_wandb:
+        return
+    try:
+        _wandb.log(dict(metrics), step=step)
+    except Exception as exc:
+        print(f"wandb: log failed; continuing without interrupting training: {exc!r}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="cfg_jax_BC_1.yaml")
@@ -102,6 +159,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--no-normalize", action="store_true")
     parser.add_argument("--resume", type=Path, default=None, help="Resume from a BC checkpoint path.")
+    parser.add_argument("--winner-fire-rate-min", type=float, default=None)
+    parser.add_argument("--winner-fire-rate-max", type=float, default=None)
+    parser.add_argument("--winner-fire-rate-min-rows", type=int, default=None)
+    parser.add_argument("--winner-fire-rate-min-episodes", type=int, default=None)
+    parser.add_argument(
+        "--exclude-unqualified-winners",
+        action="store_true",
+        help="Drop winners below the fire-rate stats sample floor instead of keeping them.",
+    )
     return parser.parse_args()
 
 
@@ -128,6 +194,204 @@ def split_paths(paths: list[Path], val_fraction: float) -> tuple[list[Path], lis
 def load_shard_arrays(path: Path, keys: tuple[str, ...] = TRAIN_ARRAY_KEYS) -> dict[str, np.ndarray]:
     with np.load(path) as data:
         return {name: np.asarray(data[name]) for name in keys}
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def unique_keys(keys: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(keys))
+
+
+def filter_load_keys(base_keys: tuple[str, ...], allowed_winners: frozenset[str] | None) -> tuple[str, ...]:
+    if allowed_winners is None:
+        return base_keys
+    return unique_keys(base_keys + FILTER_META_KEYS)
+
+
+def winner_fire_rate_filter_config(raw_cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+    cfg = raw_get(raw_cfg, "bc", "winner_fire_rate_filter", {})
+    cfg = dict(cfg) if isinstance(cfg, dict) else {}
+    enabled = bool(cfg.get("enabled", False))
+    if args.winner_fire_rate_min is not None or args.winner_fire_rate_max is not None:
+        enabled = True
+    if not enabled:
+        return None
+    min_rate = args.winner_fire_rate_min if args.winner_fire_rate_min is not None else parse_optional_float(cfg.get("min_rate"))
+    max_rate = args.winner_fire_rate_max if args.winner_fire_rate_max is not None else parse_optional_float(cfg.get("max_rate"))
+    if min_rate is None and max_rate is None:
+        raise ValueError("winner fire-rate filter is enabled, but neither min_rate nor max_rate is set")
+    min_rows = args.winner_fire_rate_min_rows
+    if min_rows is None:
+        min_rows = parse_optional_int(cfg.get("min_rows", 0))
+    min_episodes = args.winner_fire_rate_min_episodes
+    if min_episodes is None:
+        min_episodes = parse_optional_int(cfg.get("min_episodes", 0))
+    include_unqualified = bool(cfg.get("include_unqualified", True)) and not bool(args.exclude_unqualified_winners)
+    return {
+        "min_rate": min_rate,
+        "max_rate": max_rate,
+        "min_rows": int(min_rows or 0),
+        "min_episodes": int(min_episodes or 0),
+        "include_unqualified": include_unqualified,
+    }
+
+
+def compute_winner_fire_rate_stats(
+    paths: list[Path],
+    *,
+    report_every: int = 500,
+    use_wandb: bool = False,
+) -> dict[str, dict[str, Any]]:
+    rows: dict[str, int] = {}
+    fires: dict[str, int] = {}
+    episodes: dict[str, set[int]] = {}
+    start = time.time()
+    total = len(paths)
+    print(f"winner-fire-rate: start stats shards={total}", flush=True)
+    for i, path in enumerate(paths, start=1):
+        data = load_shard_arrays(path, ("label__fire", "meta__winner_name", "meta__episode_id"))
+        winners = data["meta__winner_name"].astype(str)
+        fire = data["label__fire"].astype(np.int64)
+        episode_id = data["meta__episode_id"]
+        values, inverse = np.unique(winners, return_inverse=True)
+        row_counts = np.bincount(inverse, minlength=len(values))
+        fire_counts = np.bincount(inverse, weights=fire, minlength=len(values)).astype(np.int64)
+        for j, value in enumerate(values):
+            name = str(value)
+            rows[name] = rows.get(name, 0) + int(row_counts[j])
+            fires[name] = fires.get(name, 0) + int(fire_counts[j])
+            eps = episodes.setdefault(name, set())
+            eps.update(map(int, np.unique(episode_id[winners == value])))
+        if i == 1 or i == total or (int(report_every) > 0 and i % int(report_every) == 0):
+            elapsed = time.time() - start
+            rate = i / max(elapsed, 1e-9)
+            eta = (total - i) / max(rate, 1e-9)
+            print(
+                f"winner-fire-rate: shard={i}/{total} file={path.name} "
+                f"rate={rate:.2f} shard/s eta={eta / 60.0:.1f}m",
+                flush=True,
+            )
+            log_wandb(
+                use_wandb,
+                {
+                    "winner_filter/stats_shards_done": i,
+                    "winner_filter/stats_progress": i / max(total, 1),
+                    "winner_filter/stats_eta_minutes": eta / 60.0,
+                },
+                step=0,
+            )
+    return {
+        name: {
+            "rows": int(rows[name]),
+            "fire": int(fires.get(name, 0)),
+            "episodes": len(episodes.get(name, set())),
+            "fire_rate": float(fires.get(name, 0)) / max(int(rows[name]), 1),
+        }
+        for name in rows
+    }
+
+
+def build_allowed_winners(
+    stats: dict[str, dict[str, Any]],
+    cfg: dict[str, Any],
+) -> tuple[frozenset[str], dict[str, Any]]:
+    min_rate = cfg["min_rate"]
+    max_rate = cfg["max_rate"]
+    min_rows = int(cfg["min_rows"])
+    min_episodes = int(cfg["min_episodes"])
+    include_unqualified = bool(cfg["include_unqualified"])
+    allowed: set[str] = set()
+    kept_rows = kept_fire = kept_episodes = 0
+    dropped_rows = dropped_fire = dropped_episodes = 0
+    qualified_count = 0
+    unqualified_count = 0
+    for name, item in stats.items():
+        rows = int(item["rows"])
+        fire = int(item["fire"])
+        episodes = int(item["episodes"])
+        rate = float(item["fire_rate"])
+        qualified = rows >= min_rows and episodes >= min_episodes
+        if qualified:
+            qualified_count += 1
+            keep = True
+            if min_rate is not None and rate < float(min_rate):
+                keep = False
+            if max_rate is not None and rate >= float(max_rate):
+                keep = False
+        else:
+            unqualified_count += 1
+            keep = include_unqualified
+        if keep:
+            allowed.add(name)
+            kept_rows += rows
+            kept_fire += fire
+            kept_episodes += episodes
+        else:
+            dropped_rows += rows
+            dropped_fire += fire
+            dropped_episodes += episodes
+    total_rows = kept_rows + dropped_rows
+    total_fire = kept_fire + dropped_fire
+    summary = {
+        "enabled": True,
+        "min_rate": min_rate,
+        "max_rate": max_rate,
+        "min_rows": min_rows,
+        "min_episodes": min_episodes,
+        "include_unqualified": include_unqualified,
+        "winners_total": len(stats),
+        "winners_qualified": qualified_count,
+        "winners_unqualified": unqualified_count,
+        "winners_kept": len(allowed),
+        "winners_dropped": len(stats) - len(allowed),
+        "rows_total": total_rows,
+        "rows_kept": kept_rows,
+        "rows_dropped": dropped_rows,
+        "fire_total": total_fire,
+        "fire_kept": kept_fire,
+        "fire_dropped": dropped_fire,
+        "episodes_kept_summed": kept_episodes,
+        "episodes_dropped_summed": dropped_episodes,
+        "kept_fraction": kept_rows / max(total_rows, 1),
+        "kept_fire_rate": kept_fire / max(kept_rows, 1),
+        "dropped_fire_rate": dropped_fire / max(dropped_rows, 1),
+    }
+    if not allowed:
+        raise ValueError(f"winner fire-rate filter dropped every winner: {summary}")
+    return frozenset(allowed), summary
+
+
+def row_filter_mask(data: Mapping[str, np.ndarray], allowed_winners: frozenset[str] | None) -> np.ndarray:
+    if allowed_winners is None:
+        rows = int(data["label__fire"].shape[0])
+        return np.ones((rows,), dtype=bool)
+    if "meta__winner_name" not in data:
+        raise KeyError("winner fire-rate filtering requires meta__winner_name in BC shards")
+    return np.isin(data["meta__winner_name"].astype(str), list(allowed_winners))
+
+
+def zero_disabled_relative_np(relative: np.ndarray, *, copy: bool = True) -> np.ndarray:
+    if not BUGGY_RELATIVE_FEATURE_DIMS:
+        return relative
+    value = np.array(relative, copy=copy)
+    value[..., BUGGY_RELATIVE_FEATURE_DIMS] = 0.0
+    return value
+
+
+def zero_disabled_relative_jax(relative: jnp.ndarray) -> jnp.ndarray:
+    if not BUGGY_RELATIVE_FEATURE_DIMS:
+        return relative
+    return relative.at[..., BUGGY_RELATIVE_FEATURE_DIMS].set(0.0)
 
 
 class MLP(nn.Module):
@@ -244,7 +508,7 @@ def accumulate_stats(stats: dict[str, np.ndarray], data: Mapping[str, np.ndarray
     stats["planet_sumsq"] += np.square(planet).sum(axis=0)
     stats["planet_count"] += planet.shape[0]
 
-    relative = data["feature__fight_relative"].astype(np.float64)
+    relative = zero_disabled_relative_np(data["feature__fight_relative"].astype(np.float64), copy=False)
     rel_mask = data["feature__candidate_mask"].astype(bool)
     valid_rel = relative[rel_mask]
     if valid_rel.size:
@@ -290,22 +554,50 @@ def finalize_normalizer(stats: dict[str, np.ndarray], eps: float = 1e-6) -> dict
     }
 
 
-def compute_normalizer(paths: list[Path], *, report_every: int = 100) -> dict[str, np.ndarray]:
+def compute_normalizer(
+    paths: list[Path],
+    *,
+    report_every: int = 100,
+    use_wandb: bool = False,
+    allowed_winners: frozenset[str] | None = None,
+) -> dict[str, np.ndarray]:
     stats = zeros_stats()
     start = time.time()
     total = len(paths)
+    rows_kept = 0
     print(f"normalizer: start shards={total}", flush=True)
+    log_wandb(use_wandb, {"normalizer/total_shards": total, "normalizer/shards_done": 0}, step=0)
     for i, path in enumerate(paths, start=1):
-        accumulate_stats(stats, load_shard_arrays(path, NORMALIZER_ARRAY_KEYS))
+        keys = filter_load_keys(NORMALIZER_ARRAY_KEYS, allowed_winners)
+        data = load_shard_arrays(path, keys)
+        keep = row_filter_mask(data, allowed_winners)
+        if keep.any():
+            rows_kept += int(keep.sum())
+            accumulate_stats(stats, {name: data[name][keep] for name in NORMALIZER_ARRAY_KEYS})
         if i == 1 or i == total or (int(report_every) > 0 and i % int(report_every) == 0):
             elapsed = time.time() - start
             rate = i / max(elapsed, 1e-9)
             eta = (total - i) / max(rate, 1e-9)
+            progress = i / max(total, 1)
             print(
                 f"normalizer: shard={i}/{total} file={path.name} "
                 f"rate={rate:.2f} shard/s eta={eta / 60.0:.1f}m",
                 flush=True,
             )
+            log_wandb(
+                use_wandb,
+                {
+                    "normalizer/shards_done": i,
+                    "normalizer/progress": progress,
+                    "normalizer/rate_shards_per_sec": rate,
+                    "normalizer/eta_minutes": eta / 60.0,
+                    "normalizer/elapsed_minutes": elapsed / 60.0,
+                    "normalizer/rows_kept": rows_kept,
+                },
+                step=0,
+            )
+    if rows_kept <= 0:
+        raise ValueError("normalizer saw zero rows after winner fire-rate filtering")
     return finalize_normalizer(stats)
 
 
@@ -329,7 +621,8 @@ def jax_normalizer(normalizer: dict[str, np.ndarray]) -> dict[str, jnp.ndarray]:
 
 def normalize_batch(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> FeatureRowBatch:
     planet = (batch.planet - norm["planet_mean"]) / jnp.maximum(norm["planet_std"], 1e-6)
-    relative = (batch.relative - norm["relative_mean"]) / jnp.maximum(norm["relative_std"], 1e-6)
+    relative_raw = zero_disabled_relative_jax(batch.relative)
+    relative = (relative_raw - norm["relative_mean"]) / jnp.maximum(norm["relative_std"], 1e-6)
     relative = jnp.where(batch.candidate_mask[..., None], relative, 0.0)
     global_features = (batch.global_features - norm["global_mean"]) / jnp.maximum(norm["global_std"], 1e-6)
     map_features = (batch.map_features - norm["map_mean"]) / jnp.maximum(norm["map_std"], 1e-6)
@@ -339,7 +632,7 @@ def normalize_batch(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> Fea
 def batch_from_arrays(data: Mapping[str, np.ndarray], idx: np.ndarray) -> FeatureRowBatch:
     return FeatureRowBatch(
         planet=np.asarray(data["feature__fight_planet"][idx], dtype=np.float32),
-        relative=np.asarray(data["feature__fight_relative"][idx], dtype=np.float32),
+        relative=zero_disabled_relative_np(np.asarray(data["feature__fight_relative"][idx], dtype=np.float32), copy=False),
         global_features=np.asarray(data["feature__global"][idx], dtype=np.float32),
         map_features=np.asarray(data["feature__map"][idx], dtype=np.float32),
         candidate_mask=np.asarray(data["feature__candidate_mask"][idx], dtype=bool),
@@ -501,18 +794,19 @@ def epoch_indices(
     train: bool,
     noop_keep_ratio: float,
     max_rows_per_shard: int | None,
+    allowed_winners: frozenset[str] | None = None,
     shuffle: bool | None = None,
 ) -> np.ndarray:
     if shuffle is None:
         shuffle = train
     rows = int(data["label__fire"].shape[0])
-    keep = np.ones((rows,), dtype=bool)
+    keep = row_filter_mask(data, allowed_winners)
     if train and noop_keep_ratio < 1.0:
         fire = data["label__fire"].astype(bool)
         keep_noop = rng.random(rows) < float(noop_keep_ratio)
-        keep = fire | keep_noop
+        keep = keep & (fire | keep_noop)
         if not keep.any():
-            keep[:] = True
+            keep = row_filter_mask(data, allowed_winners)
     idx = np.flatnonzero(keep)
     if shuffle:
         rng.shuffle(idx)
@@ -548,6 +842,7 @@ def train_batch_stream(
     rng: np.random.Generator,
     noop_keep_ratio: float,
     max_rows_per_shard: int | None,
+    allowed_winners: frozenset[str] | None = None,
     initial_completed_passes: int = 0,
     shuffle_shards: bool = True,
     shuffle_buffer_rows: int = 0,
@@ -584,13 +879,14 @@ def train_batch_stream(
             path = pass_paths[path_cursor]
             path_cursor += 1
             attempts += 1
-            data = load_shard_arrays(path)
+            data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
             order = epoch_indices(
                 data,
                 rng,
                 train=True,
                 noop_keep_ratio=noop_keep_ratio,
                 max_rows_per_shard=max_rows_per_shard,
+                allowed_winners=allowed_winners,
                 shuffle=True,
             )
             if len(order) > 0:
@@ -664,6 +960,7 @@ def run_eval_batches(
     rng,
     eval_batches: int,
     max_rows_per_shard: int | None,
+    allowed_winners: frozenset[str] | None = None,
 ):
     sums: dict[str, float] = {}
     count = 0
@@ -673,13 +970,14 @@ def run_eval_batches(
     while batches < int(eval_batches):
         path = paths[path_index % len(paths)]
         path_index += 1
-        data = load_shard_arrays(path)
+        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
         order = epoch_indices(
             data,
             rng,
             train=False,
             noop_keep_ratio=1.0,
             max_rows_per_shard=max_rows_per_shard,
+            allowed_winners=allowed_winners,
             shuffle=True,
         )
         if len(order) < batch_size:
@@ -698,6 +996,29 @@ def run_eval_batches(
             if batches >= int(eval_batches):
                 break
     return average_metric_sums(sums, count)
+
+
+def sample_batch_for_init(
+    paths: list[Path],
+    normalizer: dict[str, jnp.ndarray],
+    batch_size: int,
+    allowed_winners: frozenset[str] | None,
+) -> FeatureRowBatch:
+    for path in paths:
+        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
+        idx = epoch_indices(
+            data,
+            np.random.default_rng(0),
+            train=False,
+            noop_keep_ratio=1.0,
+            max_rows_per_shard=None,
+            allowed_winners=allowed_winners,
+            shuffle=False,
+        )
+        if len(idx) > 0:
+            sample_idx = idx[: min(int(batch_size), len(idx))]
+            return normalize_batch(batch_from_arrays(data, sample_idx), normalizer)
+    raise ValueError("no sample rows available after winner fire-rate filtering")
 
 
 def load_checkpoint_payload(path: Path | None) -> dict[str, Any] | None:
@@ -905,6 +1226,31 @@ def run_online_eval(
 def main() -> None:
     args = parse_args()
     raw_cfg = read_raw_config(args.config)
+    bc_cfg = raw_cfg.setdefault("bc", {})
+    if isinstance(bc_cfg, dict):
+        bc_cfg["dropped_relative_feature_dims"] = list(BUGGY_RELATIVE_FEATURE_DIMS)
+        if args.dataset_glob is not None:
+            bc_cfg["dataset_glob"] = str(args.dataset_glob)
+        if (
+            args.winner_fire_rate_min is not None
+            or args.winner_fire_rate_max is not None
+            or args.winner_fire_rate_min_rows is not None
+            or args.winner_fire_rate_min_episodes is not None
+            or args.exclude_unqualified_winners
+        ):
+            filter_cfg = dict(bc_cfg.get("winner_fire_rate_filter", {}) or {})
+            filter_cfg["enabled"] = True
+            if args.winner_fire_rate_min is not None:
+                filter_cfg["min_rate"] = float(args.winner_fire_rate_min)
+            if args.winner_fire_rate_max is not None:
+                filter_cfg["max_rate"] = float(args.winner_fire_rate_max)
+            if args.winner_fire_rate_min_rows is not None:
+                filter_cfg["min_rows"] = int(args.winner_fire_rate_min_rows)
+            if args.winner_fire_rate_min_episodes is not None:
+                filter_cfg["min_episodes"] = int(args.winner_fire_rate_min_episodes)
+            if args.exclude_unqualified_winners:
+                filter_cfg["include_unqualified"] = False
+            bc_cfg["winner_fire_rate_filter"] = filter_cfg
     resume_payload = load_checkpoint_payload(args.resume)
     dataset_pattern = args.dataset_glob or str(raw_get(raw_cfg, "bc", "dataset_glob", ""))
     paths = shard_paths(dataset_pattern, args.max_shards)
@@ -956,20 +1302,54 @@ def main() -> None:
     if online_eval_bc_player not in (0, 1):
         raise ValueError(f"eval.bc_player must be 0 or 1, got {online_eval_bc_player}")
 
+    save_root = Path(str(args.save_dir or raw_cfg.get("save_dir", "/mnt/f/kaggle-orbit-wars-data/bc_runs")))
+    run_name = str(args.run_name or raw_cfg.get("run_name", "bc_feature_rows"))
+    save_dir = save_root / run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    use_wandb = setup_wandb(raw_cfg, run_name=run_name, save_dir=save_dir)
+
     tic = time.time()
+    filter_cfg = winner_fire_rate_filter_config(raw_cfg, args)
+    allowed_winners: frozenset[str] | None = None
+    if filter_cfg is not None:
+        winner_stats = compute_winner_fire_rate_stats(train_paths, use_wandb=use_wandb)
+        allowed_winners, filter_summary = build_allowed_winners(winner_stats, filter_cfg)
+        bc_cfg["winner_fire_rate_filter_summary"] = filter_summary
+        (save_dir / "winner_fire_rate_filter_summary.json").write_text(
+            json.dumps(filter_summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(
+            "winner-fire-rate: "
+            f"min={filter_summary['min_rate']} max={filter_summary['max_rate']} "
+            f"min_rows={filter_summary['min_rows']} min_episodes={filter_summary['min_episodes']} "
+            f"include_unqualified={filter_summary['include_unqualified']} "
+            f"winners={filter_summary['winners_kept']}/{filter_summary['winners_total']} "
+            f"rows={filter_summary['rows_kept']}/{filter_summary['rows_total']} "
+            f"fire={filter_summary['fire_kept']}/{filter_summary['fire_total']} "
+            f"kept_fire_rate={filter_summary['kept_fire_rate']:.4f}",
+            flush=True,
+        )
+        log_wandb(use_wandb, {f"winner_filter/{k}": v for k, v in filter_summary.items()}, step=0)
     if resume_payload is not None and "normalizer" in resume_payload and not args.no_normalize:
         normalizer_np = resume_payload["normalizer"]
         print(f"resume: loaded normalizer from {args.resume}", flush=True)
     else:
-        normalizer_np = identity_normalizer() if args.no_normalize else compute_normalizer(train_paths)
+        normalizer_np = (
+            identity_normalizer()
+            if args.no_normalize
+            else compute_normalizer(train_paths, use_wandb=use_wandb, allowed_winners=allowed_winners)
+        )
         if args.no_normalize:
             print("normalizer: disabled; using identity normalizer", flush=True)
+            log_wandb(use_wandb, {"normalizer/disabled": 1}, step=0)
     normalizer = jax_normalizer(normalizer_np)
     print(
         f"BC feature-row start shards={len(paths)} train={len(train_paths)} val={len(val_paths)} "
         f"max_steps={max_steps} batch={batch_size} eval_batches={eval_batches} "
         f"shuffle_shards={shuffle_shards} shuffle_buffer_rows={shuffle_buffer_rows} "
         f"prefetch_batches={prefetch_batches} "
+        f"dropped_relative_dims={list(BUGGY_RELATIVE_FEATURE_DIMS)} "
         f"norm_counts={normalizer_np['counts'].tolist()}",
         flush=True,
     )
@@ -980,9 +1360,7 @@ def main() -> None:
             flush=True,
         )
 
-    sample_data = load_shard_arrays(train_paths[0])
-    sample_idx = np.arange(min(batch_size, int(sample_data["label__fire"].shape[0])))
-    sample_batch = normalize_batch(batch_from_arrays(sample_data, sample_idx), normalizer)
+    sample_batch = sample_batch_for_init(train_paths, normalizer, batch_size, allowed_winners)
 
     ship_bucket_count = int(sample_batch.amount_mask.shape[-1])
     model = FeatureRowBCPolicy(ship_bucket_count=ship_bucket_count, hidden_size=hidden_size, use_cnn=use_cnn)
@@ -1003,10 +1381,6 @@ def main() -> None:
     train_step = make_train_step(model, weights, normalizer)
     eval_step = make_eval_step(model, weights, normalizer)
 
-    save_root = Path(str(args.save_dir or raw_cfg.get("save_dir", "/mnt/f/kaggle-orbit-wars-data/bc_runs")))
-    run_name = str(args.run_name or raw_cfg.get("run_name", "bc_feature_rows"))
-    save_dir = save_root / run_name
-    save_dir.mkdir(parents=True, exist_ok=True)
     np.savez(save_dir / "normalizer.npz", **normalizer_np)
     (save_dir / "train_config_snapshot.yaml").write_text(yaml.safe_dump(raw_cfg, sort_keys=False), encoding="utf-8")
 
@@ -1021,6 +1395,8 @@ def main() -> None:
     start_step = int(jax.device_get(train_state.step))
     if start_step >= max_steps:
         print(f"BC resume checkpoint already at step {start_step}; target max_steps={max_steps}, nothing to do.", flush=True)
+        if use_wandb:
+            _wandb.finish()
         return
 
     data_seed = int(raw_cfg.get("seed", 42)) + 1_000_003 * (start_step + 1)
@@ -1031,6 +1407,7 @@ def main() -> None:
         data_rng,
         noop_keep_ratio,
         args.max_rows_per_shard,
+        allowed_winners=allowed_winners,
         initial_completed_passes=completed_passes,
         shuffle_shards=shuffle_shards,
         shuffle_buffer_rows=shuffle_buffer_rows,
@@ -1078,6 +1455,7 @@ def main() -> None:
                 np.random.default_rng(int(raw_cfg.get("seed", 42)) + 2_000_003 + step),
                 eval_batches,
                 args.max_rows_per_shard,
+                allowed_winners=allowed_winners,
             )
             metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
             improved = metrics["val_loss"] < best_val
@@ -1106,6 +1484,7 @@ def main() -> None:
                 print(f"[online-eval] failed at step={step}: {exc!r}", flush=True)
 
         write_metrics(metrics_path, step, metrics, completed_passes=completed_passes)
+        log_wandb(use_wandb, {"completed_passes": completed_passes, **metrics}, step=step)
         last_metrics = metrics
         online_text = ""
         if "online_win_rate" in metrics:
@@ -1182,6 +1561,8 @@ def main() -> None:
 
     if last_metrics:
         print(f"BC done at step={step}; wrote {save_dir / 'ckpt_last.pkl'}", flush=True)
+    if use_wandb:
+        _wandb.finish()
 
 
 if __name__ == "__main__":

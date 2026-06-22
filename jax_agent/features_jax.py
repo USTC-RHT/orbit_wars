@@ -362,7 +362,7 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
     fy_t = fleets[:, 3:4] + vy[:, None] * ts[None, :]
     in_bounds = (fx_t >= 0.0) & (fx_t <= BOARD_SIZE) & (fy_t >= 0.0) & (fy_t <= BOARD_SIZE)
 
-    px_t, py_t = planet_positions_over_horizon(state, horizon)
+    px_t, py_t, alive_t = planet_positions_alive_over_horizon(state, horizon)
     radii = planets[:, 4]
 
     fx_prev = fx_t[:, :-1]
@@ -373,6 +373,8 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
     py_old = py_t[:, :-1]
     px_new = px_t[:, 1:]
     py_new = py_t[:, 1:]
+    alive_old = alive_t[:, :-1]
+    alive_new = alive_t[:, 1:]
 
     move_d2 = point_segment_distance_sq(
         px_old[None, :, :],
@@ -384,7 +386,7 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
     )
     cur_in_bounds = in_bounds[:, 1:][:, None, :]
     move_hit = move_d2 < (radii[None, :, None] ** 2)
-    move_hit = move_hit & cur_in_bounds & f_alive[:, None, None] & p_alive[None, :, None]
+    move_hit = move_hit & cur_in_bounds & f_alive[:, None, None] & alive_old[None, :, :]
 
     sweep_x = px_new - px_old
     sweep_y = py_new - py_old
@@ -398,7 +400,7 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
         py_new[None, :, :],
     )
     sweep_hit = sweep_d2 < (radii[None, :, None] ** 2)
-    sweep_hit = sweep_hit & sweep_active[None, :, :] & cur_in_bounds & f_alive[:, None, None] & p_alive[None, :, None]
+    sweep_hit = sweep_hit & sweep_active[None, :, :] & cur_in_bounds & f_alive[:, None, None] & alive_new[None, :, :]
 
     large_key = jnp.int32(2 * (horizon + 1) + 1)
     steps = jnp.arange(1, horizon + 1, dtype=jnp.int32)
@@ -432,10 +434,11 @@ def precompute_inbound(state: EnvState, params: FeatureParams) -> jnp.ndarray:
     return jnp.where(p_alive[:, None], inbound, jnp.asarray([0.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=jnp.float32))
 
 
-def planet_positions_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def planet_positions_alive_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     planets = state.planets
     init = state.initial_planets
     ts = jnp.arange(horizon + 1, dtype=jnp.float32)
+    ts_i = jnp.arange(horizon + 1, dtype=jnp.int32)
     comet_mask = comet_planet_mask(state)
     dx = init[:, 2] - CENTER
     dy = init[:, 3] - CENTER
@@ -447,27 +450,38 @@ def planet_positions_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.nd
     py = CENTER + orbit_r[:, None] * jnp.sin(phi)
     px = jnp.where(rotating[:, None], px, planets[:, 2:3])
     py = jnp.where(rotating[:, None], py, planets[:, 3:4])
+    alive = jnp.broadcast_to(state.planet_alive[:, None], (planets.shape[0], horizon + 1))
 
     comet_slots = state.comet_slots.reshape(MAX_COMET_SPAWNS * COMETS_PER_SPAWN)
     safe_slots = jnp.where(comet_slots >= 0, comet_slots, 0)
     group_active = state.comet_path_index[:, None] >= -1
     active = (state.comet_slots >= 0) & group_active
     active_flat = active.reshape(-1)
-    path_index = state.comet_path_index[:, None, None] + jnp.arange(horizon + 1, dtype=jnp.int32)[None, None, :]
+    path_index = state.comet_path_index[:, None, None] + ts_i[None, None, :]
     path_index = jnp.broadcast_to(path_index, (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, horizon + 1))
     lengths = state.comet_lengths[:, :, None]
     valid_t = active[:, :, None] & (path_index >= 0) & (path_index < lengths)
     path_index = jnp.clip(path_index, 0, MAX_COMET_PATH - 1)
     gather_index = jnp.broadcast_to(path_index[..., None], (MAX_COMET_SPAWNS, COMETS_PER_SPAWN, horizon + 1, 2))
     path_pos = jnp.take_along_axis(state.comet_paths, gather_index, axis=2)
-    path_pos = jnp.where(valid_t[..., None], path_pos, -1000.0)
+    current_xy = state.planets[safe_slots, 2:4].reshape(MAX_COMET_SPAWNS, COMETS_PER_SPAWN, 1, 2)
+    path_pos = jnp.where(valid_t[..., None], path_pos, current_xy)
     flat_pos = path_pos.reshape(MAX_COMET_SPAWNS * COMETS_PER_SPAWN, horizon + 1, 2)
+    flat_valid = valid_t.reshape(MAX_COMET_SPAWNS * COMETS_PER_SPAWN, horizon + 1)
     slot_onehot = jax.nn.one_hot(safe_slots, planets.shape[0], dtype=jnp.float32) * active_flat[:, None].astype(jnp.float32)
     comet_has = slot_onehot.sum(axis=0) > 0.0
     comet_px = jnp.einsum("kp,kt->pt", slot_onehot, flat_pos[:, :, 0])
     comet_py = jnp.einsum("kp,kt->pt", slot_onehot, flat_pos[:, :, 1])
+    comet_alive = jnp.einsum("kp,kt->pt", slot_onehot, flat_valid.astype(jnp.float32)) > 0.0
+    comet_alive = comet_alive.at[:, 0].set(jnp.where(comet_has, state.planet_alive, comet_alive[:, 0]))
     px = jnp.where(comet_has[:, None], comet_px, px)
     py = jnp.where(comet_has[:, None], comet_py, py)
+    alive = jnp.where(comet_has[:, None], comet_alive, alive)
+    return px, py, alive
+
+
+def planet_positions_over_horizon(state: EnvState, horizon: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    px, py, _alive = planet_positions_alive_over_horizon(state, horizon)
     return px, py
 
 

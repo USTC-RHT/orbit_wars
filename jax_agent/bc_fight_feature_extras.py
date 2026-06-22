@@ -25,7 +25,7 @@ from .features_jax import (
     clip01,
     distance_to_sun,
     is_rotating,
-    planet_positions_over_horizon,
+    planet_positions_alive_over_horizon,
     proto_score,
 )
 from .garrison_jax import DEFAULT_GARRISON_HORIZON, garrison_status_jax, safe_drain_all_sources_jax, target_flip_status_from_garrison_jax
@@ -61,7 +61,7 @@ def build_fight_feature_extras(state: EnvState, params: FeatureParams) -> FightF
     enemy_pressure = enemy_pressure_jax(state, horizon=float(DEFAULT_GARRISON_HORIZON), player_id=0)
     flip_status = target_flip_status_from_garrison_jax(state, status, player_id=0)
     inbound = precompute_inbound_from_garrison(state, status, params)
-    future_px, future_py = planet_positions_over_horizon(state, int(INBOUND_HORIZON))
+    future_px, future_py, future_alive = planet_positions_alive_over_horizon(state, int(INBOUND_HORIZON))
 
     def source_row(src_idx):
         return build_source_extras(
@@ -76,6 +76,7 @@ def build_fight_feature_extras(state: EnvState, params: FeatureParams) -> FightF
             flip_status.urgency,
             future_px,
             future_py,
+            future_alive,
             params,
         )
 
@@ -97,7 +98,7 @@ def build_fight_feature_extras_for_sources(state: EnvState, source_slots: jnp.nd
     enemy_pressure = enemy_pressure_jax(state, horizon=float(DEFAULT_GARRISON_HORIZON), player_id=0)
     flip_status = target_flip_status_from_garrison_jax(state, status, player_id=0)
     inbound = precompute_inbound_from_garrison(state, status, params)
-    future_px, future_py = planet_positions_over_horizon(state, int(INBOUND_HORIZON))
+    future_px, future_py, future_alive = planet_positions_alive_over_horizon(state, int(INBOUND_HORIZON))
 
     def source_row(src_idx):
         return build_source_extras(
@@ -112,6 +113,7 @@ def build_fight_feature_extras_for_sources(state: EnvState, source_slots: jnp.nd
             flip_status.urgency,
             future_px,
             future_py,
+            future_alive,
             params,
         )
 
@@ -134,6 +136,7 @@ def build_source_extras(
     target_flip_urgency: jnp.ndarray,
     future_px: jnp.ndarray,
     future_py: jnp.ndarray,
+    future_alive: jnp.ndarray,
     params: FeatureParams,
 ) -> FightFeatureExtras:
     planet = build_planet_features(state, src_idx, inbound, safe_drain, enemy_pressure, params)
@@ -147,6 +150,7 @@ def build_source_extras(
         target_flip_urgency,
         future_px,
         future_py,
+        future_alive,
         params,
     )
     return FightFeatureExtras(planet=planet, relative=relative)
@@ -251,6 +255,7 @@ def build_relative_features(
     target_flip_urgency: jnp.ndarray,
     future_px: jnp.ndarray,
     future_py: jnp.ndarray,
+    future_alive: jnp.ndarray,
     params: FeatureParams,
 ) -> jnp.ndarray:
     src = state.planets[src_idx]
@@ -267,7 +272,7 @@ def build_relative_features(
     target_valid = alive & (~is_source) & (is_friend | is_enemy | is_neutral)
     ship_buckets = build_ship_buckets(src[5], params)
     max_bucket = jnp.maximum(ship_buckets.max(), 1.0)
-    reachable, eta_turns_raw = reachable_full_send(src, planets, future_px, future_py, max_bucket)
+    reachable, eta_turns_raw = reachable_full_send(src, planets, future_px, future_py, future_alive, max_bucket)
     eta_turns = jnp.where(target_valid, eta_turns_raw, INBOUND_HORIZON + 1.0)
     eta_norm = eta_turns / INBOUND_HORIZON
     eta_garrison = relative_eta_garrison_features(status, eta_turns, params)
@@ -364,6 +369,7 @@ def reachable_full_send(
     planets: jnp.ndarray,
     future_px: jnp.ndarray,
     future_py: jnp.ndarray,
+    future_alive: jnp.ndarray,
     ships: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     horizon = int(future_px.shape[-1]) - 1
@@ -371,13 +377,14 @@ def reachable_full_send(
     ay = future_py[:, :-1]
     bx = future_px[:, 1:]
     by = future_py[:, 1:]
+    segment_alive = future_alive[:, :-1] & future_alive[:, 1:]
     d2 = point_segment_distance_sq(src[2], src[3], ax, ay, bx, by)
     seg_dist = jnp.sqrt(jnp.maximum(d2, 0.0))
     gap = src[4] + planets[:, 4] + LAUNCH_SURFACE_OFFSET + TARGET_HIT_SURFACE_OFFSET
     surface_dist = jnp.maximum(seg_dist - gap[:, None], 0.0)
     turns = jnp.arange(1, horizon + 1, dtype=jnp.float32)
     speed = fleet_speed(jnp.maximum(ships, 1.0))
-    reachable_by_turn = surface_dist <= (speed * turns[None, :] * (1.0 + REACHABILITY_EPS))
+    reachable_by_turn = (surface_dist <= (speed * turns[None, :] * (1.0 + REACHABILITY_EPS))) & segment_alive
     can_reach = (ships >= MIN_LAUNCH) & reachable_by_turn.any(axis=-1)
     eta = jnp.min(jnp.where(reachable_by_turn, turns[None, :], INBOUND_HORIZON + 1.0), axis=-1)
     return can_reach, jnp.where(can_reach, eta, INBOUND_HORIZON + 1.0)

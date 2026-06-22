@@ -2,9 +2,9 @@
 set -euo pipefail
 
 WORKERS="${1:-2}"
-ROOT="${2:-/mnt/f/kaggle-orbit-wars-data/bc_feature_rows/official_2p_winners_fight_parallel_${WORKERS}}"
-PYTHON="${PYTHON:-/home/dministrator/miniconda/envs/orbit-wars-lab/bin/python}"
-REPO="${REPO:-/home/dministrator/kaggle/rl-agent}"
+ROOT="${2:-/mnt/kaggle/BC_data/official_2p_winners_fight_parallel_${WORKERS}}"
+PYTHON="${PYTHON:-python}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SHARD_SIZE="${SHARD_SIZE:-131072}"
 COMPRESSION="${COMPRESSION:-compressed}"
 FEATURE_DTYPE="${FEATURE_DTYPE:-float32}"

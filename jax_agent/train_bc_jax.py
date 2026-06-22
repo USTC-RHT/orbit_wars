@@ -1322,7 +1322,7 @@ def main() -> None:
     if online_eval_bc_player not in (0, 1):
         raise ValueError(f"eval.bc_player must be 0 or 1, got {online_eval_bc_player}")
 
-    save_root = Path(str(args.save_dir or raw_cfg.get("save_dir", "/mnt/f/kaggle-orbit-wars-data/bc_runs")))
+    save_root = Path(str(args.save_dir or raw_cfg.get("save_dir", "/mnt/kaggle/bc_runs")))
     run_name = str(args.run_name or raw_cfg.get("run_name", "bc_feature_rows"))
     save_dir = save_root / run_name
     save_dir.mkdir(parents=True, exist_ok=True)

@@ -1,11 +1,11 @@
 # Per-planet behavioral cloning config.
 #
 # Launch:
-#   python -m jax_agent.train_bc_jax --config cfg_jax_BC_1.yaml
+#   python -m jax_agent.train_bc_jax --config cfg_jax_BC_4090.yaml
 
 seed: 42
 run_name: "bc_feature_rows_fight_full"
-save_dir: /mnt/f/kaggle-orbit-wars-data/bc_runs
+save_dir: /mnt/kaggle/bc_runs
 
 env:
   board_size: 100.0

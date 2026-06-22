@@ -25,7 +25,7 @@ model:
   use_transformer: false
 
 state_norm:
-  enabled: false
+  enabled: true
   clip: 5.0
   eps: 1.0e-8
 

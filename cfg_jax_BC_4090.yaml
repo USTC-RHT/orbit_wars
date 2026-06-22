@@ -4,7 +4,7 @@
 #   python -m jax_agent.train_bc_jax --config cfg_jax_BC_4090.yaml
 
 seed: 42
-run_name: "bc_feature_rows_fight_full"
+run_name: "bc_feature_rows_top10_fire_lt_0p1"
 save_dir: /mnt/kaggle/bc_runs
 
 env:
@@ -69,10 +69,16 @@ bc:
   winner_fire_rate_filter:
     enabled: true
     min_rate: 0.0
-    max_rate: 0.25
+    max_rate: 0.1
     min_rows: 100000
     min_episodes: 50
     include_unqualified: false
+    allow_winners:
+      - "Isaiah @ Tufa Labs"
+      - "Jake Will"
+      - "Ender"
+      - "TonyK"
+      - "Vadasz & Ascalon"
 
 wandb:
   enabled: true

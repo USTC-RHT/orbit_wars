@@ -248,12 +248,20 @@ def winner_fire_rate_filter_config(raw_cfg: dict[str, Any], args: argparse.Names
     if min_episodes is None:
         min_episodes = parse_optional_int(cfg.get("min_episodes", 0))
     include_unqualified = bool(cfg.get("include_unqualified", True)) and not bool(args.exclude_unqualified_winners)
+    allow_winners_raw = cfg.get("allow_winners", cfg.get("allowed_winners", None))
+    allow_winners = None
+    if allow_winners_raw not in (None, ""):
+        if isinstance(allow_winners_raw, str):
+            allow_winners = [allow_winners_raw]
+        else:
+            allow_winners = [str(name) for name in allow_winners_raw]
     return {
         "min_rate": min_rate,
         "max_rate": max_rate,
         "min_rows": int(min_rows or 0),
         "min_episodes": int(min_episodes or 0),
         "include_unqualified": include_unqualified,
+        "allow_winners": allow_winners,
     }
 
 
@@ -321,6 +329,8 @@ def build_allowed_winners(
     min_rows = int(cfg["min_rows"])
     min_episodes = int(cfg["min_episodes"])
     include_unqualified = bool(cfg["include_unqualified"])
+    allow_winners = cfg.get("allow_winners")
+    allow_winners_set = set(map(str, allow_winners)) if allow_winners else None
     allowed: set[str] = set()
     kept_rows = kept_fire = kept_episodes = 0
     dropped_rows = dropped_fire = dropped_episodes = 0
@@ -342,6 +352,8 @@ def build_allowed_winners(
         else:
             unqualified_count += 1
             keep = include_unqualified
+        if keep and allow_winners_set is not None and name not in allow_winners_set:
+            keep = False
         if keep:
             allowed.add(name)
             kept_rows += rows
@@ -360,6 +372,8 @@ def build_allowed_winners(
         "min_rows": min_rows,
         "min_episodes": min_episodes,
         "include_unqualified": include_unqualified,
+        "allow_winners": sorted(allow_winners_set) if allow_winners_set is not None else None,
+        "allow_winners_missing": sorted(allow_winners_set - set(stats)) if allow_winners_set is not None else [],
         "winners_total": len(stats),
         "winners_qualified": qualified_count,
         "winners_unqualified": unqualified_count,

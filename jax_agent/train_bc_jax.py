@@ -1351,16 +1351,17 @@ def main() -> None:
             flush=True,
         )
         log_wandb(use_wandb, {f"winner_filter/{k}": v for k, v in filter_summary.items()}, step=0)
-    if resume_payload is not None and "normalizer" in resume_payload and not args.no_normalize:
+    normalize_enabled = bool(raw_get(raw_cfg, "state_norm", "enabled", True)) and not args.no_normalize
+    if resume_payload is not None and "normalizer" in resume_payload and normalize_enabled:
         normalizer_np = resume_payload["normalizer"]
         print(f"resume: loaded normalizer from {args.resume}", flush=True)
     else:
         normalizer_np = (
             identity_normalizer()
-            if args.no_normalize
+            if not normalize_enabled
             else compute_normalizer(train_paths, use_wandb=use_wandb, allowed_winners=allowed_winners)
         )
-        if args.no_normalize:
+        if not normalize_enabled:
             print("normalizer: disabled; using identity normalizer", flush=True)
             log_wandb(use_wandb, {"normalizer/disabled": 1}, step=0)
     normalizer = jax_normalizer(normalizer_np)

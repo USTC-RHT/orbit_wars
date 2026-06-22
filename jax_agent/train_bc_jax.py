@@ -389,6 +389,7 @@ def zero_disabled_relative_np(relative: np.ndarray, *, copy: bool = True) -> np.
 
 
 def zero_disabled_relative_jax(relative: jnp.ndarray) -> jnp.ndarray:
+    relative = jnp.asarray(relative)
     if not BUGGY_RELATIVE_FEATURE_DIMS:
         return relative
     return relative.at[..., BUGGY_RELATIVE_FEATURE_DIMS].set(0.0)

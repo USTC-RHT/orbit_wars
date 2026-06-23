@@ -66,7 +66,8 @@ NORMALIZER_ARRAY_KEYS = (
     "feature__map",
     "feature__candidate_mask",
 )
-BUGGY_RELATIVE_FEATURE_DIMS = (7,)  # Old active-comet ETA feature; drop from BC inputs.
+DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS = (7,)  # Old active-comet ETA feature; drop from BC inputs.
+DROPPED_RELATIVE_FEATURE_DIMS = DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS
 
 
 class FeatureRowBatch(NamedTuple):
@@ -94,6 +95,19 @@ def read_raw_config(path: str | Path) -> dict[str, Any]:
 def raw_get(raw: dict[str, Any], section: str, key: str, default: Any) -> Any:
     value = raw.get(section, {}).get(key, default)
     return default if value is None else value
+
+
+def parse_int_list(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        return tuple(int(part.strip()) for part in text.split(",") if part.strip())
+    if isinstance(value, (list, tuple)):
+        return tuple(int(item) for item in value)
+    return (int(value),)
 
 
 def setup_wandb(raw_cfg: dict[str, Any], *, run_name: str, save_dir: Path) -> bool:
@@ -407,18 +421,18 @@ def row_filter_mask(data: Mapping[str, np.ndarray], allowed_winners: frozenset[s
 
 
 def zero_disabled_relative_np(relative: np.ndarray, *, copy: bool = True) -> np.ndarray:
-    if not BUGGY_RELATIVE_FEATURE_DIMS:
+    if not DROPPED_RELATIVE_FEATURE_DIMS:
         return relative
     value = np.array(relative, copy=copy)
-    value[..., BUGGY_RELATIVE_FEATURE_DIMS] = 0.0
+    value[..., DROPPED_RELATIVE_FEATURE_DIMS] = 0.0
     return value
 
 
 def zero_disabled_relative_jax(relative: jnp.ndarray) -> jnp.ndarray:
     relative = jnp.asarray(relative)
-    if not BUGGY_RELATIVE_FEATURE_DIMS:
+    if not DROPPED_RELATIVE_FEATURE_DIMS:
         return relative
-    return relative.at[..., BUGGY_RELATIVE_FEATURE_DIMS].set(0.0)
+    return relative.at[..., DROPPED_RELATIVE_FEATURE_DIMS].set(0.0)
 
 
 class MLP(nn.Module):
@@ -1306,13 +1320,17 @@ def prefix_online_eval_metrics(prefix: str, metrics: dict[str, float]) -> dict[s
 
 
 def main() -> None:
+    global DROPPED_RELATIVE_FEATURE_DIMS
     args = parse_args()
     config_path = Path(args.config).expanduser()
     raw_cfg = read_raw_config(args.config)
     seed = int(raw_cfg.get("seed", 42))
     bc_cfg = raw_cfg.setdefault("bc", {})
     if isinstance(bc_cfg, dict):
-        bc_cfg["dropped_relative_feature_dims"] = list(BUGGY_RELATIVE_FEATURE_DIMS)
+        DROPPED_RELATIVE_FEATURE_DIMS = parse_int_list(
+            bc_cfg.get("dropped_relative_feature_dims", DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS)
+        )
+        bc_cfg["dropped_relative_feature_dims"] = list(DROPPED_RELATIVE_FEATURE_DIMS)
         if args.dataset_glob is not None:
             bc_cfg["dataset_glob"] = str(args.dataset_glob)
         if (
@@ -1464,7 +1482,7 @@ def main() -> None:
         f"max_steps={max_steps} batch={batch_size} eval_batches={eval_batches} "
         f"shuffle_shards={shuffle_shards} shuffle_buffer_rows={shuffle_buffer_rows} "
         f"prefetch_batches={prefetch_batches} "
-        f"dropped_relative_dims={list(BUGGY_RELATIVE_FEATURE_DIMS)} "
+        f"dropped_relative_dims={list(DROPPED_RELATIVE_FEATURE_DIMS)} "
         f"norm_counts={normalizer_np['counts'].tolist()}",
         flush=True,
     )

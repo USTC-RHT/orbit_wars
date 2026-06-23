@@ -64,7 +64,7 @@ bc:
   weight_decay: 0.0
   val_fraction: 0.1
   noop_keep_ratio: 0.1
-  dropped_relative_feature_dims: [7]
+  dropped_relative_feature_dims: []
   noop_weight: 1.0
   fire_weight: 1.0
   target_weight: 1.0

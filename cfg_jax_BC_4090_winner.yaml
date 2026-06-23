@@ -28,7 +28,7 @@ model:
 
 state_norm:
   enabled: true
-  normalizer_path: normalizer.npz
+  # normalizer_path: normalizer.npz
   sample_shards: 512   # 0 = scan all train shards for normalizer stats
   sample_seed: 42
   clip: 5.0
@@ -63,7 +63,7 @@ bc:
   weight_decay: 0.0
   val_fraction: 0.1
   learn_result_filter: winner
-  noop_keep_ratio: 0.1
+  noop_keep_ratio: 0.25
   dropped_relative_feature_dims: []
   noop_weight: 1.0
   fire_weight: 1.0

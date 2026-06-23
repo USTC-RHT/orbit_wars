@@ -16,7 +16,14 @@ from .build_bc_feature_rows_from_zips import encode_light_sources
 from .config import EnvConfig
 from .fast_env import EnvParams, EnvState, state_from_observation
 from .features_jax import FeatureParams, SHIP_RATIOS
-from .train_bc_jax import FeatureRowBCPolicy, FeatureRowBatch, identity_normalizer, jax_normalizer, normalize_batch
+from .train_bc_jax import (
+    FeatureRowBCPolicy,
+    FeatureRowBatch,
+    dropped_relative_feature_dims_from_raw,
+    identity_normalizer,
+    jax_normalizer,
+    normalize_batch,
+)
 from .train_jax import aim_with_prediction_jax, fit_action_slots
 
 NEG_INF = -1.0e9
@@ -194,7 +201,11 @@ def build_bc_policy_rows(state: EnvState, params: FeatureParams, bucket_count: i
     )
 
 
-def normalize_rows(rows: BCPolicyRows, normalizer: dict[str, jnp.ndarray]) -> FeatureRowBatch:
+def normalize_rows(
+    rows: BCPolicyRows,
+    normalizer: dict[str, jnp.ndarray],
+    dropped_relative_feature_dims: tuple[int, ...] | None = None,
+) -> FeatureRowBatch:
     dummy_bool = jnp.zeros((rows.planet.shape[0],), dtype=bool)
     dummy_i32 = jnp.zeros((rows.planet.shape[0],), dtype=jnp.int32)
     batch = FeatureRowBatch(
@@ -208,7 +219,11 @@ def normalize_rows(rows: BCPolicyRows, normalizer: dict[str, jnp.ndarray]) -> Fe
         target=dummy_i32,
         amount=dummy_i32,
     )
-    return normalize_batch(batch, normalizer)
+    return normalize_batch(
+        batch,
+        normalizer,
+        dropped_relative_feature_dims=dropped_relative_feature_dims,
+    )
 
 
 def safe_logits(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
@@ -217,8 +232,14 @@ def safe_logits(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(empty, 0.0, masked)
 
 
-def bc_decisions(model: FeatureRowBCPolicy, params: Any, rows: BCPolicyRows, normalizer: dict[str, jnp.ndarray]):
-    batch = normalize_rows(rows, normalizer)
+def bc_decisions(
+    model: FeatureRowBCPolicy,
+    params: Any,
+    rows: BCPolicyRows,
+    normalizer: dict[str, jnp.ndarray],
+    dropped_relative_feature_dims: tuple[int, ...] | None = None,
+):
+    batch = normalize_rows(rows, normalizer, dropped_relative_feature_dims)
     zero_target = jnp.zeros((batch.planet.shape[0],), dtype=jnp.int32)
     base_out = model.apply(
         {"params": params},
@@ -294,6 +315,7 @@ class BCPolicyAgent:
     env_params: EnvParams
     feature_params: FeatureParams
     ship_bucket_count: int
+    dropped_relative_feature_dims: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         self._act_jit = jax.jit(self._act_arrays)
@@ -303,6 +325,7 @@ class BCPolicyAgent:
         with Path(path).open("rb") as f:
             payload = pickle.load(f)
         raw = payload.get("raw_config") or payload.get("config") or {}
+        dropped_relative_feature_dims = dropped_relative_feature_dims_from_raw(raw)
         env_params = build_env_params_from_raw(raw, max_fleets=max_fleets)
         env_cfg = env_config_from_raw(raw)
         feature_params = FeatureParams.from_train_config(type("Cfg", (), {"env": env_cfg})())
@@ -326,11 +349,13 @@ class BCPolicyAgent:
             env_params=env_params,
             feature_params=feature_params,
             ship_bucket_count=ship_bucket_count,
+            dropped_relative_feature_dims=dropped_relative_feature_dims,
         )
 
     @classmethod
     def random_from_config(cls, raw: dict[str, Any] | None = None, *, seed: int = 0, max_fleets: int = 512) -> "BCPolicyAgent":
         raw = raw or {}
+        dropped_relative_feature_dims = dropped_relative_feature_dims_from_raw(raw)
         env_params = build_env_params_from_raw(raw, max_fleets=max_fleets)
         env_cfg = env_config_from_raw(raw)
         feature_params = FeatureParams.from_train_config(type("Cfg", (), {"env": env_cfg})())
@@ -348,7 +373,7 @@ class BCPolicyAgent:
         )
         state0 = state_from_observation({"planets": [], "fleets": [], "step": 0}, env_params)
         rows = build_bc_policy_rows(state0, feature_params, ship_bucket_count)
-        batch = normalize_rows(rows, jax_normalizer(identity_normalizer()))
+        batch = normalize_rows(rows, jax_normalizer(identity_normalizer()), dropped_relative_feature_dims)
         variables = model.init(
             jax.random.PRNGKey(int(seed)),
             batch.planet,
@@ -365,12 +390,19 @@ class BCPolicyAgent:
             env_params=env_params,
             feature_params=feature_params,
             ship_bucket_count=ship_bucket_count,
+            dropped_relative_feature_dims=dropped_relative_feature_dims,
         )
 
     def _act_arrays(self, state: EnvState, player: jnp.ndarray) -> jnp.ndarray:
         rows = build_bc_policy_rows(state, self.feature_params, self.ship_bucket_count)
         model_rows = bc_rows_to_player0_view(rows, player)
-        fire, target, amount = bc_decisions(self.model, self.params, model_rows, self.normalizer)
+        fire, target, amount = bc_decisions(
+            self.model,
+            self.params,
+            model_rows,
+            self.normalizer,
+            self.dropped_relative_feature_dims,
+        )
         target_env = target_from_player0_view(target, player, int(self.env_params.max_planets))
         return bc_actions_from_decisions(state, rows, fire, target_env, amount, self.env_params)
 

@@ -114,6 +114,11 @@ def parse_int_list(value: Any) -> tuple[int, ...]:
     return (int(value),)
 
 
+def dropped_relative_feature_dims_from_raw(raw: dict[str, Any] | None) -> tuple[int, ...]:
+    raw = raw or {}
+    return parse_int_list(raw_get(raw, "bc", "dropped_relative_feature_dims", DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS))
+
+
 def parse_learn_result_filter(value: Any) -> str:
     mode = str(value or "all").strip().lower()
     aliases = {
@@ -466,19 +471,29 @@ def row_filter_mask(
     return keep
 
 
-def zero_disabled_relative_np(relative: np.ndarray, *, copy: bool = True) -> np.ndarray:
-    if not DROPPED_RELATIVE_FEATURE_DIMS:
+def zero_disabled_relative_np(
+    relative: np.ndarray,
+    *,
+    copy: bool = True,
+    dropped_relative_feature_dims: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    dims = DROPPED_RELATIVE_FEATURE_DIMS if dropped_relative_feature_dims is None else tuple(dropped_relative_feature_dims)
+    if not dims:
         return relative
     value = np.array(relative, copy=copy)
-    value[..., DROPPED_RELATIVE_FEATURE_DIMS] = 0.0
+    value[..., dims] = 0.0
     return value
 
 
-def zero_disabled_relative_jax(relative: jnp.ndarray) -> jnp.ndarray:
+def zero_disabled_relative_jax(
+    relative: jnp.ndarray,
+    dropped_relative_feature_dims: tuple[int, ...] | None = None,
+) -> jnp.ndarray:
     relative = jnp.asarray(relative)
-    if not DROPPED_RELATIVE_FEATURE_DIMS:
+    dims = DROPPED_RELATIVE_FEATURE_DIMS if dropped_relative_feature_dims is None else tuple(dropped_relative_feature_dims)
+    if not dims:
         return relative
-    return relative.at[..., DROPPED_RELATIVE_FEATURE_DIMS].set(0.0)
+    return relative.at[..., dims].set(0.0)
 
 
 class MLP(nn.Module):
@@ -816,9 +831,17 @@ def jax_normalizer(normalizer: dict[str, np.ndarray]) -> dict[str, jnp.ndarray]:
     return {name: jnp.asarray(value) for name, value in normalizer.items()}
 
 
-def normalize_batch(batch: FeatureRowBatch, norm: dict[str, jnp.ndarray]) -> FeatureRowBatch:
+def normalize_batch(
+    batch: FeatureRowBatch,
+    norm: dict[str, jnp.ndarray],
+    *,
+    dropped_relative_feature_dims: tuple[int, ...] | None = None,
+) -> FeatureRowBatch:
     planet = (batch.planet - norm["planet_mean"]) / jnp.maximum(norm["planet_std"], 1e-6)
-    relative_raw = zero_disabled_relative_jax(batch.relative)
+    relative_raw = zero_disabled_relative_jax(
+        batch.relative,
+        dropped_relative_feature_dims=dropped_relative_feature_dims,
+    )
     relative = (relative_raw - norm["relative_mean"]) / jnp.maximum(norm["relative_std"], 1e-6)
     relative = jnp.where(batch.candidate_mask[..., None], relative, 0.0)
     global_features = (batch.global_features - norm["global_mean"]) / jnp.maximum(norm["global_std"], 1e-6)
@@ -1336,6 +1359,7 @@ def make_online_eval_agent(model, train_state, normalizer: dict[str, jnp.ndarray
         env_params=env_params,
         feature_params=feature_params,
         ship_bucket_count=ship_bucket_count,
+        dropped_relative_feature_dims=dropped_relative_feature_dims_from_raw(raw_cfg),
     )
 
 

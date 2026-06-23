@@ -4,7 +4,7 @@
 #   python -m jax_agent.train_bc_jax --config cfg_jax_BC_4090.yaml
 
 seed: 42
-run_name: "bc_feature_rows_top10_fire_lt_0p1"
+run_name: "bc_top5_win&lose"
 save_dir: /mnt/kaggle/bc_runs
 
 env:
@@ -50,7 +50,7 @@ eval:
 
 bc:
   # /mnt/kaggle/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained/bc_feature_rows_*.npz
-  dataset_glob: /mnt/kaggle/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained/bc_feature_rows_*.npz
+  dataset_glob: /mnt/kaggle/BC_data/selected5_all_games_player0_view/bc_feature_rows_*.npz
   max_steps: 200000
   batch_size: 4096
   shuffle_shards: true
@@ -63,14 +63,14 @@ bc:
   lr: 3.0e-4
   weight_decay: 0.0
   val_fraction: 0.1
-  noop_keep_ratio: 0.25
-  dropped_relative_feature_dims: []
+  noop_keep_ratio: 0.1
+  dropped_relative_feature_dims: [7]
   noop_weight: 1.0
   fire_weight: 1.0
   target_weight: 1.0
   amount_weight: 0.5
   winner_fire_rate_filter:
-    enabled: true
+    enabled: false
     min_rate: 0.0
     max_rate: 0.1
     min_rows: 100000

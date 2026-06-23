@@ -57,6 +57,7 @@ TRAIN_ARRAY_KEYS = (
 )
 FILTER_META_KEYS = (
     "meta__winner_name",
+    "meta__learn_player_name",
     "meta__episode_id",
 )
 NORMALIZER_ARRAY_KEYS = (
@@ -108,6 +109,25 @@ def parse_int_list(value: Any) -> tuple[int, ...]:
     if isinstance(value, (list, tuple)):
         return tuple(int(item) for item in value)
     return (int(value),)
+
+
+def parse_learn_result_filter(value: Any) -> str:
+    mode = str(value or "all").strip().lower()
+    aliases = {
+        "": "all",
+        "both": "all",
+        "win": "winner",
+        "wins": "winner",
+        "won": "winner",
+        "loss": "loser",
+        "lose": "loser",
+        "lost": "loser",
+        "losses": "loser",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"all", "winner", "loser"}:
+        raise ValueError(f"bc.learn_result_filter must be one of all/winner/loser, got {value!r}")
+    return mode
 
 
 def setup_wandb(raw_cfg: dict[str, Any], *, run_name: str, save_dir: Path) -> bool:
@@ -237,8 +257,12 @@ def unique_keys(keys: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(keys))
 
 
-def filter_load_keys(base_keys: tuple[str, ...], allowed_winners: frozenset[str] | None) -> tuple[str, ...]:
-    if allowed_winners is None:
+def filter_load_keys(
+    base_keys: tuple[str, ...],
+    allowed_winners: frozenset[str] | None,
+    learn_result_filter: str = "all",
+) -> tuple[str, ...]:
+    if allowed_winners is None and learn_result_filter == "all":
         return base_keys
     return unique_keys(base_keys + FILTER_META_KEYS)
 
@@ -410,14 +434,30 @@ def build_allowed_winners(
     return frozenset(allowed), summary
 
 
-def row_filter_mask(data: Mapping[str, np.ndarray], allowed_winners: frozenset[str] | None) -> np.ndarray:
-    if allowed_winners is None:
-        first = next(iter(data.values()))
-        rows = int(first.shape[0])
-        return np.ones((rows,), dtype=bool)
-    if "meta__winner_name" not in data:
-        raise KeyError("winner fire-rate filtering requires meta__winner_name in BC shards")
-    return np.isin(data["meta__winner_name"].astype(str), list(allowed_winners))
+def row_filter_mask(
+    data: Mapping[str, np.ndarray],
+    allowed_winners: frozenset[str] | None,
+    learn_result_filter: str = "all",
+) -> np.ndarray:
+    first = next(iter(data.values()))
+    rows = int(first.shape[0])
+    keep = np.ones((rows,), dtype=bool)
+    if allowed_winners is not None:
+        if "meta__winner_name" not in data:
+            raise KeyError("winner fire-rate filtering requires meta__winner_name in BC shards")
+        keep &= np.isin(data["meta__winner_name"].astype(str), list(allowed_winners))
+    if learn_result_filter != "all":
+        missing = [name for name in ("meta__learn_player_name", "meta__winner_name") if name not in data]
+        if missing:
+            raise KeyError(f"bc.learn_result_filter={learn_result_filter!r} requires metadata keys: {missing}")
+        is_learn_winner = data["meta__learn_player_name"].astype(str) == data["meta__winner_name"].astype(str)
+        if learn_result_filter == "winner":
+            keep &= is_learn_winner
+        elif learn_result_filter == "loser":
+            keep &= ~is_learn_winner
+        else:
+            raise ValueError(f"unsupported learn_result_filter: {learn_result_filter!r}")
+    return keep
 
 
 def zero_disabled_relative_np(relative: np.ndarray, *, copy: bool = True) -> np.ndarray:
@@ -627,6 +667,7 @@ def compute_normalizer(
     report_every: int = 100,
     use_wandb: bool = False,
     allowed_winners: frozenset[str] | None = None,
+    learn_result_filter: str = "all",
 ) -> dict[str, np.ndarray]:
     stats = zeros_stats()
     start = time.time()
@@ -635,9 +676,9 @@ def compute_normalizer(
     print(f"normalizer: start shards={total}", flush=True)
     log_wandb(use_wandb, {"normalizer/total_shards": total, "normalizer/shards_done": 0}, step=0)
     for i, path in enumerate(paths, start=1):
-        keys = filter_load_keys(NORMALIZER_ARRAY_KEYS, allowed_winners)
+        keys = filter_load_keys(NORMALIZER_ARRAY_KEYS, allowed_winners, learn_result_filter)
         data = load_shard_arrays(path, keys)
-        keep = row_filter_mask(data, allowed_winners)
+        keep = row_filter_mask(data, allowed_winners, learn_result_filter)
         if keep.any():
             rows_kept += int(keep.sum())
             accumulate_stats(stats, {name: data[name][keep] for name in NORMALIZER_ARRAY_KEYS})
@@ -871,18 +912,19 @@ def epoch_indices(
     noop_keep_ratio: float,
     max_rows_per_shard: int | None,
     allowed_winners: frozenset[str] | None = None,
+    learn_result_filter: str = "all",
     shuffle: bool | None = None,
 ) -> np.ndarray:
     if shuffle is None:
         shuffle = train
     rows = int(data["label__fire"].shape[0])
-    keep = row_filter_mask(data, allowed_winners)
+    keep = row_filter_mask(data, allowed_winners, learn_result_filter)
     if train and noop_keep_ratio < 1.0:
         fire = data["label__fire"].astype(bool)
         keep_noop = rng.random(rows) < float(noop_keep_ratio)
         keep = keep & (fire | keep_noop)
         if not keep.any():
-            keep = row_filter_mask(data, allowed_winners)
+            keep = row_filter_mask(data, allowed_winners, learn_result_filter)
     idx = np.flatnonzero(keep)
     if shuffle:
         rng.shuffle(idx)
@@ -919,6 +961,7 @@ def train_batch_stream(
     noop_keep_ratio: float,
     max_rows_per_shard: int | None,
     allowed_winners: frozenset[str] | None = None,
+    learn_result_filter: str = "all",
     initial_completed_passes: int = 0,
     shuffle_shards: bool = True,
     shuffle_buffer_rows: int = 0,
@@ -955,7 +998,7 @@ def train_batch_stream(
             path = pass_paths[path_cursor]
             path_cursor += 1
             attempts += 1
-            data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
+            data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners, learn_result_filter))
             order = epoch_indices(
                 data,
                 rng,
@@ -963,6 +1006,7 @@ def train_batch_stream(
                 noop_keep_ratio=noop_keep_ratio,
                 max_rows_per_shard=max_rows_per_shard,
                 allowed_winners=allowed_winners,
+                learn_result_filter=learn_result_filter,
                 shuffle=True,
             )
             if len(order) > 0:
@@ -1037,6 +1081,7 @@ def run_eval_batches(
     eval_batches: int,
     max_rows_per_shard: int | None,
     allowed_winners: frozenset[str] | None = None,
+    learn_result_filter: str = "all",
 ):
     sums: dict[str, float] = {}
     count = 0
@@ -1046,7 +1091,7 @@ def run_eval_batches(
     while batches < int(eval_batches):
         path = paths[path_index % len(paths)]
         path_index += 1
-        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
+        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners, learn_result_filter))
         order = epoch_indices(
             data,
             rng,
@@ -1054,6 +1099,7 @@ def run_eval_batches(
             noop_keep_ratio=1.0,
             max_rows_per_shard=max_rows_per_shard,
             allowed_winners=allowed_winners,
+            learn_result_filter=learn_result_filter,
             shuffle=True,
         )
         if len(order) < batch_size:
@@ -1079,9 +1125,10 @@ def sample_batch_for_init(
     normalizer: dict[str, jnp.ndarray],
     batch_size: int,
     allowed_winners: frozenset[str] | None,
+    learn_result_filter: str = "all",
 ) -> FeatureRowBatch:
     for path in paths:
-        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners))
+        data = load_shard_arrays(path, filter_load_keys(TRAIN_ARRAY_KEYS, allowed_winners, learn_result_filter))
         idx = epoch_indices(
             data,
             np.random.default_rng(0),
@@ -1089,12 +1136,13 @@ def sample_batch_for_init(
             noop_keep_ratio=1.0,
             max_rows_per_shard=None,
             allowed_winners=allowed_winners,
+            learn_result_filter=learn_result_filter,
             shuffle=False,
         )
         if len(idx) > 0:
             sample_idx = idx[: min(int(batch_size), len(idx))]
             return normalize_batch(batch_from_arrays(data, sample_idx), normalizer)
-    raise ValueError("no sample rows available after winner fire-rate filtering")
+    raise ValueError("no sample rows available after BC row filtering")
 
 
 def load_checkpoint_payload(path: Path | None) -> dict[str, Any] | None:
@@ -1386,6 +1434,8 @@ def main() -> None:
     target_num_heads = int(raw_get(raw_cfg, "model", "target_num_heads", 8))
     weight_decay = float(raw_get(raw_cfg, "bc", "weight_decay", 0.0))
     noop_keep_ratio = float(raw_get(raw_cfg, "bc", "noop_keep_ratio", 0.25))
+    learn_result_filter = parse_learn_result_filter(raw_get(raw_cfg, "bc", "learn_result_filter", "all"))
+    bc_cfg["learn_result_filter"] = learn_result_filter
     weights = {
         "noop_weight": float(raw_get(raw_cfg, "bc", "noop_weight", 1.0)),
         "fire_weight": float(raw_get(raw_cfg, "bc", "fire_weight", 1.0)),
@@ -1471,7 +1521,12 @@ def main() -> None:
         normalizer_np = (
             identity_normalizer()
             if not normalize_enabled
-            else compute_normalizer(normalizer_paths, use_wandb=use_wandb, allowed_winners=allowed_winners)
+            else compute_normalizer(
+                normalizer_paths,
+                use_wandb=use_wandb,
+                allowed_winners=allowed_winners,
+                learn_result_filter=learn_result_filter,
+            )
         )
         if not normalize_enabled:
             print("normalizer: disabled; using identity normalizer", flush=True)
@@ -1482,6 +1537,7 @@ def main() -> None:
         f"max_steps={max_steps} batch={batch_size} eval_batches={eval_batches} "
         f"shuffle_shards={shuffle_shards} shuffle_buffer_rows={shuffle_buffer_rows} "
         f"prefetch_batches={prefetch_batches} "
+        f"learn_result_filter={learn_result_filter} "
         f"dropped_relative_dims={list(DROPPED_RELATIVE_FEATURE_DIMS)} "
         f"norm_counts={normalizer_np['counts'].tolist()}",
         flush=True,
@@ -1493,7 +1549,13 @@ def main() -> None:
             flush=True,
         )
 
-    sample_batch = sample_batch_for_init(train_paths, normalizer, batch_size, allowed_winners)
+    sample_batch = sample_batch_for_init(
+        train_paths,
+        normalizer,
+        batch_size,
+        allowed_winners,
+        learn_result_filter=learn_result_filter,
+    )
 
     ship_bucket_count = int(sample_batch.amount_mask.shape[-1])
     model = FeatureRowBCPolicy(
@@ -1547,6 +1609,7 @@ def main() -> None:
         noop_keep_ratio,
         args.max_rows_per_shard,
         allowed_winners=allowed_winners,
+        learn_result_filter=learn_result_filter,
         initial_completed_passes=completed_passes,
         shuffle_shards=shuffle_shards,
         shuffle_buffer_rows=shuffle_buffer_rows,
@@ -1595,6 +1658,7 @@ def main() -> None:
                 eval_batches,
                 args.max_rows_per_shard,
                 allowed_winners=allowed_winners,
+                learn_result_filter=learn_result_filter,
             )
             metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
             improved = metrics["val_loss"] < best_val

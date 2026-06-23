@@ -27,7 +27,7 @@ import numpy as np
 import onnx
 
 from .train_bc_jax import (
-    BUGGY_RELATIVE_FEATURE_DIMS,
+    DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS,
     FeatureRowBCPolicy,
     FeatureRowBatch,
     identity_normalizer,
@@ -44,6 +44,14 @@ INPUT_NAMES = (
     "selected_targets",
 )
 OUTPUT_NAMES = ("fire_logits", "target_logits", "amount_logits")
+GREEDY_INPUT_NAMES = (
+    "planet",
+    "relative",
+    "global_features",
+    "candidate_mask",
+    "map_features",
+)
+GREEDY_OUTPUT_NAMES = ("fire_logits", "target_logits", "amount_logits", "greedy_target")
 
 
 def _raw_get(raw: dict[str, Any], section: str, key: str, default: Any) -> Any:
@@ -81,6 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planet-dim", type=int, default=28)
     parser.add_argument("--relative-dim", type=int, default=22)
     parser.add_argument("--global-dim", type=int, default=11)
+    parser.add_argument(
+        "--greedy-single-pass",
+        action="store_true",
+        help="Export a deterministic inference graph that chooses target argmax inside ONNX and returns amount logits in one pass.",
+    )
     return parser.parse_args()
 
 
@@ -105,9 +118,18 @@ def export_checkpoint(
     planet_dim: int = 28,
     relative_dim: int = 22,
     global_dim: int = 11,
+    greedy_single_pass: bool = False,
 ) -> Path:
     payload = load_payload(checkpoint)
     raw = payload.get("raw_config") or payload.get("config") or {}
+    dropped_relative_feature_dims = _raw_get(
+        raw,
+        "bc",
+        "dropped_relative_feature_dims",
+        DEFAULT_DROPPED_RELATIVE_FEATURE_DIMS,
+    )
+    if dropped_relative_feature_dims is None:
+        dropped_relative_feature_dims = ()
     max_planets = int(_raw_get(raw, "env", "max_planets", 45))
     candidate_count = max_planets + 1
     ship_bucket_count = int(_raw_get(raw, "env", "ship_bucket_count", 8))
@@ -126,14 +148,13 @@ def export_checkpoint(
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
     normalizer = jax_normalizer(payload.get("normalizer") or identity_normalizer())
 
-    def forward(
+    def make_batch(
         planet: jnp.ndarray,
         relative: jnp.ndarray,
         global_features: jnp.ndarray,
         candidate_mask: jnp.ndarray,
         map_features: jnp.ndarray,
-        selected_targets: jnp.ndarray,
-    ):
+    ) -> FeatureRowBatch:
         rows = planet.shape[0]
         dummy_bool = jnp.zeros((rows,), dtype=jnp.bool_)
         dummy_i32 = jnp.zeros((rows,), dtype=jnp.int32)
@@ -152,7 +173,17 @@ def export_checkpoint(
             target=dummy_i32,
             amount=dummy_i32,
         )
-        batch = normalize_batch_for_onnx(batch, normalizer)
+        return normalize_batch_for_onnx(batch, normalizer)
+
+    def forward(
+        planet: jnp.ndarray,
+        relative: jnp.ndarray,
+        global_features: jnp.ndarray,
+        candidate_mask: jnp.ndarray,
+        map_features: jnp.ndarray,
+        selected_targets: jnp.ndarray,
+    ):
+        batch = make_batch(planet, relative, global_features, candidate_mask, map_features)
         out = model.apply(
             {"params": params},
             batch.planet,
@@ -163,6 +194,24 @@ def export_checkpoint(
             selected_targets,
         )
         return out.fire_logits, out.target_logits, out.amount_logits
+
+    def greedy_forward(
+        planet: jnp.ndarray,
+        relative: jnp.ndarray,
+        global_features: jnp.ndarray,
+        candidate_mask: jnp.ndarray,
+        map_features: jnp.ndarray,
+    ):
+        batch = make_batch(planet, relative, global_features, candidate_mask, map_features)
+        return model.apply(
+            {"params": params},
+            batch.planet,
+            batch.relative,
+            batch.global_features,
+            batch.candidate_mask,
+            batch.map_features,
+            method=model.greedy_single_pass,
+        )
 
     model_name = name or checkpoint.stem
     model_dir = out_dir / model_name
@@ -182,11 +231,14 @@ def export_checkpoint(
         _shape_dtype((max_planets, map_channels, map_grid_size, map_grid_size), jnp.float32),
         _shape_dtype((max_planets,), jnp.int32),
     ]
+    export_inputs = inputs[:-1] if greedy_single_pass else inputs
+    export_input_names = GREEDY_INPUT_NAMES if greedy_single_pass else INPUT_NAMES
+    export_output_names = GREEDY_OUTPUT_NAMES if greedy_single_pass else OUTPUT_NAMES
     jax2onnx.to_onnx(
-        forward,
-        inputs,
-        input_names=INPUT_NAMES,
-        output_names=OUTPUT_NAMES,
+        greedy_forward if greedy_single_pass else forward,
+        export_inputs,
+        input_names=export_input_names,
+        output_names=export_output_names,
         model_name="feature_row_bc_policy",
         opset=int(opset),
         return_mode="file",
@@ -205,8 +257,9 @@ def export_checkpoint(
         "onnx_file": onnx_path.name,
         "external_data_file": data_path.name if data_path.exists() else None,
         "opset": int(opset),
-        "input_names": list(INPUT_NAMES),
-        "output_names": list(OUTPUT_NAMES),
+        "input_names": list(export_input_names),
+        "output_names": list(export_output_names),
+        "greedy_single_pass": bool(greedy_single_pass),
         "max_planets": max_planets,
         "candidate_count": candidate_count,
         "ship_bucket_count": ship_bucket_count,
@@ -219,7 +272,7 @@ def export_checkpoint(
         "global_dim": int(global_dim),
         "map_channels": int(map_channels),
         "map_grid_size": int(map_grid_size),
-        "dropped_relative_feature_dims": list(BUGGY_RELATIVE_FEATURE_DIMS),
+        "dropped_relative_feature_dims": [int(x) for x in dropped_relative_feature_dims],
         "raw_config": raw,
         "metrics": payload.get("metrics") or {},
     }
@@ -251,6 +304,7 @@ def main() -> None:
         planet_dim=args.planet_dim,
         relative_dim=args.relative_dim,
         global_dim=args.global_dim,
+        greedy_single_pass=args.greedy_single_pass,
     )
     print(f"exported {path}", flush=True)
 

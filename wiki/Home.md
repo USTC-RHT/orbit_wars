@@ -10,6 +10,7 @@
 | [Behavioral Cloning Training Notes](BC-Training-Notes.md) | Data quality, labels, losses, and BC pitfalls |
 | [Kaggle BC Discussion Translation](BC-Discussion-Translation.md) | Chinese translation of the BC / imitation-learning discussion |
 | [Imitation Learning Plan](Imitation-Learning-Plan.md) | Implementation path from replay zips to BC checkpoint and PPO warm start |
+| [Kaggle Submission Packaging Notes](Kaggle-Submission-Packaging-Notes.md) | Vendored ONNX Runtime requirements for Kaggle tarballs |
 
 ## Repository Layout
 

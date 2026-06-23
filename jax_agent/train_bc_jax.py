@@ -577,6 +577,80 @@ class FeatureRowBCPolicy(nn.Module):
         amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
         return BCOutput(fire_logits, target_logits, amount_logits)
 
+    @nn.compact
+    def greedy_single_pass(
+        self,
+        planet: jnp.ndarray,
+        relative: jnp.ndarray,
+        global_features: jnp.ndarray,
+        candidate_mask: jnp.ndarray,
+        map_features: jnp.ndarray,
+    ):
+        planet_h = MLP(self.hidden_size)(planet)
+        relative_h = MLP(self.hidden_size)(relative)
+        global_h = MLP(self.hidden_size)(global_features)
+
+        valid = candidate_mask.astype(jnp.float32)
+        has_valid = candidate_mask.any(axis=1, keepdims=True)
+        masked = jnp.where(candidate_mask[..., None], relative_h, jnp.finfo(jnp.float32).min)
+        max_pool = jnp.where(has_valid, masked.max(axis=1), 0.0)
+        mean_pool = (relative_h * valid[..., None]).sum(axis=1) / jnp.maximum(valid.sum(axis=1, keepdims=True), 1.0)
+
+        context_parts = [planet_h, global_h, 0.5 * (max_pool + mean_pool)]
+        if self.use_cnn:
+            x = jnp.transpose(map_features, (0, 2, 3, 1))
+            x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
+            x = nn.relu(nn.Conv(32, (3, 3), padding="SAME")(x))
+            x = nn.relu(nn.Conv(16, (3, 3), padding="SAME")(x))
+            x = x.mean(axis=(1, 2))
+            context_parts.append(nn.relu(nn.Dense(16)(x)))
+
+        context_h = jnp.concatenate(context_parts, axis=-1)
+
+        target_head = str(self.target_head or "dot").lower().replace("-", "_")
+        if target_head in {"cross_attention", "attention", "mh_attention", "multihead_attention"}:
+            heads = max(int(self.target_num_heads), 1)
+            head_dim = max((int(self.hidden_size) + heads - 1) // heads, 1)
+            attn_size = heads * head_dim
+            q = nn.relu(nn.Dense(self.hidden_size, name="target_query_mlp_0")(context_h))
+            q = nn.Dense(attn_size, name="target_query")(q).reshape((context_h.shape[0], heads, head_dim))
+            k = nn.Dense(attn_size, name="target_key")(relative_h).reshape((relative_h.shape[0], relative_h.shape[1], heads, head_dim))
+            v = nn.Dense(attn_size, name="target_value")(relative_h).reshape((relative_h.shape[0], relative_h.shape[1], heads, head_dim))
+            attn_logits = jnp.einsum("bhd,bchd->bhc", q, k) / jnp.sqrt(float(head_dim))
+            masked_attn_logits = jnp.where(candidate_mask[:, None, :], attn_logits, NEG_INF)
+            attn_weights = jax.nn.softmax(masked_attn_logits, axis=-1)
+            attended = jnp.einsum("bhc,bchd->bhd", attn_weights, v).reshape((context_h.shape[0], attn_size))
+            attended = nn.relu(nn.Dense(self.hidden_size, name="target_attended_proj")(attended))
+            head_logits = jnp.swapaxes(masked_attn_logits, 1, 2)
+            head_mix = nn.Dense(1, use_bias=False, name="target_head_mix")(head_logits).squeeze(-1)
+            pair_context = nn.relu(nn.Dense(self.hidden_size, name="target_pair_context")(jnp.concatenate([context_h, attended], axis=-1)))
+            pair_context = jnp.broadcast_to(pair_context[:, None, :], relative_h.shape)
+            pair = jnp.concatenate([relative_h, pair_context, relative_h * pair_context], axis=-1)
+            pair_logits = nn.Dense(1, name="target_pair_score")(
+                nn.relu(nn.Dense(self.hidden_size, name="target_pair_mlp")(pair))
+            ).squeeze(-1)
+            target_logits = head_mix + pair_logits
+        else:
+            q = nn.Dense(self.hidden_size)(context_h)
+            q = nn.relu(q)
+            q = nn.Dense(self.hidden_size)(q)
+            q = q / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(q), axis=-1, keepdims=True), 1e-12))
+            keys = nn.Dense(self.hidden_size)(relative_h)
+            keys = keys / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(keys), axis=-1, keepdims=True), 1e-12))
+            target_logits = jnp.einsum("bh,bch->bc", q, keys) / jnp.sqrt(float(self.hidden_size))
+        target_logits = jnp.where(candidate_mask, target_logits, NEG_INF)
+
+        fire_h = nn.relu(nn.Dense(self.hidden_size)(context_h))
+        fire_logits = nn.Dense(1)(fire_h).squeeze(-1)
+
+        target_for_amount = jnp.argmax(safe_logits(target_logits, candidate_mask), axis=-1).astype(jnp.int32)
+        row = jnp.arange(target_for_amount.shape[0])
+        selected_h = relative_h[row, target_for_amount]
+        amount_h = jnp.concatenate([context_h, selected_h], axis=-1)
+        amount_h = nn.relu(nn.Dense(self.hidden_size)(amount_h))
+        amount_logits = nn.Dense(self.ship_bucket_count)(amount_h)
+        return fire_logits, target_logits, amount_logits, target_for_amount
+
 
 def safe_logits(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     masked = jnp.where(mask, logits, NEG_INF)

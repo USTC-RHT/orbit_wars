@@ -6,9 +6,10 @@ set -euo pipefail
 #
 # This avoids recomputing expensive fight features after state-level mirroring.
 
-REPO_DIR="${REPO_DIR:-/home/dministrator/kaggle/rl-agent}"
-CONDA_EXE="${CONDA_EXE:-/home/dministrator/miniconda/bin/conda}"
-CONDA_ENV="${CONDA_ENV:-orbit-wars-lab}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 RAW_ROOT="${RAW_ROOT:-/mnt/kaggle/BC_data/raw}"
 MANIFEST="${MANIFEST:-}"
@@ -46,8 +47,8 @@ if [[ ! -d "$REPO_DIR" ]]; then
   echo "missing REPO_DIR: $REPO_DIR" >&2
   exit 1
 fi
-if [[ ! -f "$CONDA_EXE" ]]; then
-  echo "missing CONDA_EXE: $CONDA_EXE" >&2
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "missing PYTHON_BIN on PATH: $PYTHON_BIN" >&2
   exit 1
 fi
 if [[ ! -f "$MANIFEST" ]]; then
@@ -72,7 +73,7 @@ fi
 
 cat > "${LOG_FILE}.cmd" <<EOF
 REPO_DIR=$REPO_DIR
-CONDA_ENV=$CONDA_ENV
+PYTHON_BIN=$PYTHON_BIN
 RAW_ROOT=$RAW_ROOT
 MANIFEST=$MANIFEST
 ZIP_DIR=$ZIP_DIR
@@ -86,11 +87,9 @@ EOF
 
 nohup bash -lc "
 set -euo pipefail
-eval \"\$($CONDA_EXE shell.bash hook)\"
-conda activate \"$CONDA_ENV\"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 cd \"$REPO_DIR\"
-python -m jax_agent.build_bc_player0_view_feature_rows_from_zips \\
+\"$PYTHON_BIN\" -m jax_agent.build_bc_player0_view_feature_rows_from_zips \\
   --manifest \"$MANIFEST\" \\
   --zip-dir \"$ZIP_DIR\" \\
   --output-dir \"$OUTPUT_DIR\" \\

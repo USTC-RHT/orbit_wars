@@ -55,10 +55,13 @@ TRAIN_ARRAY_KEYS = (
     "label__target",
     "label__amount",
 )
-FILTER_META_KEYS = (
+WINNER_FILTER_META_KEYS = (
+    "meta__winner_name",
+    "meta__episode_id",
+)
+LEARN_RESULT_META_KEYS = (
     "meta__winner_name",
     "meta__learn_player_name",
-    "meta__episode_id",
 )
 NORMALIZER_ARRAY_KEYS = (
     "feature__fight_planet",
@@ -262,9 +265,12 @@ def filter_load_keys(
     allowed_winners: frozenset[str] | None,
     learn_result_filter: str = "all",
 ) -> tuple[str, ...]:
-    if allowed_winners is None and learn_result_filter == "all":
-        return base_keys
-    return unique_keys(base_keys + FILTER_META_KEYS)
+    keys = base_keys
+    if allowed_winners is not None:
+        keys = unique_keys(keys + WINNER_FILTER_META_KEYS)
+    if learn_result_filter != "all":
+        keys = unique_keys(keys + LEARN_RESULT_META_KEYS)
+    return keys
 
 
 def winner_fire_rate_filter_config(raw_cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:

@@ -1,0 +1,111 @@
+{
+  "delta_new_minus_old": {
+    "episodes": 0,
+    "fire": 0,
+    "fire_rate": 0.0,
+    "rows": 0
+  },
+  "new_filter": "meta__learn_player_name == meta__winner_name in selected5",
+  "new_path": "/mnt/kfs-ssd/raohaotian/rl_3/BC_data/selected5_all_games_player0_view",
+  "new_selected5_winner": {
+    "by_player": {
+      "Ender": {
+        "episodes": 650,
+        "fire": 76226,
+        "fire_rate": 0.03729796487162525,
+        "noop": 1967478,
+        "rows": 2043704
+      },
+      "Isaiah @ Tufa Labs": {
+        "episodes": 2018,
+        "fire": 743660,
+        "fire_rate": 0.06759682058791582,
+        "noop": 10257745,
+        "rows": 11001405
+      },
+      "Jake Will": {
+        "episodes": 2016,
+        "fire": 233093,
+        "fire_rate": 0.04501045737675193,
+        "noop": 4945548,
+        "rows": 5178641
+      },
+      "TonyK": {
+        "episodes": 1332,
+        "fire": 305729,
+        "fire_rate": 0.0447492464924134,
+        "noop": 6526319,
+        "rows": 6832048
+      },
+      "Vadasz & Ascalon": {
+        "episodes": 314,
+        "fire": 59279,
+        "fire_rate": 0.07821779696016869,
+        "noop": 698592,
+        "rows": 757871
+      }
+    },
+    "total": {
+      "episodes": 6330,
+      "fire": 1417987,
+      "fire_rate": 0.05493163331411741,
+      "noop": 24395682,
+      "rows": 25813669
+    }
+  },
+  "old_filter": "meta__winner_name in selected5",
+  "old_path": "/mnt/kfs-ssd/raohaotian/rl_3/BC_data/official_2p_winners_fight_full_v2_player0_view_eta_retained",
+  "old_winner_filtered": {
+    "by_player": {
+      "Ender": {
+        "episodes": 650,
+        "fire": 76226,
+        "fire_rate": 0.03729796487162525,
+        "noop": 1967478,
+        "rows": 2043704
+      },
+      "Isaiah @ Tufa Labs": {
+        "episodes": 2018,
+        "fire": 743660,
+        "fire_rate": 0.06759682058791582,
+        "noop": 10257745,
+        "rows": 11001405
+      },
+      "Jake Will": {
+        "episodes": 2016,
+        "fire": 233093,
+        "fire_rate": 0.04501045737675193,
+        "noop": 4945548,
+        "rows": 5178641
+      },
+      "TonyK": {
+        "episodes": 1332,
+        "fire": 305729,
+        "fire_rate": 0.0447492464924134,
+        "noop": 6526319,
+        "rows": 6832048
+      },
+      "Vadasz & Ascalon": {
+        "episodes": 314,
+        "fire": 59279,
+        "fire_rate": 0.07821779696016869,
+        "noop": 698592,
+        "rows": 757871
+      }
+    },
+    "total": {
+      "episodes": 6330,
+      "fire": 1417987,
+      "fire_rate": 0.05493163331411741,
+      "noop": 24395682,
+      "rows": 25813669
+    }
+  },
+  "players": [
+    "Isaiah @ Tufa Labs",
+    "Jake Will",
+    "Ender",
+    "TonyK",
+    "Vadasz & Ascalon"
+  ]
+}

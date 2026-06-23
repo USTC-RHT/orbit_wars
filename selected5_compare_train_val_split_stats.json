@@ -1,0 +1,172 @@
+{
+  "delta_train_new_minus_old": {
+    "fire": -44951,
+    "fire_rate": -3.032043458812278e-05,
+    "noop": -758708,
+    "rows": -803659
+  },
+  "delta_val_new_minus_old": {
+    "fire": 44951,
+    "fire_rate": 0.0011358089330983298,
+    "noop": 758708,
+    "rows": 803659
+  },
+  "new_files": 1037,
+  "new_train": {
+    "by_player": {
+      "Ender": {
+        "fire": 58867,
+        "fire_rate": 0.03539298922163321,
+        "noop": 1604372,
+        "rows": 1663239
+      },
+      "Isaiah @ Tufa Labs": {
+        "fire": 699002,
+        "fire_rate": 0.06935990024904003,
+        "noop": 9378896,
+        "rows": 10077898
+      },
+      "Jake Will": {
+        "fire": 209584,
+        "fire_rate": 0.04364301205584483,
+        "noop": 4592651,
+        "rows": 4802235
+      },
+      "TonyK": {
+        "fire": 297040,
+        "fire_rate": 0.04464515190383677,
+        "noop": 6356314,
+        "rows": 6653354
+      },
+      "Vadasz & Ascalon": {
+        "fire": 38784,
+        "fire_rate": 0.07828019319771279,
+        "noop": 456667,
+        "rows": 495451
+      }
+    },
+    "fire": 1303277,
+    "fire_rate": 0.055008748246309316,
+    "noop": 22388900,
+    "rows": 23692177
+  },
+  "new_train_files": 933,
+  "new_val": {
+    "by_player": {
+      "Ender": {
+        "fire": 17359,
+        "fire_rate": 0.04562574744063186,
+        "noop": 363106,
+        "rows": 380465
+      },
+      "Isaiah @ Tufa Labs": {
+        "fire": 44658,
+        "fire_rate": 0.04835696968187572,
+        "noop": 878849,
+        "rows": 923507
+      },
+      "Jake Will": {
+        "fire": 23509,
+        "fire_rate": 0.06245649644267095,
+        "noop": 352897,
+        "rows": 376406
+      },
+      "TonyK": {
+        "fire": 8689,
+        "fire_rate": 0.048625023783674885,
+        "noop": 170005,
+        "rows": 178694
+      },
+      "Vadasz & Ascalon": {
+        "fire": 20495,
+        "fire_rate": 0.07809999237862968,
+        "noop": 241925,
+        "rows": 262420
+      }
+    },
+    "fire": 114710,
+    "fire_rate": 0.05407043722059758,
+    "noop": 2006782,
+    "rows": 2121492
+  },
+  "new_val_files": 104,
+  "old_files": 4618,
+  "old_train": {
+    "by_player": {
+      "Ender": {
+        "fire": 61971,
+        "fire_rate": 0.0357234266266377,
+        "noop": 1672773,
+        "rows": 1734744
+      },
+      "Isaiah @ Tufa Labs": {
+        "fire": 717055,
+        "fire_rate": 0.06863608074200155,
+        "noop": 9730147,
+        "rows": 10447202
+      },
+      "Jake Will": {
+        "fire": 218324,
+        "fire_rate": 0.04415906356668924,
+        "noop": 4725712,
+        "rows": 4944036
+      },
+      "TonyK": {
+        "fire": 299978,
+        "fire_rate": 0.044588392938761524,
+        "noop": 6427737,
+        "rows": 6727715
+      },
+      "Vadasz & Ascalon": {
+        "fire": 50900,
+        "fire_rate": 0.07926632707248742,
+        "noop": 591239,
+        "rows": 642139
+      }
+    },
+    "fire": 1348228,
+    "fire_rate": 0.05503906868089744,
+    "noop": 23147608,
+    "rows": 24495836
+  },
+  "old_train_files": 4156,
+  "old_val": {
+    "by_player": {
+      "Ender": {
+        "fire": 14255,
+        "fire_rate": 0.04613865872604868,
+        "noop": 294705,
+        "rows": 308960
+      },
+      "Isaiah @ Tufa Labs": {
+        "fire": 26605,
+        "fire_rate": 0.048005875103527045,
+        "noop": 527598,
+        "rows": 554203
+      },
+      "Jake Will": {
+        "fire": 14769,
+        "fire_rate": 0.06295262249312675,
+        "noop": 219836,
+        "rows": 234605
+      },
+      "TonyK": {
+        "fire": 5751,
+        "fire_rate": 0.055121581858089005,
+        "noop": 98582,
+        "rows": 104333
+      },
+      "Vadasz & Ascalon": {
+        "fire": 8379,
+        "fire_rate": 0.07240002765008813,
+        "noop": 107353,
+        "rows": 115732
+      }
+    },
+    "fire": 69759,
+    "fire_rate": 0.05293462828749925,
+    "noop": 1248074,
+    "rows": 1317833
+  },
+  "old_val_files": 462
+}

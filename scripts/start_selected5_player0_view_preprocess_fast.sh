@@ -88,8 +88,10 @@ EOF
 nohup bash -lc "
 set -euo pipefail
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export JAX_PLATFORMS=cpu
+export JAX_PLATFORM_NAME=cpu
 cd \"$REPO_DIR\"
-\"$PYTHON_BIN\" -m jax_agent.build_bc_player0_view_feature_rows_from_zips \\
+\"$PYTHON_BIN\" -m jax_agent.preprocessing.build_bc_player0_view_feature_rows_from_zips \\
   --manifest \"$MANIFEST\" \\
   --zip-dir \"$ZIP_DIR\" \\
   --output-dir \"$OUTPUT_DIR\" \\

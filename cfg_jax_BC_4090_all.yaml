@@ -1,7 +1,7 @@
 # Per-planet behavioral cloning config.
 #
 # Launch:
-#   python -m jax_agent.train_bc_jax --config cfg_jax_BC_4090_all.yaml
+#   python -m jax_agent.bc.train_bc_jax --config cfg_jax_BC_4090_all.yaml
 
 seed: 42
 run_name: "bc_top5_all_winlose"

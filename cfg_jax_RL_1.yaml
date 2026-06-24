@@ -1,7 +1,7 @@
 # 4090/4090D 24GB training config for the per-planet ActorCritic actor.
 #
 # Launch:
-#   python -m jax_agent.train_jax --config cfg_jax_RL_1.yaml
+#   python -m jax_agent.rl.train_jax --config cfg_jax_RL_1.yaml
 #
 # Original fixed_pool_with_tgtmask-0526 training config.
 

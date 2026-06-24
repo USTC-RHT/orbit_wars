@@ -124,7 +124,7 @@ Orbit Wars 同一回合的多条 launch 在语义上更像一个集合，但 aut
 
 大佬提到 preprocessing 是把 board 变成 normalized feature rows，并且需要一些 relational info。纯 per-planet 特征很难判断 reachability、谁在争夺、从哪个 source 打哪个 target 更合理。
 
-当前 `features_jax.py` 已经非常适合作为 BC 输入：
+当前 `jax_agent/common/features_jax.py` 已经非常适合作为 BC 输入：
 
 | 特征组 | 对 BC 的价值 |
 |--------|--------------|

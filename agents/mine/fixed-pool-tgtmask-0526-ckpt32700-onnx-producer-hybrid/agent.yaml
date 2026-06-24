@@ -1,5 +1,0 @@
-name: "Fixed Pool TgtMask 0526 Ckpt 32700 ONNX Producer Hybrid"
-description: "2P uses fixed_pool_with_tgtmask-0526_jax ckpt_032700 exported to ONNX; 4P delegates to producer."
-author: "local"
-tags: ["onnx", "reinforcement-learning", "2p", "fixed-pool", "tgtmask", "ckpt32700", "producer-hybrid"]
-disabled: false

@@ -1,0 +1,132 @@
+My Orbit Wars Solution (Jake Will)
+
+Jake Will · 4th place · 3 DAYS AGO
+
+Introduction
+
+Before beginning, I want to thank the organizers for hosting such a wonderful competition. This was a fantastic game and incredibly fun to watch our agents compete and improve throughout. I've learned a tremendous amount about RL in these past few months, and would love to see more of these types of challenges make their way to Kaggle in the future!
+
+Side note Unfortunately, I am not eligible to win prize money from Kaggle competitions, so as long as I remain in the top 10 (🤞), whichever team finishes 11th should be getting a nice surprise.
+
+A Note on AI Agents
+
+I relied heavily on AI agents to build out my solution, and this competition really opened my eyes to just how effective they have become. Still, as other competitors have mentioned in their own writeups, agents were primarily useful as an implementation tool, and generally quite bad at suggesting improvements to the RL pipeline itself (although they did come up with some interesting ideas on the model architecture). And they certainly aren't perfect - I had to deal with some very tricky bugs that got introduced along the way. But still, I was able to iterate much more quickly and test out more ideas than I otherwise would have.
+
+High Level Overview
+
+My solution uses reinforcement learning, trained entirely through self-play against snapshots from prior stages of training. The model itself is only responsible for tactical decision making; all calculations like the exact launch angles were handled by a custom C++ game engine. On each turn, the model outputs the following actions independently for each currently owned planet. All actions were emitted with a single forward pass of the policy network, with no autoregressive structure.
+
+1) A target to launch at, represented as a 44-way categorical distribution across all other planets/comets in the scene. Invalid targets such as unreachable planets or non-existent comets were masked out.
+
+2) A fleet size, chosen from the below 3 options
+
+100% of available ships
+
+"Capture/Defend" - exactly enough ships to guarantee that once the launched fleet lands, we would maintain ownership of the target planet for all future steps, assuming no new fleets are launched.
+
+"Maintain ownership" - the most ships we can send while guaranteeing that we maintain ownership of the current planet, assuming no new fleets are launched.
+
+Calculating b) and c) is deceptively tricky because the final number needs to take into account planet production, incoming fleets, and flight time, and the flight time depends on the exact chosen size. During training, I encountered significant bugs in these calculations multiple times. Just one example of needing to verify the outputs of AI agents.
+
+3) Launch or no launch. I called this the "no-op" head. If no-op was chosen, the planet just did nothing for that turn, and the outputs of (1) and (2) were masked out (didn't contribute to the joint prob for PPO loss).
+
+I started RL training from scratch, and chose to train completely separate models for the 2-player and 4-player variants of the game. My final models for each regime trained for ~4B and ~2B steps respectively, but these numbers are inflated - there were several instances where training plateaued for a while and I needed to make adjustments like lowering the entropy coefficient or learning rate to continue. Starting from scratch with better annealing schedules would likely result in shorter training runs.
+
+Model Architecture
+
+I used a transformer-based actor-critic policy trained via self-play PPO. The model takes in a tokenized game state represented by a sequence of 45 tokens - 40 possible planets, 4 comets, and a single global CLS token. Each token was produced by an encoder that took in all the various relevant features. These tokens then passed through an 8-layer self-attention trunk, then fused with the global summary before outputting the factored action heads. In total, the final model had approximately 7.5M parameters.
+
+Input Features
+
+The policy never sees raw pixels or anything resembling the visual board. Instead, every game state was hand-encoded into a structured set of features, with most of the design effort going into making sure the model had everything it needed to reason about who owns what, what is about to happen, and what a given launch would actually do.
+
+Each of the 45 tokens (40 planets, 4 comets, and the CLS token) carries its own feature vector. For an individual planet, the most important features fall into a few groups:
+
+Self-state — current owner, ship count, production rate, planet type, and full orbital state (position, velocity, orbital radius, and angular phase).
+Combat preview — rather than forcing the model to simulate fleet arrivals itself, I precomputed what would happen to each planet if no new fleets were launched: the predicted future owner, predicted ship count, and the margin by which it flips. This gives the policy a cheap, reliable "what happens if I do nothing" signal.
+Incoming/outgoing fleet summaries — a top-K digest of the fleets heading toward (and launched from) each planet, including owner, size, and arrival time.
+
+On top of the per-token features, two other pieces were especially important:
+
+Pairwise geometry. For every (source, target) pair I provided features like normalized distance, whether the sun blocks the trajectory, predicted arrival step, and relative orbital phase. The target-selection head reads these directly, which is what lets the policy reason about reachability and timing without a spatial backbone like a CNN.
+Resolved launch sizes. Because the action space chooses an intent (e.g. "send exactly enough to capture") rather than a raw number, I fed in a table of the actual ship count each intent would resolve to for every target. This means the policy can see the real cost of every option before committing to one.
+
+Finally, the CLS token aggregates global, game-level context: per-player ship totals, planet counts, production, in-flight fleets, ship-share momentum, an aggression matrix summarizing who has been attacking whom, and a coarse game-phase indicator.
+
+One design decision worth highlighting is that all input features are fully rotationally invariant. This means that rotating the game board by any multiple of 90 degrees produces an exact input to the model, and (assuming we use the argmax of the action heads), will play exactly the same from each corner of the board.
+
+Self-Play Training
+
+I trained separate but virtually identical models for playing the 2-player and 4-player variants of the game. Both were trained using PPO self-play, but I added several additional loss components that I believe helped to stabilize training, especially early on.
+
+The opponent pool
+
+For 2-player games, I maintained frozen checkpoints of the model and had the policy play against the latest checkpoint for almost all games. Towards the very end of training I expanded this slightly to include the most recent 3 checkpoints, but for the most part I did not see any of the issues that typically plague pure self play setups like strategic cycling. The policy's strength improved pretty much monotonically.
+
+For 4-player games I started off with the same approach of always playing against a fixed set of recent checkpoints, but here I did encounter issues where the latest policy performed poorly against certain combos of past checkpoints. In the last few days of the competition, I experimented with a Prioritized Fictitious Self-Play (PFSP) setup, where the policy would train specifically against combos of previous checkpoints that it performed poorly against. The process looked something like this
+
+Select ~200 combos of 3 checkpoints from the previous pool at random
+Run ~50 games of the current policy against each of the above combos (10k games total)
+Select all combos where the policy had a <25% winrate
+Train against those combos using a quadratic weighting system; combos with a 25% win rate get a relative weight of 1, 12.5% win rate gets a weight of 4, etc
+Repeat the above process after training for ~30M steps or so
+
+This process was extremely effective, and I regret not implementing it earlier. I was only able to train my 4p model using this for ~300M steps, but saw a dramatic improvement in 4p strength during this window, with no real sign of plateauing.
+
+Reward signal
+
+The reward was entirely sparse and terminal. In the 2-player games this was a simple zero-sum +1 for a win and −1 for a loss. For 4-player games, I awarded +1 / 0 / -0.5 / -1 for 1st, 2nd, 3rd, and 4th. My reasoning here was that by differentiating between non-1st place positions, the policy would have an easier time picking up general strategies and be more stable against other opponents on the leaderboard.
+
+Launch success auxiliary loss
+
+This was an interesting idea that I had early on in the competition and decided to keep. In order to play OrbitWars effectively, the policy needs to have some internal understanding of whether or not a launch will succeed. During training, as the policy launches fleets that either fail or succeed at capturing their targets, we can use the results of fleet launches as a supervised dataset to train the model to predict the results of launching on any given turn for each available size. The success critera for a launch was simply "when the launch landed, did we flip ownership of the target". Launches that landed on already owned planets or didn't land by the end of the rollout were just excluded from training.
+
+I incorporated this as a binary cross entropy loss term in conjunction with the PPO and other losses. I ran some small A/B tests demonstrating that the model improved more quickly during the early stages of training with this additional supervised signal, but it may not have had any real impact on the strength of the final policy.
+
+Bias towars no-op
+
+A key aspect of Orbit Wars is that most of the time, the optimal move for a planet is to do nothing and save up ships. To bias the policy towards this, I added a KL loss term on the no-op head that pulled each planet towards a 10% launch rate on average. I calculated this for each planet slot, which allows for variation across turns; some turns could launch with 100% probability without incurring a loss, as long as there were other lower launch probability turns to average out to 10%.
+
+Was this additional loss term necessary? Probably not, but I found that this anchor allowed the policy to improve much more rapidly early in training, and prevent "spray and pray" type strategies from developing.
+
+Per-player value head for 4-player
+
+In the 2-player version of the game, having a single value head is sufficient because the game is zero-sum. In 4-player games, however, that property doesn't hold, and having distinct value heads for each player can help the policy understand concepts like who is currently winning or who has essentially lost. This was a relatively minor change - all the PPO machinery still used the policy's value head; the other 3 heads were just there to provide some guidance signal.
+
+Surrender
+
+OrbitWars games are often decided long before the game actually finishes. To exclude turns where the game is just being "cleaned up", I implemented a surrender mechanism where the game will end once both players' value predictions exceed some value V (one negative, one positive). I used an adaptive system to choose V - during training, 5% of holdout games would run to completion, from which we could estimate a false positive rate. I targetted a 99% correctness rate - V moved up or down based on how correct the predictions were. This mechanism helped to cut out between 60% to 70% of turns, significantly improving sample efficiency during training. I only implemented surrender for 2p games - 4p games are trickier to get right and generally aren't "decided" until much deeper into the game.
+
+Hyperparameters
+
+The settings below are for the 2-player agent. The 4-player config was virtually identical aside from the opponent-pool and reward differences described above.
+
+Setting	Value
+Rollout length	64
+Minibatch size	4096
+PPO batch size	~400k
+Epochs per update	2
+Learning rate	1e-4 (to start, adjusted down several times)
+Discount γ	0.995
+GAE λ	0.90
+Entropy (per-head)	0.002 (to start, adjusted down several times)
+Target no-op	0.9 (10% average launch rate)
+No-op KL coef	0.5 -> 0.1 (over 500M steps)
+Launch success BCE coef	0.2
+Surrender V threshold	Adaptive, no lower than 0.25. Settled between 0.4 and 0.5
+Hardware/Compute
+
+I ran training on a wide variety of different machines, ranging from my personal workstation (RTX 3090 + 16-core Ryzen 9) for testing all the way up to a large rented Vast.ai instance with 8x5090 and 384 cores. Using 8x5090 GPUs was overkill - because the model is relatively small, CPUs were the bottleneck. On the larger machines I was able to train at between 15k to 20k steps per second, including both rollout and PPO update time.
+
+What I Would Do Differently
+Larger model
+
+This is obvious now seeing Isaiah's solution, but I already suspected that I was bumping up against the capacity of my 7.5M param model towards the end of training. Training plateaued at the end - for 2-player games, a checkpoint from 2B steps is only marginally worse than at 4B. Interestingly, because we were primarily bottlenecked by CPU compute, training a larger model didn't really impact the throughput of training - I did some quick experiments with a 20M param model and still achieved close to 15k to 20k SPS, but chose to just continue with my existing model rather than starting from scratch.
+
+Longer PFSP Training for 4p
+
+I was only able to train my 4p model using the PFSP setup for a few hundred million steps. I'm confident that continuing down this path would have lead to a significantly stronger model.
+
+Conclusion
+
+This has been an amazing competition and I've learned so much throughout the process. I first became interested in RL nearly 5 years ago after reading @pressman1's solution to the original Lux AI competition, but this is the first time I've had a chance to experiment with it to this extent. It's incredible to see how far things have come, with so many of the top submissions today being RL based. I hope to have the chance to compete with you all again in a future competition!

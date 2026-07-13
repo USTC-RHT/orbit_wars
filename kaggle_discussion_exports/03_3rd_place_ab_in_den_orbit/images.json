@@ -1,0 +1,32 @@
+[
+  {
+    "kind": "post_image",
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F4239923%2F9114615be6640b5054322b921797ecdd%2Fplanet_token_features.png?generation=1783513304389973&alt=media",
+    "file": "images/image_01_planet_token_features.png",
+    "content_type": "image/png"
+  },
+  {
+    "kind": "post_image",
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F4239923%2Fd62c07f3105b31463ca67fd8b921f730%2Fplayer_token_features.png?generation=1783513319857645&alt=media",
+    "file": "images/image_02_player_token_features.png",
+    "content_type": "image/png"
+  },
+  {
+    "kind": "post_image",
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F4239923%2F6ccfe10e049d7b4435afe99a66ec755e%2Fentropy_coeff.png?generation=1783510449118945&alt=media",
+    "file": "images/image_03_entropy_coeff.png",
+    "content_type": "image/png"
+  },
+  {
+    "kind": "post_image",
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F4239923%2Feb97603e3a88d8edef6b38fc47c1dc85%2F2p_winrate.png?generation=1783510866867551&alt=media",
+    "file": "images/image_04_2p_winrate.png",
+    "content_type": "image/png"
+  },
+  {
+    "kind": "post_image",
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F4239923%2F9756b441673ce386e7009fb677807be2%2F4p_winrate.png?generation=1783510901045798&alt=media",
+    "file": "images/image_05_4p_winrate.png",
+    "content_type": "image/png"
+  }
+]

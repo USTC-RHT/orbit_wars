@@ -1,0 +1,242 @@
+<article>
+<div class="sc-fMvFCd gLPPZv" style="margin-top: 40px;"><h1 class="sc-jrIDTr sc-cPdrvo egLHmK hPXRPW">2nd Place Solution for Orbit Wars</h1><div class="sc-dAueUm jEQvZb"><a class="sc-llQYOh lhnLzg sc-gIblub cYJELF" href="https://www.kaggle.com/competitions/orbit-wars" data-discover="true"><div class="sc-fGEWzA iYBJBb"><p class="sc-bjLslk sc-iDXkGp lnqkao kRcjCi">Orbit Wars</p></div></a><p class="sc-bjLslk sc-cDkSAy lnqkao bHGLYP">Solution Writeup · 2nd place · Jul 8, 2026</p></div></div>
+<div class="post-body">
+<div class="sc-dFBygw goGFMn"><p><img src="images/image_01_hober_malloc.png" alt=""></p>
+<p><em>Image inspiration: <a href="https://en.wikipedia.org/wiki/File:Foundation_-_Isaac_Asimov_(Gnome_1951).jpg" target="_blank" aria-label="David Kyle’s cover art (opens in a new tab)" rel="noreferrer nofollow">David Kyle’s cover art</a> for the first edition of Isaac Asimov’s Foundation. Hober Mallow is one of the novel’s central characters, whose actions play a key role in the Foundation’s expansion.</em></p>
+<p>Many thanks to Kaggle and especially to <a href="https://www.kaggle.com/bovard" target="_blank" aria-label="@bovard (opens in a new tab)" data-id="f56d6228-62d3-4e02-89c1-a3591254fb54" data-user-name="bovard" class="user-mention">@bovard</a> and <a href="https://www.kaggle.com/addisonhoward" target="_blank" aria-label="@addisonhoward (opens in a new tab)" data-id="6e8830ee-e49a-49e7-b6ca-d014cb1888b3" data-user-name="addisonhoward" class="user-mention">@addisonhoward</a> for organizing such a fun competition. It was my first simulation competition and as usual with Kaggle I learned a ton. I initially reached the top 50 with hand-crafted heuristic/search agents, but after reading the <a href="https://www.kaggle.com/competitions/orbit-wars/discussion/697725" target="_blank" aria-label="post (opens in a new tab)">post</a> from <a href="https://www.kaggle.com/lightmk" target="_blank" aria-label="@lightmk (opens in a new tab)" data-id="d3da5005-1faf-4cdd-84d7-ca1749c08c3f" data-user-name="lightmk" class="user-mention">@lightmk</a> and write-ups from previous simulation competitions, I switched to deep learning approaches. Imitation Learning (<em>a.k.a</em> behavioral cloning) got me in the top 10, finetuning with reinforcement learning (RL) I reached the top 5, and in the very last days of the competition, I started training from scratch with RL (kind of my AlphaGo -&gt; AlphaZero moment 😄). </p>
+<p>Code to reproduce my two final submissions is available <a href="https://github.com/SimJeg/orbit-wars" target="_blank" aria-label="here (opens in a new tab)" rel="noreferrer nofollow">here</a>.</p>
+<h2 data-original-level="2">🛰️ Overview</h2>
+<p>I trained a single neural network - ModernBERT on top of 1D-CNN embeddings with 4.3M parameters - for both 2p and 4p, using self-play from scratch for 10B steps. I simplified the action space to only two possible actions per body (planet or comet): do nothing (<code>no-op</code> action) or launch all available ships (<code>all-in</code> action) toward a short-distance target (ETA &lt; 20). </p>
+<h2 data-original-level="2">🏗️ Architecture</h2>
+<p>The model consists of 3 modules:</p>
+<ol>
+<li>A 1D-CNN encoder (290K parameters), which encodes each body - planet or comet - into a continuous embedding </li>
+<li>A ModernBERT transformer (3.9M parameters), taking as input a set of <code>N</code> embeddings, where <code>N</code> is the number of planets plus 4 comets</li>
+<li><code>2N+1</code> heads (130K parameters), two action heads per body (launch head and target head), and one global value head used for PPO training</li>
+</ol>
+<p><img src="images/image_02_diagram_v3.png" alt=""></p>
+<h3 data-original-level="3">Feature space</h3>
+<p>For a body <code>b</code> and a timestep <code>t</code>, I extracted 10 features <code>f(b, t)</code>:</p>
+<table>
+<thead>
+<tr>
+<th>feature</th>
+<th>description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timestep</code></td>
+<td>Timestep <code>t</code></td>
+</tr>
+<tr>
+<td><code>production</code></td>
+<td>Body production value. Constant.</td>
+</tr>
+<tr>
+<td><code>radial_coordinate</code></td>
+<td>Body distance from the map center. Constant except for comets</td>
+</tr>
+<tr>
+<td><code>angular_coordinate</code></td>
+<td>Body angular position around the map center. Constant only for fixed planets</td>
+</tr>
+<tr>
+<td><code>player_ships</code></td>
+<td>Player ships on the body at <code>t</code></td>
+</tr>
+<tr>
+<td><code>neutral_ships</code></td>
+<td>Neutral ships on the body at <code>t</code></td>
+</tr>
+<tr>
+<td><code>opponent1_ships</code></td>
+<td>Opponent 1 ships on the body at <code>t</code></td>
+</tr>
+<tr>
+<td><code>opponent2_ships</code></td>
+<td>Opponent 2 ships on the body. 0 if only 2 players remain</td>
+</tr>
+<tr>
+<td><code>opponent3_ships</code></td>
+<td>Opponent 3 ships on the body. 0 if only 3 players remain</td>
+</tr>
+<tr>
+<td><code>ships_for_capture</code></td>
+<td>Additional ships the player would need at <code>t</code> to own the body after combat resolution</td>
+</tr>
+</tbody>
+</table>
+<p>At most one <code>*_ships</code> feature can be non-zero, indicating which player owns the planet at timestep <code>t</code>. In most cases, <code>ships_for_capture</code> is simply <code>0</code> if the body is owned, or <code>max(*_ships) + 1</code> if it is not, but this is not always true when 3 or 4 players remain.</p>
+<p>I then computed the time series <code>x(b) = [f(b, t), f(b, t+1), ..., f(b, t+T)]</code> with <code>T=19</code> to represent the future states of this body <em>assuming no fleet is launched after <code>t</code></em>. In other words I simply ran the environment <code>T</code> times from the state at <code>t</code> with no new action, and computed <code>f(b, t+i)</code> iteratively. This time series explicitly encodes body properties and geometry, and implicitly captures the impact of all existing fleets over the next timesteps. For instance, the <code>player_ships</code> feature can be positive in the first timesteps and then become 0, signaling a capture by an opponent. Four slots are always reserved for comets, even if not present at a given timestep <code>t</code> (using 0 everywhere except for the <code>t</code> row).</p>
+<h3 data-original-level="3">1D-CNN encoder</h3>
+<p>The 1D-CNN is a stack of 4 residual blocks - <code>Conv1D (k=5) -&gt; GELU -&gt; Residual -&gt; LayerNorm</code> - applied to each body's timestep features, followed by a <code>GlobalAveragePooling1D</code> layer and a <code>Linear</code> projection from <code>d=128</code> to <code>d=256</code>. It was inspired by <a href="https://www.kaggle.com/competitions/predict-student-performance-from-game-play/writeups/french-touch-1st-place-solution-for-the-predict-st" target="_blank" aria-label="this competition write-up (opens in a new tab)">this competition write-up</a> from <a href="https://www.kaggle.com/cpmpml" target="_blank" aria-label="@cpmpml (opens in a new tab)" data-id="a5775648-a5ca-4447-9d20-6ced0cb9c18b" data-user-name="cpmpml" class="user-mention">@cpmpml</a> and <a href="https://www.kaggle.com/pdnartreb" target="_blank" aria-label="@pdnartreb (opens in a new tab)" data-id="e5290b10-015d-4769-8829-be7e3488f310" data-user-name="pdnartreb" class="user-mention">@pdnartreb</a>. </p>
+<h3 data-original-level="3">ModernBERT transformer</h3>
+<p>The ModernBERT transformer follows the XXS configuration proposed in the <a href="https://huggingface.co/blog/ettin" target="_blank" aria-label="Ettin Encoder series (opens in a new tab)" rel="noreferrer nofollow">Ettin Encoder series</a>: 7 layers, 4 attention heads and <code>d=256</code>. The only modifications are:</p>
+<ul>
+<li>No token embedding table, since the model uses the 1D-CNN embeddings as inputs</li>
+<li>No positional encoding, since the geometry is already encoded in the 1D-CNN embeddings</li>
+<li>Global attention only - no local attention - since the maximum input length is <code>N=44</code> (40 planets and 4 comets).</li>
+</ul>
+<h3 data-original-level="3">Heads and masking</h3>
+<p>For each body <code>b</code>, I decomposed the action into:</p>
+<ol>
+<li>A launch head that predicts the probability that <code>b</code> launches a fleet, using a linear projection on top of hidden states</li>
+<li>A target head that predicts the target of this fleet, using an attention head over the hidden states of the other bodies </li>
+</ol>
+<p>During both training and inference, two action masks are computed at each timestep <code>t</code>:</p>
+<ol>
+<li><code>launch_mask(t)</code> of size <code>N</code>, which masks bodies that are not owned by the player, since it is not possible to send a fleet from a planet we do not own</li>
+<li><code>target_mask(t)</code> of size <code>(N, N)</code>, where <code>target_mask[i, j]</code> is valid only if planet <code>i</code> can reach planet <code>j</code> in less than <code>T</code> timesteps with an all-in launch. This mask might be incorrect in the very unlikely case of an interception by a comet that has yet to spawn.</li>
+</ol>
+<p>Finally, a value head is added on top of the average of the last hidden states over the <code>N</code> bodies for PPO training.</p>
+<h3 data-original-level="3">Inference</h3>
+<p>Features, masks, and conversion of model outputs to the <code>[from_planet_id, direction_angle, num_ships]</code> action format are implemented in Rust. Neural network inference is performed using Jax. Test time augmentation is used by averaging the model predictions over 4 views when 2 players remain (4 rotations for the <code>angular_coordinate</code> feature: 0, π/4, π/2, 3π/4), and 8 views when 3 or 4 players remain (4 rotations combined with 4 permutations of the <code>opponent*_ships</code> rows). Launches are triggered when the launch probability exceeds a threshold of 53% (submission 1) or 56% (submission 2), and are enforced for owned comets leaving the board during the next timestep.</p>
+<h2 data-original-level="2">🎭 Imitation learning (IL)</h2>
+<p><em>Note: I did not use IL in my final submissions, so you can skip this section.</em></p>
+<p>In <a href="https://www.kaggle.com/competitions/lux-ai-season-3" target="_blank" aria-label="LuxAI Season 3 (opens in a new tab)">LuxAI Season 3</a>, several gold-medal solutions relied on IL only - for example the <a href="https://www.kaggle.com/competitions/lux-ai-season-3/writeups/adg4b-imitation-learning-3rd-place-solution" target="_blank" aria-label="3rd-place solution (opens in a new tab)">3rd-place solution</a> - so I decided to start with IL before going into RL.</p>
+<p>I noticed a few patterns when looking at replays from top players:</p>
+<ul>
+<li>With very few exceptions, they launched at most one fleet per body</li>
+<li>The two most common actions were by far <code>no-op</code> and <code>all-in</code></li>
+<li>Launches were often limited to short distances, typically with ETA &lt; 20</li>
+</ul>
+<p>My latest IL dataset contained 5M samples - 54% 2p and 46% 4p - from 20K episodes filtered from the 189K episodes shared by <a href="https://www.kaggle.com/bovard" target="_blank" aria-label="@bovard (opens in a new tab)" data-id="98ac67eb-1b09-4c93-ae4e-af0ae42b588f" data-user-name="bovard" class="user-mention">@bovard</a> <a href="https://www.kaggle.com/datasets/kaggle/orbit-wars-episodes-index" target="_blank" aria-label="here (opens in a new tab)">here</a>, between May 6th (the last significant environment update) and June 14th. I used the following filters:</p>
+<ul>
+<li>The player either had a score &gt; 1500, regardless of whether they won or lost the episode, or won against a player with a score &gt; 1500 (scores were retrieved from <a href="https://www.kaggle.com/datasets/kaggle/meta-kaggle/data" target="_blank" aria-label="Meta Kaggle Dataset (opens in a new tab)">Meta Kaggle Dataset</a>)</li>
+<li>The player only used <code>all-in</code> actions, with any ETA, during the episode, with a tolerance of 3 steps that did not respect that rule</li>
+</ul>
+<p>I trained models using <a href="https://github.com/Lightning-AI/pytorch-lightning" target="_blank" aria-label="PyTorch Lightning (opens in a new tab)" rel="noreferrer nofollow">PyTorch Lightning</a> with binary cross-entropy for the launch head (weight = 5.0) and categorical cross-entropy for the target head (weight = 1.0), and later finetuned them on a similar dataset with a stricter score threshold of 1600. Here are the results I obtained on a test set of 45K samples from ~200 independent episodes (AP = average precision, acc = accuracy):</p>
+<table>
+<thead>
+<tr>
+<th>Finetuned</th>
+<th>Rotation TTA</th>
+<th>Opponent TTA</th>
+<th>Launch AP</th>
+<th>Target acc@1</th>
+<th>Target acc@2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td></td>
+<td></td>
+<td></td>
+<td>81.73</td>
+<td>79.86</td>
+<td>93.84</td>
+</tr>
+<tr>
+<td>✓</td>
+<td></td>
+<td></td>
+<td>83.00</td>
+<td>80.90</td>
+<td>94.57</td>
+</tr>
+<tr>
+<td>✓</td>
+<td>✓</td>
+<td></td>
+<td>83.77</td>
+<td>82.07</td>
+<td>95.00</td>
+</tr>
+<tr>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>83.80</td>
+<td>82.12</td>
+<td>94.99</td>
+</tr>
+</tbody>
+</table>
+<p>These experiments allowed me to reach the top 10 in early June, but more importantly helped me narrow down the feature space, neural network architecture, and action space. Several things I tried and later dropped based on those experiments:</p>
+<ul>
+<li>A third action head to predict fractions of ships to send (25%, 50%, 75% or 100%) instead of using <code>all-in</code> actions only</li>
+<li>Higher values of <code>T</code> than 20 (<em>e.g.</em> 30 or 50), since my model is blind to fleets arriving beyond that horizon </li>
+<li>Smaller or larger CNNs and transformers</li>
+<li>Using the target mask as input through attention positional bias, which led to faster convergence but similar results</li>
+<li>Various data filtering methods</li>
+</ul>
+<h2 data-original-level="2">🐡 Reinforcement Learning (RL)</h2>
+<p>I had never done RL before this competition, except maybe in <a href="https://www.kaggle.com/code/simjeg/relax-it-s-santa" target="_blank" aria-label="this notebook (opens in a new tab)">this notebook</a> for the Santa 2024 competition. After reading about REINFORCE, A2C, and PPO, previous competition write-ups and discussion posts, I decided to use PPO with the <a href="https://github.com/pufferai/pufferlib" target="_blank" aria-label="PufferLib (opens in a new tab)" rel="noreferrer nofollow">PufferLib</a> library, given its claims about speed. To use PufferLib properly, I had to port the feature and mask construction from Rust to C and the model from Torch to CUDA. What would have been impossible for me a year ago was done by Codex and GPT-5.5 within a few minutes. I used an 8xH100 machine to run training and reached around 40K steps per second with this implementation.</p>
+<p>During my experiments, I encountered two main issues:</p>
+<ol>
+<li>The agent never launched</li>
+<li>In 4p, the four agents neutralized each other and the game ran for 500 steps</li>
+</ol>
+<p>For the first issue, I: </p>
+<ul>
+<li>Manually shifted launch logits to higher values when initializing the model from an IL checkpoint</li>
+<li>Used a 5x larger entropy coefficient for the launch distribution than for the target distribution to encourage exploration</li>
+<li>Stopped the rollout after 40 timesteps with no actions (maybe this was a bad idea, given the latest <a href="https://www.kaggle.com/pressman1" target="_blank" aria-label="@pressman1 (opens in a new tab)" data-id="b2c71dfe-a030-484e-b951-88edb011cbff" data-user-name="pressman1" class="user-mention">@pressman1</a> replays)</li>
+</ul>
+<p>For the second issue, I:</p>
+<ul>
+<li>Updated the rewards from -1 for losing and +1 for winning, to -1 for losing, +0.5 for winning after 500 timesteps, and +1 for winning before 500 timesteps</li>
+<li>Used a pool of frozen checkpoints for 2 out of 4 seats in 4p, a strategy I dropped for the final training run</li>
+</ul>
+<p>I did a poor job of ablating the modifications above, so it is very possible that some of these tricks were useless. In my latest training runs, the fraction of rollouts discarded because of 40 consecutive no-op actions was below 1%, the average 2p episode length was ~200, and the average 4p episode length was ~460.</p>
+<p>Only five days before the end of the competition, I started training from scratch, and it quickly outperformed the models initialized with IL. I wish I had tried it earlier, because it would have made it easier to explore alternative architectures or wider action spaces. My final model was trained for 10B steps - 1M steps per epoch - in three 24-hour stages of 3B, 3.5B, and 3.5B steps, respectively, with decreasing learning rates: 1e-3, 3e-4, and 1e-4. Here are the main configuration parameters I used:</p>
+<pre class="uc-code-block"><code id="code-block-1783675178279-0" data-processing="yes" data-highlighted="yes" class="hljs language-ini"><span class="hljs-section">[vec]</span>
+<span class="hljs-attr">total_agents</span> = <span class="hljs-number">1024</span>
+<span class="hljs-attr">num_buffers</span> = <span class="hljs-number">8</span>
+<span class="hljs-attr">num_threads</span> = <span class="hljs-number">16</span>
+
+<span class="hljs-section">[env]</span>
+<span class="hljs-attr">four_player_prob</span> = <span class="hljs-number">0.4</span> <span class="hljs-comment">; 40% of the games sampled as 4p</span>
+<span class="hljs-attr">reward_timestep_limit</span> = <span class="hljs-number">0.5</span> <span class="hljs-comment">; winner reward is reduced to 0.5 if the game reaches the 500-step limit</span>
+<span class="hljs-attr">max_no_op_steps</span> = <span class="hljs-number">40</span> <span class="hljs-comment">; rollout is stopped after 40 steps without actions</span>
+<span class="hljs-attr">feature_rotation_augmentation</span> = <span class="hljs-number">1</span> <span class="hljs-comment">; data augmentation on angular_coordinate row</span>
+<span class="hljs-attr">feature_enemy_permutation_augmentation</span> = <span class="hljs-number">1</span> <span class="hljs-comment">; data augmentation on opponent*_ships rows</span>
+
+<span class="hljs-section">[train]</span>
+<span class="hljs-attr">gpus</span> = <span class="hljs-number">8</span>
+<span class="hljs-attr">total_timesteps</span> = <span class="hljs-number">3_000_000_000</span> <span class="hljs-comment">; for stage 1, then 3_500_000_000 for stages 2 and 3</span>
+<span class="hljs-attr">horizon</span> = <span class="hljs-number">128</span> <span class="hljs-comment">; 1 epoch is horizon * total_agents * gpus = ~1M steps</span>
+<span class="hljs-attr">gamma</span> = <span class="hljs-number">0.995</span>
+<span class="hljs-attr">gae_lambda</span> = <span class="hljs-number">0.97</span>
+<span class="hljs-attr">learning_rate</span> = <span class="hljs-number">0.001</span> <span class="hljs-comment">; for stage 1, then 0.0003 for stage 2 and 0.0001 for stage 3</span>
+<span class="hljs-attr">min_lr_ratio</span> = <span class="hljs-number">0.01</span> <span class="hljs-comment">; cosine decay</span>
+<span class="hljs-comment">; lr_warmup_timesteps = 50_000_000 ; linear warmup, only for stages 2 and 3</span>
+<span class="hljs-comment">; lr_warmup_start_ratio = 0.01</span>
+<span class="hljs-attr">minibatch_size</span> = <span class="hljs-number">4096</span>
+<span class="hljs-attr">clip_coef</span> = <span class="hljs-number">0.2</span>
+<span class="hljs-attr">launch_ent_coef</span> = <span class="hljs-number">0.01</span> <span class="hljs-comment">; entropy coefficient for launch head</span>
+<span class="hljs-attr">target_ent_coef</span> = <span class="hljs-number">0.002</span> <span class="hljs-comment">; entropy coefficient for target head</span>
+<span class="hljs-attr">vf_coef</span> = <span class="hljs-number">0.5</span> <span class="hljs-comment">; coefficient for value head</span>
+</code><div class="uc-code-block-copy-button-wrapper"><button aria-label="Copy code" class="uc-code-block-copy-button google-symbols">content_copy</button></div></pre>
+<h2 data-original-level="2">📈 Evaluation</h2>
+<p>Evaluation in a simulation competition is quite different from building a cross-validation strategy that correlates with the public leaderboard score.  Very early in the competition, I built a fast local arena in Rust to evaluate my hand-crafted agents, and I used throughout the competition. It supported two main modes:</p>
+<ol>
+<li>Run a set of matches between 2 agents in 2p or 4 agents in 4p</li>
+<li>Create a local leaderboard, either in 2p or 4p, using a pool of agents. I used <a href="https://crates.io/crates/openskill" target="_blank" aria-label="OpenSkill (opens in a new tab)" rel="noreferrer nofollow">OpenSkill</a> to try to mimic the matchmaking and scoring system used on Kaggle, even though as far as I know, it is <a href="https://www.kaggle.com/competitions/orbit-wars/discussion/707660" target="_blank" aria-label="unknown (opens in a new tab)">unknown</a>.</li>
+</ol>
+<h2 data-original-level="2">🚧  Things I would try next</h2>
+<p>I am very happy with my final solution: an almost naive action space, a single model for both 2p and 4p, based on 10 simple features, and trained from scratch with self-play. Here are a few things I would have explored with more time, now that my setup allows me to train from scratch with RL:</p>
+<ul>
+<li>Separate models for 2p and 4p, although using a single one is nicer 😀</li>
+<li>A more complex action space, for example going back to fixed fraction buckets as <a href="https://www.kaggle.com/ferdinandlimburg" target="_blank" aria-label="@ferdinandlimburg (opens in a new tab)" data-id="3ecbcf5f-1eea-4205-aff6-abe082f1b146" data-user-name="ferdinandlimburg" class="user-mention">@ferdinandlimburg</a> appears to be doing based on replay data</li>
+<li>A longer horizon than <code>T=20</code>, because I cannot quite bring myself to believe that a model blind to arriving fleets beyond 20 timesteps is optimal</li>
+<li>An explicit encoding of possible actions through the PairFormer architecture used in AlphaFold. I thought about using a time series for each pair of bodies <code>(i, j)</code> with three features: the timestep <code>t</code>, and the minimum and maximum number of ships that can be sent from <code>i</code> to <code>j</code> with ETA <code>t</code>.</li>
+</ul>
+<p>I cannot wait to learn what <a href="https://www.kaggle.com/pressman1" target="_blank" aria-label="@pressman1 (opens in a new tab)" data-id="52b782af-b5b0-4073-8931-1525221c0bbe" data-user-name="pressman1" class="user-mention">@pressman1</a> has cooked up. He has been crushing this competition for weeks now, huge congrats to him 👏 <em>Update: after reading his write-up, I would obviously scale the transformer, and maybe replace the 1D-CNN by a simple linéaire projection with flattened features</em></p>
+<h2 data-original-level="2">🌱 Lessons Learnt</h2>
+<ul>
+<li><p><strong>Perseverance, speed and rigor</strong>: I believe these qualities are essential in a Kaggle competition, and I tried my best to embody them (although my RL experiments could probably have been more rigorous). This was the first solo competition I completed end-to-end with the goal of reaching Grandmaster rank, and I’m now confident I will get there 🥳</p></li>
+<li><p><strong>Coding Agents</strong>: This competition was also the opportunity for me to learn how to work with coding agents like Claude Code or Codex. While they clearly made me faster and removed barriers like “let’s rewrite this environment in Rust,” I also realized that we did not go from autocomplete to a fully autonomous Kaggle agent overnight. I spent some time experimenting with <a href="https://github.com/karpathy/autoresearch" target="_blank" aria-label="autoresearch-like (opens in a new tab)" rel="noreferrer nofollow">autoresearch-like</a> approaches for rule-based agents, but they quickly plateaued, as <a href="https://www.kaggle.com/addisonhoward" target="_blank" aria-label="@addisonhoward (opens in a new tab)" data-id="b2c68d9c-d8a9-41c6-9e50-fe7571d0130d" data-user-name="addisonhoward" class="user-mention">@addisonhoward</a> also reported <a href="https://www.kaggle.com/competitions/orbit-wars/discussion/696214#3479321" target="_blank" aria-label="here (opens in a new tab)">here</a>.</p></li>
+<li><p><strong>Reinforcement Learning</strong>: While I have been doing deep learning for years now, this was my first hands-on experience with RL. I was fascinated by AlphaZero when it came out in 2017, and I was equally fascinated to see how far I could get here with self-play alone. Coding agents are a great example of how RL (RLVR) can build on imitation learning (LLM pretraining) and I believe this is only the beginning (see, for instance, the <a href="https://storage.googleapis.com/deepmind-media/Era-of-Experience%20/The%20Era%20of%20Experience%20Paper.pdf" target="_blank" aria-label="Era of Experience (opens in a new tab)" rel="noreferrer nofollow">Era of Experience</a> paper), so learning more about RL felt important to me.</p></li>
+</ul>
+<h2 data-original-level="2">Sources</h2>
+<ul>
+<li><a href="https://www.kaggle.com/competitions/predict-student-performance-from-game-play/writeups/french-touch-1st-place-solution-for-the-predict-st" target="_blank" aria-label="https://www.kaggle.com/competitions/predict-student-performance-from-game-play/writeups/french-touch-1st-place-solution-for-the-predict-st (opens in a new tab)">https://www.kaggle.com/competitions/predict-student-performance-from-game-play/writeups/french-touch-1st-place-solution-for-the-predict-st</a></li>
+<li><a href="https://arxiv.org/abs/2412.13663" target="_blank" aria-label="https://arxiv.org/abs/2412.13663 (opens in a new tab)" rel="noreferrer nofollow">https://arxiv.org/abs/2412.13663</a></li>
+<li><a href="https://arxiv.org/abs/2507.11412v1" target="_blank" aria-label="https://arxiv.org/abs/2507.11412v1 (opens in a new tab)" rel="noreferrer nofollow">https://arxiv.org/abs/2507.11412v1</a> </li>
+<li><a href="https://github.com/Lightning-AI/pytorch-lightning" target="_blank" aria-label="https://github.com/Lightning-AI/pytorch-lightning (opens in a new tab)" rel="noreferrer nofollow">https://github.com/Lightning-AI/pytorch-lightning</a></li>
+<li><a href="https://github.com/pufferai/pufferlib" target="_blank" aria-label="https://github.com/pufferai/pufferlib (opens in a new tab)" rel="noreferrer nofollow">https://github.com/pufferai/pufferlib</a></li>
+</ul></div>
+</div>
+</article>

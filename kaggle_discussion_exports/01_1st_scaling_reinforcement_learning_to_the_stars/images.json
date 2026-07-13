@@ -1,0 +1,17 @@
+[
+  {
+    "kind": "post_image",
+    "file": "model-architecture.svg",
+    "alt": "Diagram of the Orbit Wars model: entity and special tokens feed a shared transformer that drives per-player actor and critic heads.",
+    "source_url": "https://raw.githubusercontent.com/IsaiahPressman/kaggle-orbit-wars/eef32d1ba96c69f021d49e230b313b61decc0371/docs/model-architecture.svg",
+    "width": 680,
+    "height": 774
+  },
+  {
+    "kind": "formula_screenshot",
+    "file": "formula_1.png",
+    "latex": "\\frac{\\mathbf{Q(source)} \\cdot \\mathbf{K(target)}}{\\sqrt{d}}",
+    "width": 192,
+    "height": 48
+  }
+]

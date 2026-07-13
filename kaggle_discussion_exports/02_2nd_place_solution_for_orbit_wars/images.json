@@ -1,0 +1,22 @@
+[
+  {
+    "alt": "",
+    "h": 938,
+    "i": 10,
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-forum-message-attachments/o/inbox%2F412830%2F043097006d4984e0c79ce88c6de3d301%2Fhober_malloc.png?generation=1782288071621104&alt=media",
+    "visible": true,
+    "w": 1677,
+    "file": "images/image_01_hober_malloc.png",
+    "kind": "post_image"
+  },
+  {
+    "alt": "",
+    "h": 935,
+    "i": 11,
+    "src": "https://www.googleapis.com/download/storage/v1/b/kaggle-forum-message-attachments/o/inbox%2F412830%2F071a5f250afaaf7e007a0d5883471be3%2Fdiagram_v3.png?generation=1782367654549439&alt=media",
+    "visible": true,
+    "w": 1681,
+    "file": "images/image_02_diagram_v3.png",
+    "kind": "post_image"
+  }
+]

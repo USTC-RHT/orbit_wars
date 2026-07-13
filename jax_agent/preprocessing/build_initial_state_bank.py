@@ -64,9 +64,18 @@ def load_orbit_wars_module():
 
     import types
 
-    path = Path(__file__).resolve().parents[2] / "orbit_wars.py"
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        repo_root / "jax_agent" / "reference" / "orbit_wars.py",
+        repo_root / "orbit_wars.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     source = path.read_text(encoding="utf-8")
     source = source.split("dir_path = path.dirname(__file__)", 1)[0]
+    source = source.replace(
+        "from kaggle_environments.utils import resolve_episode_seed\n",
+        "",
+    )
     module = types.ModuleType("orbit_wars_local")
     exec(compile(source, str(path), "exec"), module.__dict__)
     return module

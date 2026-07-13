@@ -1,0 +1,89 @@
+:root {
+  --bg: #f6f7f9;
+  --paper: #fff;
+  --text: #172033;
+  --muted: #667085;
+  --line: #dde3ea;
+  --accent: #0b73d9;
+  --soft: #e7f2ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.78 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { width: min(1060px, calc(100% - 32px)); margin: 0 auto; }
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px max(16px, calc((100vw - 1060px) / 2));
+  border-bottom: 1px solid var(--line);
+  background: rgba(255,255,255,.94);
+}
+.hero { padding: 54px 0 26px; }
+.hero h1 { margin: 0 0 12px; font-size: clamp(32px, 5vw, 52px); line-height: 1.08; }
+.hero p { margin: 0; color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; padding-bottom: 56px; }
+.card {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+  min-height: 142px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--text);
+}
+.card.disabled { opacity: .58; pointer-events: none; }
+.rank {
+  display: inline-flex;
+  width: max-content;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--soft);
+  color: #07549f;
+  font-size: 13px;
+  font-weight: 700;
+}
+.article {
+  margin: 24px auto 64px;
+  padding: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.article h1 { font-size: clamp(30px, 4vw, 44px); line-height: 1.12; margin: 0 0 14px; }
+.article h2 { margin: 1.8em 0 .65em; padding-top: 18px; border-top: 1px solid var(--line); font-size: 25px; }
+.article h3 { margin: 1.5em 0 .5em; font-size: 20px; }
+.article p { margin: 0 0 1em; }
+.article img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 18px auto 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+figure { margin: 22px 0; }
+figcaption { text-align: center; color: var(--muted); font-size: 14px; }
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #f1f4f8;
+  border-radius: 5px;
+}
+code { padding: 2px 5px; }
+pre { overflow-x: auto; padding: 14px; }
+.formula { text-align: center; }
+.formula pre { display: inline-block; text-align: left; }
+@media (max-width: 700px) {
+  .article { padding: 18px; }
+  .topbar { flex-direction: column; }
+}

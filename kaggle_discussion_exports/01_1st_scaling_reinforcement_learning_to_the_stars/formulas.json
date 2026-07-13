@@ -1,0 +1,7 @@
+[
+  {
+    "file": "formula_1.png",
+    "latex": "\\frac{\\mathbf{Q(source)} \\cdot \\mathbf{K(target)}}{\\sqrt{d}}",
+    "text": "Q(source) dot K(target) over sqrt(d)"
+  }
+]
